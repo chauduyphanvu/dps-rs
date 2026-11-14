@@ -16,14 +16,16 @@ use objc2_core_audio::{
     AudioDeviceStart, AudioDeviceStop, AudioHardwareCreateAggregateDevice,
     AudioHardwareCreateProcessTap, AudioHardwareDestroyAggregateDevice,
     AudioHardwareDestroyProcessTap, AudioObjectAddPropertyListener, AudioObjectGetPropertyData,
-    AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
-    AudioObjectPropertyListenerProc, AudioObjectPropertyScope, AudioObjectPropertySelector,
-    AudioObjectRemovePropertyListener, AudioObjectSetPropertyData, CATapDescription,
-    CATapMuteBehavior, kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceIsStackedKey,
+    AudioObjectGetPropertyDataSize, AudioObjectHasProperty, AudioObjectID,
+    AudioObjectPropertyAddress, AudioObjectPropertyElement, AudioObjectPropertyListenerProc,
+    AudioObjectPropertyScope, AudioObjectPropertySelector, AudioObjectRemovePropertyListener,
+    AudioObjectSetPropertyData, CATapDescription, CATapMuteBehavior,
+    kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceIsStackedKey,
     kAudioAggregateDeviceMainSubDeviceKey, kAudioAggregateDeviceNameKey,
     kAudioAggregateDeviceSubDeviceListKey, kAudioAggregateDeviceTapListKey,
     kAudioAggregateDeviceUIDKey, kAudioDevicePropertyDeviceIsRunning,
-    kAudioDevicePropertyDeviceUID, kAudioHardwareBadPropertySizeError,
+    kAudioDevicePropertyDeviceUID, kAudioDevicePropertyPreferredChannelsForStereo,
+    kAudioDevicePropertyVolumeRangeDecibels, kAudioHardwareBadPropertySizeError,
     kAudioHardwarePropertyDevices, kAudioHardwarePropertyTranslatePIDToProcessObject,
     kAudioHardwareUnspecifiedError, kAudioObjectPropertyElementMain, kAudioObjectPropertyName,
     kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioObjectUnknown,
@@ -32,7 +34,7 @@ use objc2_core_audio::{
     kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, kAudioTapPropertyDescription,
     kAudioTapPropertyFormat, kAudioTapPropertyUID,
 };
-use objc2_core_audio_types::AudioStreamBasicDescription;
+use objc2_core_audio_types::{AudioStreamBasicDescription, AudioValueRange};
 use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType};
 use objc2_foundation::{NSArray, NSNumber, NSString};
 
@@ -40,9 +42,9 @@ pub use objc2_core_audio::{
     kAudioDeviceProcessorOverload, kAudioDevicePropertyDeviceIsAlive,
     kAudioDevicePropertyIOStoppedAbnormally, kAudioDevicePropertyNominalSampleRate,
     kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyStreams,
-    kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyProcessObjectList,
-    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput,
-    kAudioObjectPropertyScopeWildcard,
+    kAudioDevicePropertyVolumeDecibels, kAudioHardwarePropertyDefaultOutputDevice,
+    kAudioHardwarePropertyProcessObjectList, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, kAudioObjectPropertyScopeWildcard,
 };
 
 pub type ObjectId = AudioObjectID;
@@ -51,6 +53,7 @@ pub type PropertyAddress = AudioObjectPropertyAddress;
 pub const SYSTEM_OBJECT: ObjectId = kAudioObjectSystemObject as ObjectId;
 pub const UNKNOWN: ObjectId = kAudioObjectUnknown;
 pub const GLOBAL: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal;
+pub const MAIN: AudioObjectPropertyElement = kAudioObjectPropertyElementMain;
 
 /// A failed HAL call: what was being done and the OSStatus it returned.
 #[derive(Debug, Clone, Copy)]
@@ -94,10 +97,18 @@ fn address(
     selector: AudioObjectPropertySelector,
     scope: AudioObjectPropertyScope,
 ) -> AudioObjectPropertyAddress {
+    element_address(selector, scope, MAIN)
+}
+
+fn element_address(
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
+    element: AudioObjectPropertyElement,
+) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress {
         mSelector: selector,
         mScope: scope,
-        mElement: kAudioObjectPropertyElementMain,
+        mElement: element,
     }
 }
 
@@ -112,7 +123,34 @@ unsafe fn get_qualified<T: Copy, Q>(
     qualifier: Option<&Q>,
     action: &'static str,
 ) -> Result<T, Error> {
-    let address = address(selector, scope);
+    // SAFETY: forwarded to the caller.
+    unsafe { get_at(object, address(selector, scope), qualifier, action) }
+}
+
+/// Reads a fixed-size property of one element.
+///
+/// # Safety
+/// `T` must be the property's C type.
+unsafe fn get_element<T: Copy>(
+    object: ObjectId,
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
+    element: AudioObjectPropertyElement,
+    action: &'static str,
+) -> Result<T, Error> {
+    let address = element_address(selector, scope, element);
+    // SAFETY: forwarded to the caller.
+    unsafe { get_at::<T, ()>(object, address, None, action) }
+}
+
+/// # Safety
+/// `T` (and `Q`) must be the property's C types.
+unsafe fn get_at<T: Copy, Q>(
+    object: ObjectId,
+    address: AudioObjectPropertyAddress,
+    qualifier: Option<&Q>,
+    action: &'static str,
+) -> Result<T, Error> {
     let (qualifier_size, qualifier) = match qualifier {
         Some(q) => (size_of::<Q>() as u32, ptr::from_ref(q).cast::<c_void>()),
         None => (0, ptr::null()),
@@ -268,6 +306,83 @@ pub fn nominal_sample_rate(device: ObjectId) -> Result<f64, Error> {
             "read the device sample rate",
         )
     }
+}
+
+fn has_property(
+    object: ObjectId,
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
+    element: AudioObjectPropertyElement,
+) -> bool {
+    let address = element_address(selector, scope, element);
+    // SAFETY: a valid address.
+    unsafe { AudioObjectHasProperty(object, NonNull::from(&address)) }
+}
+
+/// The elements whose output volume in dB `device` reports: its main
+/// volume, or else the channels of its preferred stereo pair (1 and 2 if
+/// it names none) that have one; none for a device without a volume
+/// control, as HDMI outputs and some DACs are.
+pub fn volume_elements(device: ObjectId) -> Vec<AudioObjectPropertyElement> {
+    let output = kAudioObjectPropertyScopeOutput;
+    let has_volume = |e| has_property(device, kAudioDevicePropertyVolumeDecibels, output, e);
+    if has_volume(MAIN) {
+        return vec![MAIN];
+    }
+    // SAFETY: a UInt32[2] property.
+    let pair: Result<[u32; 2], _> = unsafe {
+        get(
+            device,
+            kAudioDevicePropertyPreferredChannelsForStereo,
+            output,
+            "read the device's stereo pair",
+        )
+    };
+    pair.unwrap_or([1, 2])
+        .into_iter()
+        .filter(|&e| has_volume(e))
+        .collect()
+}
+
+/// The output volume of `device` in dB below its maximum, mute aside: the
+/// mean over `volume_elements`, or `None` if it has none.
+pub fn output_volume_db(device: ObjectId) -> Result<Option<f32>, Error> {
+    let output = kAudioObjectPropertyScopeOutput;
+    let readings = volume_elements(device)
+        .into_iter()
+        .map(|element| {
+            // SAFETY: a Float32 and an AudioValueRange property.
+            unsafe {
+                let db: f32 = get_element(
+                    device,
+                    kAudioDevicePropertyVolumeDecibels,
+                    output,
+                    element,
+                    "read the output volume",
+                )?;
+                let range: Result<AudioValueRange, _> = get_element(
+                    device,
+                    kAudioDevicePropertyVolumeRangeDecibels,
+                    output,
+                    element,
+                    "read the output volume's range",
+                );
+                Ok((db, range.map_or(0.0, |r| r.mMaximum)))
+            }
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok(below_max(&readings))
+}
+
+/// The mean of `readings`, each a volume in dB and its range's maximum, as
+/// dB below the maximum: 0 is full volume.
+pub fn below_max(readings: &[(f32, f64)]) -> Option<f32> {
+    let below: Vec<f64> = readings
+        .iter()
+        .map(|&(db, max)| f64::from(db) - max)
+        .filter(|db| db.is_finite())
+        .collect();
+    (!below.is_empty()).then(|| (below.iter().sum::<f64>() / below.len() as f64).min(0.0) as f32)
 }
 
 pub fn is_running(device: ObjectId) -> Result<bool, Error> {
@@ -636,7 +751,24 @@ impl Listener {
         client: *mut c_void,
         action: &'static str,
     ) -> Result<Self, Error> {
-        let address = address(selector, scope);
+        // SAFETY: forwarded to the caller.
+        unsafe { Self::add_on_element(object, selector, scope, MAIN, proc, client, action) }
+    }
+
+    /// `add` for the property of one element.
+    ///
+    /// # Safety
+    /// As for `add`.
+    pub unsafe fn add_on_element(
+        object: ObjectId,
+        selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope,
+        element: AudioObjectPropertyElement,
+        proc: AudioObjectPropertyListenerProc,
+        client: *mut c_void,
+        action: &'static str,
+    ) -> Result<Self, Error> {
+        let address = element_address(selector, scope, element);
         // SAFETY: forwarded to the caller.
         check(action, unsafe {
             AudioObjectAddPropertyListener(object, NonNull::from(&address), proc, client)
@@ -695,6 +827,56 @@ mod tests {
                 runs_output(process)
             );
         }
+        for device in devices().unwrap() {
+            if stream_ids(device, kAudioObjectPropertyScopeOutput)
+                .unwrap()
+                .is_empty()
+            {
+                continue;
+            }
+            let output = kAudioObjectPropertyScopeOutput;
+            let elements: Vec<_> = (0..=2)
+                .filter(|&e| has_property(device, kAudioDevicePropertyVolumeDecibels, output, e))
+                .collect();
+            let ranges: Vec<_> = elements
+                .iter()
+                .map(|&e| {
+                    // SAFETY: an AudioValueRange property.
+                    let range: Result<AudioValueRange, _> = unsafe {
+                        get_element(
+                            device,
+                            kAudioDevicePropertyVolumeRangeDecibels,
+                            output,
+                            e,
+                            "read the range",
+                        )
+                    };
+                    range.map(|r| (r.mMinimum, r.mMaximum))
+                })
+                .collect();
+            println!(
+                "device {device} {:?}: volume dB on elements {elements:?} with ranges {ranges:?}, \
+                 used {:?}, reads {:?}",
+                name(device),
+                volume_elements(device),
+                output_volume_db(device)
+            );
+        }
+    }
+
+    #[test]
+    fn volume_is_the_mean_in_db_below_each_range_maximum() {
+        assert_eq!(below_max(&[]), None);
+        assert_eq!(below_max(&[(-20.0, 0.0)]), Some(-20.0));
+        // A range topping out above 0 dB still reads 0 at full volume.
+        assert_eq!(below_max(&[(6.0, 6.0)]), Some(0.0));
+        assert_eq!(below_max(&[(-4.0, 6.0)]), Some(-10.0));
+        // Two channels of a stereo pair, set apart: their mean.
+        assert_eq!(below_max(&[(-10.0, 0.0), (-20.0, 0.0)]), Some(-15.0));
+        // A reading that is not a number is left out.
+        assert_eq!(below_max(&[(f32::NAN, 0.0), (-6.0, 0.0)]), Some(-6.0));
+        assert_eq!(below_max(&[(f32::NEG_INFINITY, 0.0)]), None);
+        assert_eq!(below_max(&[(1.0, 0.0)]), Some(0.0));
     }
 
     #[test]

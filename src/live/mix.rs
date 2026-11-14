@@ -49,6 +49,9 @@ pub struct Controls {
     dry_gain: AtomicU32,
     /// Callback: the measurements the gain comes from, as f64 bits.
     levels: [AtomicU64; 3],
+    /// Main thread: the system volume in dB below maximum, as f32 bits;
+    /// NaN when unknown.
+    volume_db: AtomicU32,
 }
 
 impl Default for Controls {
@@ -57,6 +60,7 @@ impl Default for Controls {
             bypass: AtomicBool::new(false),
             dry_gain: AtomicU32::new(1f32.to_bits()),
             levels: Default::default(),
+            volume_db: AtomicU32::new(f32::NAN.to_bits()),
         }
     }
 }
@@ -64,6 +68,15 @@ impl Default for Controls {
 impl Controls {
     pub fn dry_gain(&self) -> f32 {
         f32::from_bits(self.dry_gain.load(Relaxed))
+    }
+
+    pub fn set_volume_db(&self, volume_db: Option<f32>) {
+        let bits = volume_db.unwrap_or(f32::NAN).to_bits();
+        self.volume_db.store(bits, Relaxed);
+    }
+
+    pub fn volume_db(&self) -> Option<f32> {
+        Some(f32::from_bits(self.volume_db.load(Relaxed))).filter(|v| !v.is_nan())
     }
 }
 
@@ -199,6 +212,11 @@ impl<C: Chain> Mixer<C> {
             self.fading = Some((mem::replace(&mut self.chain, new), 0));
             self.old_delay = self.delay;
             self.delay = self.chain.latency_frames();
+        }
+        let volume_db = self.controls.volume_db();
+        self.chain.set_volume_db(volume_db);
+        if let Some((old_chain, _)) = &mut self.fading {
+            old_chain.set_volume_db(volume_db);
         }
         let dry = &mut self.dry[..block.len()];
         dry.copy_from_slice(block);
@@ -1173,6 +1191,37 @@ mod tests {
                 .zip(&input[30_000 + FADE..])
                 .all(|(o, i)| *o == -i)
         );
+    }
+
+    #[test]
+    fn the_chain_hears_the_volume_set_on_the_controls() {
+        struct Heard(Arc<AtomicU32>);
+        impl Chain for Heard {
+            fn process(&mut self, _: &mut [f32]) {}
+            fn set_volume_db(&mut self, volume_db: Option<f32>) {
+                self.0
+                    .store(volume_db.unwrap_or(f32::NAN).to_bits(), Relaxed);
+            }
+        }
+        let heard = Arc::new(AtomicU32::new(0));
+        let controls = Arc::new(Controls::default());
+        assert_eq!(controls.volume_db(), None);
+        let mut mixer = Mixer::new(
+            Box::new(Heard(Arc::clone(&heard))),
+            RATE,
+            256,
+            Arc::new(Handoff::new()),
+            Arc::clone(&controls),
+        );
+        let seen = || Some(f32::from_bits(heard.load(Relaxed))).filter(|v| !v.is_nan());
+        mixer.process(&mut [0.0; 64]);
+        assert_eq!(seen(), None);
+        controls.set_volume_db(Some(-18.5));
+        mixer.process(&mut [0.0; 64]);
+        assert_eq!(seen(), Some(-18.5));
+        controls.set_volume_db(None);
+        mixer.process(&mut [0.0; 64]);
+        assert_eq!(seen(), None);
     }
 
     #[test]

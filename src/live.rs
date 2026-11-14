@@ -78,6 +78,9 @@ const START_NOTICE: Duration = Duration::from_secs(1);
 /// Apps start and quit with bursts of process changes; wait this long after
 /// one before looking at which to leave alone.
 const APPS_SETTLE: Duration = Duration::from_millis(500);
+/// How often the output volume is read even without a notification, which
+/// some devices never send.
+const VOLUME_POLL: Duration = Duration::from_secs(2);
 /// The least time between restarts made only because the tap could not be
 /// told which apps to leave alone, so that apps starting and quitting can
 /// restart it at most twice within `REBUILD_WINDOW`.
@@ -104,6 +107,8 @@ static CHANGED: AtomicBool = AtomicBool::new(false);
 static REBUILD: AtomicBool = AtomicBool::new(false);
 /// Set by the HAL when a process connects to or leaves the audio system.
 static PROCESSES: AtomicBool = AtomicBool::new(false);
+/// Set by the HAL when the output volume may have changed.
+static VOLUME: AtomicBool = AtomicBool::new(false);
 
 /// Counters the audio callback and HAL listeners update for the main thread.
 #[derive(Default)]
@@ -211,6 +216,7 @@ pub fn run(options: Options) -> Result<(), String> {
             }
         };
         let exclude = live.session_exclusions(own)?;
+        controls.set_volume_db(hal::output_volume_db(target.device).ok().flatten());
         let profile = live.tuner.profile();
         let hint = live.permission_hint();
         let session = Session::start(
@@ -857,6 +863,7 @@ impl Live {
         let Some(screen) = &mut self.screen else {
             return Ok(());
         };
+        let contour = contour_text(self.tuner.profile(), controls.volume_db());
         let view = tui::View {
             tuner: &self.tuner,
             name: &self.name,
@@ -864,6 +871,7 @@ impl Live {
             rate,
             clamped: stats.clamped.load(Relaxed),
             dry_gain: controls.dry_gain(),
+            contour: contour.as_deref(),
         };
         match screen.draw(&view) {
             Ok(()) => Ok(()),
@@ -955,10 +963,16 @@ fn watch(
 ) -> Result<Next, String> {
     let mut silence = SilenceWatch::new(Instant::now(), stats.callbacks.load(Relaxed));
     let mut warned = false;
+    // `run` read it just before the session started.
+    let mut volume_read = Instant::now();
     loop {
         let key = live.wait()?;
         if STOP.load(Relaxed) {
             return Ok(Next::Stop);
+        }
+        if VOLUME.swap(false, Relaxed) || volume_read.elapsed() >= VOLUME_POLL {
+            controls.set_volume_db(hal::output_volume_db(target.device).ok().flatten());
+            volume_read = Instant::now();
         }
         if live.step(key, rate, &session.handoff, controls) {
             return Ok(Next::Stop);
@@ -1080,6 +1094,30 @@ impl Rebuilds {
         self.0.push_back(now);
         self.0.len() <= REBUILD_LIMIT
     }
+}
+
+/// What the tuner's device line says of the system volume and whether the
+/// loudness contour adds anything at it, when the profile has the contour
+/// on.
+fn contour_text(profile: &Profile, volume_db: Option<f32>) -> Option<String> {
+    let contour = &profile.contour;
+    if !contour.enabled {
+        return None;
+    }
+    let Some(volume) = volume_db else {
+        return Some("volume unknown, contour idle".into());
+    };
+    let below = (contour.reference_db - volume).max(0.0);
+    let bass = (contour.bass_per_db * below).min(contour.max_bass_db);
+    let treble = (contour.treble_per_db * below).min(contour.max_treble_db);
+    let state = if bass > 0.0 || treble > 0.0 {
+        "acting"
+    } else {
+        "idle"
+    };
+    // Adding 0 turns -0 into 0.
+    let shown = volume.round() + 0.0;
+    Some(format!("volume {shown} dB, contour {state}"))
 }
 
 /// When the session may next restart to change the apps it leaves alone,
@@ -1244,7 +1282,7 @@ impl Session {
         // SAFETY: `on_change` and `on_rebuild` only touch statics, and
         // `on_overload` gets `Stats`, which `run` keeps alive past every
         // session.
-        let listeners = unsafe {
+        let mut listeners = unsafe {
             vec![
                 hal::Listener::add(
                     aggregate.id,
@@ -1296,6 +1334,26 @@ impl Session {
                 )?,
             ]
         };
+        // A volume that cannot be watched is still read every `VOLUME_POLL`.
+        listeners.extend(
+            hal::volume_elements(target.device)
+                .into_iter()
+                .filter_map(|element| {
+                    // SAFETY: `on_volume` only touches a static.
+                    unsafe {
+                        hal::Listener::add_on_element(
+                            target.device,
+                            hal::kAudioDevicePropertyVolumeDecibels,
+                            hal::kAudioObjectPropertyScopeOutput,
+                            element,
+                            Some(on_volume),
+                            ptr::null_mut(),
+                            "watch the output volume",
+                        )
+                    }
+                    .ok()
+                }),
+        );
         let io = notify_if_slow(on_slow_start, || {
             // SAFETY: `io_proc::<Processor>` expects an `Engine<Processor>`.
             unsafe { hal::IoProc::start(aggregate.id, Some(io_proc::<Processor>), engine) }
@@ -1462,6 +1520,10 @@ trait Chain {
     fn latency_frames(&self) -> usize {
         0
     }
+
+    /// The system volume in dB below maximum, `None` when unknown. Called
+    /// on the callback, so it may not allocate or free.
+    fn set_volume_db(&mut self, _volume_db: Option<f32>) {}
 }
 
 impl Chain for Processor {
@@ -1475,6 +1537,10 @@ impl Chain for Processor {
 
     fn latency_frames(&self) -> usize {
         Processor::latency_frames(self)
+    }
+
+    fn set_volume_db(&mut self, volume_db: Option<f32>) {
+        Processor::set_volume_db(self, volume_db);
     }
 }
 
@@ -1753,6 +1819,16 @@ unsafe extern "C-unwind" fn on_change(
     _client: *mut c_void,
 ) -> i32 {
     CHANGED.store(true, Relaxed);
+    0
+}
+
+unsafe extern "C-unwind" fn on_volume(
+    _object: ObjectId,
+    _count: u32,
+    _addresses: NonNull<hal::PropertyAddress>,
+    _client: *mut c_void,
+) -> i32 {
+    VOLUME.store(true, Relaxed);
     0
 }
 
@@ -2815,6 +2891,29 @@ mod tests {
         );
         live.announce("Speakers", 48_000, true, None);
         assert_eq!(live.tuner.message(), "now on Speakers at 48000 Hz");
+    }
+
+    #[test]
+    fn the_device_line_shows_the_volume_and_whether_the_contour_acts() {
+        let mut profile = Profile::default();
+        profile.contour.enabled = false;
+        assert_eq!(contour_text(&profile, Some(-30.0)), None);
+        profile.contour.enabled = true;
+        profile.contour.reference_db = -10.0;
+        profile.contour.bass_per_db = 0.5;
+        profile.contour.treble_per_db = 0.25;
+        let text = |v| contour_text(&profile, v).unwrap();
+        assert_eq!(text(None), "volume unknown, contour idle");
+        assert_eq!(text(Some(-18.4)), "volume -18 dB, contour acting");
+        assert_eq!(text(Some(-10.0)), "volume -10 dB, contour idle");
+        assert_eq!(text(Some(-0.2)), "volume 0 dB, contour idle");
+        // Nothing to add at any volume: idle.
+        profile.contour.max_bass_db = 0.0;
+        profile.contour.max_treble_db = 0.0;
+        assert_eq!(
+            contour_text(&profile, Some(-40.0)).unwrap(),
+            "volume -40 dB, contour idle"
+        );
     }
 
     #[test]

@@ -98,6 +98,8 @@ pub struct View<'a> {
     pub rate: u32,
     pub clamped: u64,
     pub dry_gain: f32,
+    /// The system volume and what the loudness contour does at it.
+    pub contour: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -146,7 +148,8 @@ pub fn layout(view: &View, width: u16, height: u16, top: &mut usize) -> Vec<Line
         n => status += &format!("  {n} EQ bands skipped"),
     }
     let (at, count) = tuner.position();
-    let output = format!("{} at {} Hz   ", view.device, view.rate);
+    let contour = view.contour.map(|c| format!(", {c}")).unwrap_or_default();
+    let output = format!("{} at {} Hz{contour}   ", view.device, view.rate);
     let room = width.saturating_sub(output.chars().count());
     let mut lines = vec![
         line(status, Style::Bold),
@@ -722,6 +725,7 @@ mod tests {
             rate: 48_000,
             clamped: 0,
             dry_gain: 1.0,
+            contour: None,
         }
     }
 
