@@ -3,13 +3,19 @@
 //! output limiter from US 9,350,309). See docs/patent-spec-core.md and
 //! docs/patent-spec-later.md.
 
+pub mod bass;
 pub mod bell;
+pub mod biquad;
 pub mod chain;
 pub mod compressor;
+pub mod contour;
+pub mod correction;
+pub mod crossfeed;
+pub mod leveler;
 pub mod limiter;
 pub mod profile;
 pub mod shelf;
 pub mod stereo;
 
-pub use chain::Processor;
+pub use chain::{Meters, Processor};
 pub use profile::Profile;

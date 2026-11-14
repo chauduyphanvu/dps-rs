@@ -1891,6 +1891,11 @@ mod tests {
         let dir = Scratch::new("keys");
         let (mut live, path) = live_in(&dir, "output_gain_db = -3.0\n", None);
         let (handoff, controls) = (Handoff::new(), Controls::default());
+        // Down past the leveler's six settings to the input gain.
+        for _ in 0..6 {
+            assert!(!live.step(Some(Key::Down), 48_000, &handoff, &controls));
+        }
+        assert!(handoff.take().is_none());
         assert!(!live.step(Some(Key::Right), 48_000, &handoff, &controls));
         let want = Profile {
             input_gain_db: 0.5,
@@ -1928,7 +1933,7 @@ mod tests {
             handoff.take()
         };
         // Down to the fourth band, then Tab to its frequency: no new chain.
-        for _ in 0..16 {
+        for _ in 0..22 {
             assert!(press(&mut live, Key::Down).is_none());
         }
         assert!(press(&mut live, Key::Tab).is_none());

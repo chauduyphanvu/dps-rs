@@ -750,9 +750,9 @@ mod tests {
             text[1],
             "MacBook Pro Speakers at 48000 Hz   presets/music.toml"
         );
-        assert!(text[2].starts_with("-- 1/34 ---"));
-        assert_eq!(text[3], " Gains");
-        assert_eq!(selected(&lines), [">   input gain               +0.0 dB "]);
+        assert!(text[2].starts_with("-- 1/57 ---"));
+        assert_eq!(text[3], " Leveler");
+        assert_eq!(selected(&lines), [">   enabled                      off "]);
         assert_eq!(&text[22..], LEGEND);
         // The selection is marked in the text, not only by the highlight.
         assert!(text[4].starts_with('>'));
@@ -763,18 +763,18 @@ mod tests {
     fn the_list_scrolls_to_keep_the_selection_in_view() {
         let mut tuner = Tuner::new(Profile::default(), String::new());
         let mut top = 0;
-        for _ in 0..33 {
+        for _ in 0..56 {
             tuner.apply(Action::Down, 48_000);
             let lines = layout(&view(&tuner), 80, 24, &mut top);
             assert_eq!(selected(&lines).len(), 1, "{:#?}", texts(&lines));
         }
         let lines = layout(&view(&tuner), 80, 24, &mut top);
-        assert!(selected(&lines)[0].contains("release"));
-        assert!(texts(&lines)[2].starts_with("-- 34/34 "));
+        assert!(selected(&lines)[0].contains("true peak"));
+        assert!(texts(&lines)[2].starts_with("-- 57/57 "));
         assert!(texts(&lines).contains(&" Limiter"), "{:#?}", texts(&lines));
         assert!(top > 0);
         // Back up to compressor 2's first setting: its heading shows too.
-        for _ in 0..24 {
+        for _ in 0..41 {
             tuner.apply(Action::Up, 48_000);
             layout(&view(&tuner), 80, 24, &mut top);
         }
@@ -952,7 +952,8 @@ mod tests {
     /// The tuner with band `band` selected and `tabs` presses of Tab made.
     fn on_band(profile: Profile, band: usize, tabs: usize) -> Tuner {
         let mut tuner = Tuner::new(profile, String::new());
-        for _ in 0..13 + band {
+        // 19 settings come before the bands.
+        for _ in 0..19 + band {
             tuner.apply(Action::Down, 48_000);
         }
         for _ in 0..tabs {

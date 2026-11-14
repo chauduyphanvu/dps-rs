@@ -30,6 +30,12 @@ pub enum Dynamics {
 /// One setting the tuner lists.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Setting {
+    LevelerEnabled,
+    LevelerTarget,
+    LevelerMaxBoost,
+    LevelerMaxCut,
+    LevelerRise,
+    LevelerFall,
     InputGain,
     OutputGain,
     ShelfCorner,
@@ -38,12 +44,29 @@ pub enum Setting {
     Dynamics(Stage, Dynamics),
     /// One EQ band: its frequency, Q and gain on one row.
     Band(usize),
+    BassEnabled,
+    BassCutoff,
+    BassHarmonics,
+    BassRemoveLows,
+    ContourEnabled,
+    ContourReference,
+    ContourBassPerDb,
+    ContourTreblePerDb,
+    ContourMaxBass,
+    ContourMaxTreble,
     StereoEnabled,
     Crossover,
     SideBoost,
+    CrossfeedEnabled,
+    CrossfeedCutoff,
+    CrossfeedLevel,
+    CorrectionEnabled,
+    CorrectionPreamp,
     LimiterEnabled,
     Ceiling,
     LimiterRelease,
+    Lookahead,
+    TruePeak,
 }
 
 /// The value of an EQ band that Left and Right change; other settings have
@@ -73,6 +96,10 @@ impl Field {
 /// reached does not depend on the device in use while tuning.
 const MAX_BAND_HZ: f32 = 24_000.0;
 
+/// The leveler's slowest rate up or down, which validation allows; it is off
+/// the rates' grid.
+const MIN_LEVELER_RATE: f32 = 0.05;
+
 enum Unit {
     Db,
     Hz,
@@ -81,6 +108,10 @@ enum Unit {
     /// An EQ band's frequency.
     BandHz,
     Q,
+    Lufs,
+    DbPerS,
+    /// dB added per dB of volume.
+    DbPerDb,
 }
 
 /// How a value moves on Left and Right.
@@ -88,6 +119,9 @@ enum Unit {
 enum Grid {
     /// To the next multiple of the coarse or the fine step.
     Linear { coarse: f64, fine: f64 },
+    /// Like `Linear`, but a step down that would pass `min` stops on it, so
+    /// a minimum off the grid can be reached.
+    Floored { coarse: f64, fine: f64, min: f32 },
     /// Along `octave_point`s through `anchor`.
     Octaves { anchor: f64 },
 }
@@ -106,6 +140,18 @@ impl Grid {
                 coarse,
                 fine: fine_step,
             } => snap(value, if fine { fine_step } else { coarse }, up),
+            Self::Floored {
+                coarse,
+                fine: fine_step,
+                min,
+            } => {
+                let next = snap(value, if fine { fine_step } else { coarse }, up);
+                if !up && next < min && value > min {
+                    min
+                } else {
+                    next
+                }
+            }
             Self::Octaves { anchor } => {
                 let every = if fine { 1 } else { POINTS_PER_COARSE_STEP };
                 step_octaves(value, anchor, every, up)
@@ -163,6 +209,12 @@ impl Setting {
         let dynamics =
             |stage| [Threshold, Ratio, Attack, Release].map(|d| Self::Dynamics(stage, d));
         [
+            Self::LevelerEnabled,
+            Self::LevelerTarget,
+            Self::LevelerMaxBoost,
+            Self::LevelerMaxCut,
+            Self::LevelerRise,
+            Self::LevelerFall,
             Self::InputGain,
             Self::OutputGain,
             Self::ShelfCorner,
@@ -173,29 +225,80 @@ impl Setting {
         .chain(dynamics(Stage::One))
         .chain(dynamics(Stage::Two))
         .chain((0..EQ_BANDS).map(Self::Band))
-        .chain([Self::StereoEnabled, Self::Crossover, Self::SideBoost])
+        .chain([
+            Self::BassEnabled,
+            Self::BassCutoff,
+            Self::BassHarmonics,
+            Self::BassRemoveLows,
+            Self::ContourEnabled,
+            Self::ContourReference,
+            Self::ContourBassPerDb,
+            Self::ContourTreblePerDb,
+            Self::ContourMaxBass,
+            Self::ContourMaxTreble,
+            Self::StereoEnabled,
+            Self::Crossover,
+            Self::SideBoost,
+        ])
         .chain(dynamics(Stage::Stereo))
-        .chain([Self::LimiterEnabled, Self::Ceiling, Self::LimiterRelease])
+        .chain([
+            Self::CrossfeedEnabled,
+            Self::CrossfeedCutoff,
+            Self::CrossfeedLevel,
+            Self::CorrectionEnabled,
+            Self::CorrectionPreamp,
+            Self::LimiterEnabled,
+            Self::Ceiling,
+            Self::LimiterRelease,
+            Self::Lookahead,
+            Self::TruePeak,
+        ])
         .collect()
     }
 
     fn group(self) -> &'static str {
         match self {
+            Self::LevelerEnabled
+            | Self::LevelerTarget
+            | Self::LevelerMaxBoost
+            | Self::LevelerMaxCut
+            | Self::LevelerRise
+            | Self::LevelerFall => "Leveler",
             Self::InputGain | Self::OutputGain => "Gains",
             Self::ShelfCorner | Self::LowShelf | Self::HighShelf => "Shelves",
             Self::Dynamics(Stage::One, _) => "Compressor 1",
             Self::Dynamics(Stage::Two, _) => "Compressor 2",
             Self::Band(_) => "EQ bands",
+            Self::BassEnabled | Self::BassCutoff | Self::BassHarmonics | Self::BassRemoveLows => {
+                "Bass"
+            }
+            Self::ContourEnabled
+            | Self::ContourReference
+            | Self::ContourBassPerDb
+            | Self::ContourTreblePerDb
+            | Self::ContourMaxBass
+            | Self::ContourMaxTreble => "Contour",
             Self::StereoEnabled
             | Self::Crossover
             | Self::SideBoost
             | Self::Dynamics(Stage::Stereo, _) => "Stereo",
-            Self::LimiterEnabled | Self::Ceiling | Self::LimiterRelease => "Limiter",
+            Self::CrossfeedEnabled | Self::CrossfeedCutoff | Self::CrossfeedLevel => "Crossfeed",
+            Self::CorrectionEnabled | Self::CorrectionPreamp => "Correction",
+            Self::LimiterEnabled
+            | Self::Ceiling
+            | Self::LimiterRelease
+            | Self::Lookahead
+            | Self::TruePeak => "Limiter",
         }
     }
 
     fn label(self) -> &'static str {
         match self {
+            Self::LevelerTarget => "target",
+            Self::LevelerMaxBoost => "max boost",
+            Self::LevelerMaxCut => "max cut",
+            Self::LevelerRise => "rise",
+            Self::LevelerFall => "fall",
             Self::InputGain => "input gain",
             Self::OutputGain => "output gain",
             Self::ShelfCorner => "corner",
@@ -206,10 +309,28 @@ impl Setting {
             Self::Dynamics(_, Dynamics::Attack) => "attack",
             Self::Dynamics(_, Dynamics::Release) | Self::LimiterRelease => "release",
             Self::Band(_) => "EQ band",
-            Self::StereoEnabled | Self::LimiterEnabled => "enabled",
+            Self::LevelerEnabled
+            | Self::BassEnabled
+            | Self::ContourEnabled
+            | Self::StereoEnabled
+            | Self::CrossfeedEnabled
+            | Self::CorrectionEnabled
+            | Self::LimiterEnabled => "enabled",
+            Self::BassCutoff | Self::CrossfeedCutoff => "cutoff",
+            Self::BassHarmonics => "harmonics",
+            Self::BassRemoveLows => "remove lows",
+            Self::ContourReference => "reference",
+            Self::ContourBassPerDb => "bass per dB",
+            Self::ContourTreblePerDb => "treble per dB",
+            Self::ContourMaxBass => "max bass",
+            Self::ContourMaxTreble => "max treble",
             Self::Crossover => "crossover",
             Self::SideBoost => "side boost",
+            Self::CrossfeedLevel => "level",
+            Self::CorrectionPreamp => "preamp",
             Self::Ceiling => "ceiling",
+            Self::Lookahead => "lookahead",
+            Self::TruePeak => "true peak",
         }
     }
 
@@ -217,6 +338,11 @@ impl Setting {
     /// for an on/off switch.
     fn number(self, field: Field, p: &mut Profile) -> Option<&mut f32> {
         Some(match self {
+            Self::LevelerTarget => &mut p.leveler.target_lufs,
+            Self::LevelerMaxBoost => &mut p.leveler.max_boost_db,
+            Self::LevelerMaxCut => &mut p.leveler.max_cut_db,
+            Self::LevelerRise => &mut p.leveler.rise_db_per_s,
+            Self::LevelerFall => &mut p.leveler.fall_db_per_s,
             Self::InputGain => &mut p.input_gain_db,
             Self::OutputGain => &mut p.output_gain_db,
             Self::ShelfCorner => &mut p.shelf_corner_hz,
@@ -258,19 +384,45 @@ impl Setting {
                 Field::Q => &mut p.eq.q[i],
                 Field::Gain => &mut p.eq.gains_db[i],
             },
-            Self::StereoEnabled | Self::LimiterEnabled => return None,
+            Self::LevelerEnabled
+            | Self::BassEnabled
+            | Self::BassRemoveLows
+            | Self::ContourEnabled
+            | Self::StereoEnabled
+            | Self::CrossfeedEnabled
+            | Self::CorrectionEnabled
+            | Self::LimiterEnabled
+            | Self::TruePeak => return None,
+            Self::BassCutoff => &mut p.bass.cutoff_hz,
+            Self::BassHarmonics => &mut p.bass.harmonics_db,
+            Self::ContourReference => &mut p.contour.reference_db,
+            Self::ContourBassPerDb => &mut p.contour.bass_per_db,
+            Self::ContourTreblePerDb => &mut p.contour.treble_per_db,
+            Self::ContourMaxBass => &mut p.contour.max_bass_db,
+            Self::ContourMaxTreble => &mut p.contour.max_treble_db,
             Self::Crossover => &mut p.stereo.crossover_hz,
             Self::SideBoost => &mut p.stereo.side_boost_db,
+            Self::CrossfeedCutoff => &mut p.crossfeed.cutoff_hz,
+            Self::CrossfeedLevel => &mut p.crossfeed.level_db,
+            Self::CorrectionPreamp => &mut p.correction.preamp_db,
             Self::Ceiling => &mut p.limiter.ceiling_db,
             Self::LimiterRelease => &mut p.limiter.release_ms,
+            Self::Lookahead => &mut p.limiter.lookahead_ms,
         })
     }
 
     /// The switch this setting turns on and off, if it is one.
     fn switch(self, p: &mut Profile) -> Option<&mut bool> {
         match self {
+            Self::LevelerEnabled => Some(&mut p.leveler.enabled),
+            Self::BassEnabled => Some(&mut p.bass.enabled),
+            Self::BassRemoveLows => Some(&mut p.bass.remove_lows),
+            Self::ContourEnabled => Some(&mut p.contour.enabled),
             Self::StereoEnabled => Some(&mut p.stereo.enabled),
+            Self::CrossfeedEnabled => Some(&mut p.crossfeed.enabled),
+            Self::CorrectionEnabled => Some(&mut p.correction.enabled),
             Self::LimiterEnabled => Some(&mut p.limiter.enabled),
+            Self::TruePeak => Some(&mut p.limiter.true_peak),
             _ => None,
         }
     }
@@ -282,11 +434,16 @@ impl Setting {
                 Field::Q => Unit::Q,
                 Field::Gain => Unit::Db,
             },
-            Self::ShelfCorner | Self::Crossover => Unit::Hz,
-            Self::Dynamics(_, Dynamics::Ratio) => Unit::Ratio,
-            Self::Dynamics(_, Dynamics::Attack | Dynamics::Release) | Self::LimiterRelease => {
-                Unit::Ms
+            Self::ShelfCorner | Self::Crossover | Self::BassCutoff | Self::CrossfeedCutoff => {
+                Unit::Hz
             }
+            Self::Dynamics(_, Dynamics::Ratio) => Unit::Ratio,
+            Self::Dynamics(_, Dynamics::Attack | Dynamics::Release)
+            | Self::LimiterRelease
+            | Self::Lookahead => Unit::Ms,
+            Self::LevelerTarget => Unit::Lufs,
+            Self::LevelerRise | Self::LevelerFall => Unit::DbPerS,
+            Self::ContourBassPerDb | Self::ContourTreblePerDb => Unit::DbPerDb,
             _ => Unit::Db,
         }
     }
@@ -299,10 +456,17 @@ impl Setting {
                 Field::Q => Grid::Octaves { anchor: 1.0 },
                 Field::Gain => linear(0.5, 0.1),
             },
-            Self::ShelfCorner => linear(50.0, 10.0),
+            Self::ShelfCorner | Self::CrossfeedCutoff => linear(50.0, 10.0),
             Self::Crossover => linear(10.0, 1.0),
+            Self::BassCutoff => linear(5.0, 1.0),
             Self::Dynamics(_, Dynamics::Threshold | Dynamics::Attack) => linear(1.0, 0.1),
             Self::Dynamics(_, Dynamics::Release) | Self::LimiterRelease => linear(10.0, 1.0),
+            Self::LevelerRise | Self::LevelerFall => Grid::Floored {
+                coarse: 0.5,
+                fine: 0.1,
+                min: MIN_LEVELER_RATE,
+            },
+            Self::ContourBassPerDb | Self::ContourTreblePerDb => linear(0.05, 0.01),
             _ => linear(0.5, 0.1),
         }
     }
@@ -315,12 +479,15 @@ impl Setting {
             return if on { "on" } else { "off" }.into();
         };
         match self.unit(field) {
-            Unit::Db => format!("{} dB", decimal(v, true)),
+            Unit::Db => format!("{} dB", decimal(v, 1, true)),
             Unit::Hz => format!("{v} Hz"),
-            Unit::Ratio => format!("{}:1", decimal(v, false)),
-            Unit::Ms => format!("{} ms", decimal(v, false)),
+            Unit::Ratio => format!("{}:1", decimal(v, 1, false)),
+            Unit::Ms => format!("{} ms", decimal(v, 1, false)),
             Unit::BandHz => format!("{} Hz", significant(v)),
             Unit::Q => format!("Q {}", significant(v)),
+            Unit::Lufs => format!("{} LUFS", decimal(v, 1, true)),
+            Unit::DbPerS => format!("{} dB/s", decimal(v, 1, false)),
+            Unit::DbPerDb => format!("{} dB/dB", decimal(v, 2, false)),
         }
     }
 }
@@ -337,13 +504,13 @@ fn significant(v: f32) -> String {
     }
 }
 
-/// `v` with one decimal, or with as many as it needs to be exact.
-fn decimal(v: f32, signed: bool) -> String {
+/// `v` with `places` decimals, or with as many as it needs to be exact.
+fn decimal(v: f32, places: usize, signed: bool) -> String {
     let v = v + 0.0; // never "-0.0"
     let short = if signed {
-        format!("{v:+.1}")
+        format!("{v:+.places$}")
     } else {
-        format!("{v:.1}")
+        format!("{v:.places$}")
     };
     if short.parse::<f32>() == Ok(v) {
         short
@@ -807,6 +974,11 @@ mod tests {
         t.key(key, RATE)
     }
 
+    /// Where `setting` is in the list.
+    fn position(setting: Setting) -> usize {
+        Setting::all().iter().position(|&s| s == setting).unwrap()
+    }
+
     /// Moves down to `setting`, which must be at or below the selection.
     fn select(t: &mut Tuner, setting: Setting) {
         let target = t.settings.iter().position(|&s| s == setting).unwrap();
@@ -852,18 +1024,25 @@ mod tests {
         assert_eq!(
             groups,
             [
+                "Leveler",
                 "Gains",
                 "Shelves",
                 "Compressor 1",
                 "Compressor 2",
                 "EQ bands",
+                "Bass",
+                "Contour",
                 "Stereo",
+                "Crossfeed",
+                "Correction",
                 "Limiter"
             ]
         );
-        // 2 gains, 3 shelf values, 4 + 4 compressor values, 11 bands,
-        // 7 stereo values and 3 limiter values.
-        assert_eq!(rows.len() - groups.len(), 34);
+        // 6 leveler values, 2 gains, 3 shelf values, 4 + 4 compressor
+        // values, 11 bands, 4 bass values, 6 contour values, 7 stereo
+        // values, 3 crossfeed values, 2 correction values and 5 limiter
+        // values.
+        assert_eq!(rows.len() - groups.len(), 57);
         let labels: Vec<String> = rows
             .iter()
             .filter_map(|r| match r {
@@ -872,39 +1051,88 @@ mod tests {
                 Row::Group(_) => None,
             })
             .collect();
-        assert_eq!(labels[0], "input gain: +0.0 dB");
-        assert_eq!(labels[2], "corner: 1000 Hz");
-        assert_eq!(labels[3], "low shelf: -10.0 dB");
-        assert_eq!(labels[6], "ratio: 4.0:1");
-        assert_eq!(labels[8], "release: 100.0 ms");
-        assert_eq!(labels[13], "30.0 Hz  Q 1.50: +0.0 dB");
-        assert_eq!(labels[14], "56.4 Hz  Q 1.50: +0.0 dB");
-        assert_eq!(labels[17], "375 Hz  Q 1.50: +0.0 dB");
-        // Off the three-figure grid, shown exactly.
-        assert_eq!(labels[19], "1327 Hz  Q 1.50: +0.0 dB");
-        assert_eq!(labels[23], "16000 Hz  Q 1.50: +0.0 dB");
-        assert_eq!(labels[24], "enabled: off");
-        assert_eq!(labels[30], "release: 200.0 ms");
-        assert_eq!(labels[31], "enabled: on");
-        assert_eq!(labels[32], "ceiling: -1.0 dB");
-        assert_eq!(labels[33], "release: 100.0 ms");
+        let compressor = [
+            "threshold: -20.0 dB",
+            "ratio: 4.0:1",
+            "attack: 10.0 ms",
+            "release: 100.0 ms",
+        ];
+        let want: Vec<&str> = [
+            "enabled: off",
+            "target: -14.0 LUFS",
+            "max boost: +12.0 dB",
+            "max cut: +12.0 dB",
+            "rise: 1.0 dB/s",
+            "fall: 4.0 dB/s",
+            "input gain: +0.0 dB",
+            "output gain: +7.0 dB",
+            "corner: 1000 Hz",
+            "low shelf: -10.0 dB",
+            "high shelf: +8.0 dB",
+        ]
+        .into_iter()
+        .chain(compressor)
+        .chain(compressor)
+        .chain([
+            "30.0 Hz  Q 1.50: +0.0 dB",
+            "56.4 Hz  Q 1.50: +0.0 dB",
+            "106 Hz  Q 1.50: +0.0 dB",
+            "199 Hz  Q 1.50: +0.0 dB",
+            "375 Hz  Q 1.50: +0.0 dB",
+            "705 Hz  Q 1.50: +0.0 dB",
+            // Off the three-figure grid, shown exactly.
+            "1327 Hz  Q 1.50: +0.0 dB",
+            "2497 Hz  Q 1.50: +0.0 dB",
+            "4698 Hz  Q 1.50: +0.0 dB",
+            "8839 Hz  Q 1.50: +0.0 dB",
+            "16000 Hz  Q 1.50: +0.0 dB",
+            "enabled: off",
+            "cutoff: 100 Hz",
+            "harmonics: +0.0 dB",
+            "remove lows: off",
+            "enabled: off",
+            "reference: -12.0 dB",
+            "bass per dB: 0.35 dB/dB",
+            "treble per dB: 0.10 dB/dB",
+            "max bass: +9.0 dB",
+            "max treble: +4.0 dB",
+            "enabled: off",
+            "crossover: 200 Hz",
+            "side boost: +8.0 dB",
+            "threshold: -30.0 dB",
+            "ratio: 4.0:1",
+            "attack: 10.0 ms",
+            "release: 200.0 ms",
+            "enabled: off",
+            "cutoff: 700 Hz",
+            "level: -4.5 dB",
+            "enabled: off",
+            "preamp: +0.0 dB",
+            "enabled: on",
+            "ceiling: -1.0 dB",
+            "release: 100.0 ms",
+            "lookahead: 1.5 ms",
+            "true peak: on",
+        ])
+        .collect();
+        assert_eq!(labels, want);
     }
 
     #[test]
     fn selection_moves_and_stops_at_both_ends() {
         let mut t = tuner();
         assert_eq!(press(&mut t, Key::Up), Effect::None);
-        assert_eq!(t.position(), (0, 34));
+        assert_eq!(t.position(), (0, 57));
         press(&mut t, Key::Char('j'));
         press(&mut t, Key::Down);
-        assert_eq!(selected(&t).0, "corner");
+        assert_eq!(selected(&t).0, "max boost");
         press(&mut t, Key::Char('k'));
-        assert_eq!(selected(&t).0, "output gain");
-        for _ in 0..40 {
+        assert_eq!(selected(&t).0, "target");
+        for _ in 0..60 {
             press(&mut t, Key::Down);
         }
-        assert_eq!(t.position(), (33, 34));
-        assert_eq!(t.settings[33], Setting::LimiterRelease);
+        assert_eq!(t.position(), (56, 57));
+        assert_eq!(t.settings[56], Setting::TruePeak);
     }
 
     #[test]
@@ -912,6 +1140,11 @@ mod tests {
         use Dynamics::*;
         // (setting, after one coarse step up, after one fine step down from there)
         let cases = [
+            (Setting::LevelerTarget, "-13.5 LUFS", "-13.6 LUFS"),
+            (Setting::LevelerMaxBoost, "+12.5 dB", "+12.4 dB"),
+            (Setting::LevelerMaxCut, "+12.5 dB", "+12.4 dB"),
+            (Setting::LevelerRise, "1.5 dB/s", "1.4 dB/s"),
+            (Setting::LevelerFall, "4.5 dB/s", "4.4 dB/s"),
             (Setting::InputGain, "+0.5 dB", "+0.4 dB"),
             (Setting::OutputGain, "+7.5 dB", "+7.4 dB"),
             (Setting::ShelfCorner, "1050 Hz", "1040 Hz"),
@@ -929,6 +1162,13 @@ mod tests {
                 "109.0 ms",
             ),
             (Setting::Band(4), "+0.5 dB", "+0.4 dB"),
+            (Setting::BassCutoff, "105 Hz", "104 Hz"),
+            (Setting::BassHarmonics, "+0.5 dB", "+0.4 dB"),
+            (Setting::ContourReference, "-11.5 dB", "-11.6 dB"),
+            (Setting::ContourBassPerDb, "0.40 dB/dB", "0.39 dB/dB"),
+            (Setting::ContourTreblePerDb, "0.15 dB/dB", "0.14 dB/dB"),
+            (Setting::ContourMaxBass, "+9.5 dB", "+9.4 dB"),
+            (Setting::ContourMaxTreble, "+4.5 dB", "+4.4 dB"),
             (Setting::Crossover, "210 Hz", "209 Hz"),
             (Setting::SideBoost, "+8.5 dB", "+8.4 dB"),
             (
@@ -936,8 +1176,12 @@ mod tests {
                 "210.0 ms",
                 "209.0 ms",
             ),
+            (Setting::CrossfeedCutoff, "750 Hz", "740 Hz"),
+            (Setting::CrossfeedLevel, "-4.0 dB", "-4.1 dB"),
+            (Setting::CorrectionPreamp, "+0.5 dB", "+0.4 dB"),
             (Setting::Ceiling, "-0.5 dB", "-0.6 dB"),
             (Setting::LimiterRelease, "110.0 ms", "109.0 ms"),
+            (Setting::Lookahead, "2.0 ms", "1.9 ms"),
         ];
         for (setting, up, fine_down) in cases {
             let mut t = tuner();
@@ -952,6 +1196,7 @@ mod tests {
     #[test]
     fn steps_land_on_the_grid_and_store_exact_values() {
         let mut t = tuner();
+        select(&mut t, Setting::InputGain);
         for code in [Key::Char('l'), Key::Char('L'), Key::Char('L')] {
             press(&mut t, code);
         }
@@ -968,6 +1213,7 @@ mod tests {
             ..Profile::default()
         };
         let mut t = Tuner::new(p, String::new());
+        select(&mut t, Setting::InputGain);
         press(&mut t, Key::Right);
         assert_eq!(t.profile().input_gain_db, 1.5);
         press(&mut t, Key::Char('H'));
@@ -986,6 +1232,7 @@ mod tests {
         assert!(t.profile().stereo.enabled);
         // Space does nothing on a number.
         let mut t = tuner();
+        select(&mut t, Setting::InputGain);
         assert_eq!(press(&mut t, Key::Char(' ')), Effect::None);
         assert!(!t.dirty());
     }
@@ -1095,6 +1342,7 @@ mod tests {
     #[test]
     fn dirty_means_different_from_the_last_save_or_load() {
         let mut t = tuner();
+        select(&mut t, Setting::InputGain);
         assert!(!t.dirty());
         press(&mut t, Key::Right);
         assert!(t.dirty());
@@ -1124,6 +1372,7 @@ mod tests {
         let mut t = tuner();
         assert_eq!(press(&mut t, Key::Char('r')), Effect::None);
         assert_eq!(t.message(), "no unsaved changes to revert");
+        select(&mut t, Setting::InputGain);
         press(&mut t, Key::Right); // input gain 0.5
         t.saved();
         press(&mut t, Key::Right); // 1.0
@@ -1156,6 +1405,7 @@ mod tests {
     #[test]
     fn quitting_with_unsaved_changes_asks_first() {
         let mut t = tuner();
+        select(&mut t, Setting::InputGain);
         press(&mut t, Key::Right);
         assert_eq!(press(&mut t, Key::Char('q')), Effect::None);
         assert_eq!(
@@ -1188,6 +1438,7 @@ mod tests {
     #[test]
     fn a_message_while_asking_leaves_the_question_up() {
         let mut t = tuner();
+        select(&mut t, Setting::InputGain);
         press(&mut t, Key::Right);
         press(&mut t, Key::Char('q'));
         t.set_message("now on External Headphones at 44100 Hz".into());
@@ -1269,8 +1520,9 @@ mod tests {
 
     #[test]
     fn negative_zero_prints_as_zero() {
-        assert_eq!(decimal(-0.0, true), "+0.0");
-        assert_eq!(decimal(-0.0, false), "0.0");
+        assert_eq!(decimal(-0.0, 1, true), "+0.0");
+        assert_eq!(decimal(-0.0, 1, false), "0.0");
+        assert_eq!(decimal(-0.0, 2, false), "0.00");
         // As a hand-written profile can hold it.
         let p: Profile = toml::from_str("low_shelf_db = -0.0").unwrap();
         let t = Tuner::new(p, String::new());
@@ -1390,10 +1642,10 @@ mod tests {
         select(&mut t, Setting::Band(7));
         assert_eq!(active(&t), [(7, Field::Q)]);
         // Below the bands, a switch still switches.
-        select(&mut t, Setting::StereoEnabled);
+        select(&mut t, Setting::BassEnabled);
         assert_eq!(active(&t), []);
         assert_eq!(press(&mut t, Key::Left), Effect::Apply);
-        assert!(t.profile().stereo.enabled);
+        assert!(t.profile().bass.enabled);
         // A reload keeps the field too.
         assert!(t.reload(Profile::default()));
         press(&mut t, Key::Up);
@@ -1419,7 +1671,8 @@ mod tests {
         assert!(!t.dirty());
         assert_eq!(t.message(), "now on External Headphones at 44100 Hz");
         // The field did not move: on a band, gain is still the one changed.
-        while t.selected > 13 {
+        let first_band = position(Setting::Band(0));
+        while t.selected > first_band {
             press(&mut t, Key::Up);
         }
         assert_eq!(t.settings[t.selected], Setting::Band(0));
@@ -1755,7 +2008,7 @@ mod tests {
         let dir = scratch_dir("walk");
         let path = dir.join("walk.toml");
         let mut walk = Walk(0x2545_f491_4f6c_dd1d);
-        let first = 13;
+        let first = position(Setting::Band(0));
         let last = first + EQ_BANDS - 1;
         let mut changes = 0;
         for round in 0..24 {
@@ -1865,6 +2118,265 @@ mod tests {
         }
     }
 
+    #[test]
+    fn new_settings_step_within_their_range_and_are_refused_past_it() {
+        // (setting, its name, lowest, highest, a step past each, writes it)
+        type Set = fn(&mut Profile, f32);
+        let cases: [(Setting, &str, f32, f32, f32, f32, Set); 16] = [
+            (
+                Setting::LevelerTarget,
+                "leveler.target_lufs",
+                -40.0,
+                -5.0,
+                -40.5,
+                -4.5,
+                |p, v| p.leveler.target_lufs = v,
+            ),
+            (
+                Setting::LevelerMaxBoost,
+                "leveler.max_boost_db",
+                0.0,
+                24.0,
+                -0.5,
+                24.5,
+                |p, v| p.leveler.max_boost_db = v,
+            ),
+            (
+                Setting::LevelerMaxCut,
+                "leveler.max_cut_db",
+                0.0,
+                24.0,
+                -0.5,
+                24.5,
+                |p, v| p.leveler.max_cut_db = v,
+            ),
+            (
+                Setting::LevelerRise,
+                "leveler.rise_db_per_s",
+                0.05,
+                20.0,
+                0.0,
+                20.5,
+                |p, v| p.leveler.rise_db_per_s = v,
+            ),
+            (
+                Setting::LevelerFall,
+                "leveler.fall_db_per_s",
+                0.05,
+                40.0,
+                0.0,
+                40.5,
+                |p, v| p.leveler.fall_db_per_s = v,
+            ),
+            (
+                Setting::BassCutoff,
+                "bass.cutoff_hz",
+                40.0,
+                250.0,
+                35.0,
+                255.0,
+                |p, v| p.bass.cutoff_hz = v,
+            ),
+            (
+                Setting::BassHarmonics,
+                "bass.harmonics_db",
+                -24.0,
+                12.0,
+                -24.5,
+                12.5,
+                |p, v| p.bass.harmonics_db = v,
+            ),
+            (
+                Setting::ContourReference,
+                "contour.reference_db",
+                -60.0,
+                0.0,
+                -60.5,
+                0.5,
+                |p, v| p.contour.reference_db = v,
+            ),
+            (
+                Setting::ContourBassPerDb,
+                "contour.bass_per_db",
+                0.0,
+                1.0,
+                -0.05,
+                1.05,
+                |p, v| p.contour.bass_per_db = v,
+            ),
+            (
+                Setting::ContourTreblePerDb,
+                "contour.treble_per_db",
+                0.0,
+                1.0,
+                -0.05,
+                1.05,
+                |p, v| p.contour.treble_per_db = v,
+            ),
+            (
+                Setting::ContourMaxBass,
+                "contour.max_bass_db",
+                0.0,
+                18.0,
+                -0.5,
+                18.5,
+                |p, v| p.contour.max_bass_db = v,
+            ),
+            (
+                Setting::ContourMaxTreble,
+                "contour.max_treble_db",
+                0.0,
+                12.0,
+                -0.5,
+                12.5,
+                |p, v| p.contour.max_treble_db = v,
+            ),
+            (
+                Setting::CrossfeedCutoff,
+                "crossfeed.cutoff_hz",
+                300.0,
+                2000.0,
+                250.0,
+                2050.0,
+                |p, v| p.crossfeed.cutoff_hz = v,
+            ),
+            (
+                Setting::CrossfeedLevel,
+                "crossfeed.level_db",
+                -24.0,
+                -1.0,
+                -24.5,
+                -0.5,
+                |p, v| p.crossfeed.level_db = v,
+            ),
+            (
+                Setting::CorrectionPreamp,
+                "correction.preamp_db",
+                -24.0,
+                12.0,
+                -24.5,
+                12.5,
+                |p, v| p.correction.preamp_db = v,
+            ),
+            (
+                Setting::Lookahead,
+                "limiter.lookahead_ms",
+                0.0,
+                10.0,
+                -0.5,
+                10.5,
+                |p, v| p.limiter.lookahead_ms = v,
+            ),
+        ];
+        for (setting, name, lo, hi, below, above, set) in cases {
+            let mut t = tuner();
+            select(&mut t, setting);
+            // Coarse steps up to the top and one past it, then down to the
+            // bottom and one past that; every step on the way is valid.
+            for (key, end, past) in [(Key::Right, hi, above), (Key::Left, lo, below)] {
+                let mut steps = 0;
+                while press(&mut t, key) == Effect::Apply {
+                    assert_eq!(t.profile().validate(RATE), Ok(()), "{name}");
+                    steps += 1;
+                    assert!(steps < 1000, "{name} never stops");
+                }
+                let mut want = Profile::default();
+                set(&mut want, end);
+                assert_eq!(t.profile(), &want, "{name} {key:?}");
+                assert_eq!(
+                    t.message(),
+                    format!("refused: {name} = {past} is outside {lo}..={hi}"),
+                    "{name}"
+                );
+                // A fine step back goes through.
+                let back = if key == Key::Right {
+                    Key::ShiftLeft
+                } else {
+                    Key::ShiftRight
+                };
+                assert_eq!(press(&mut t, back), Effect::Apply, "{name}");
+                assert_eq!(press(&mut t, key), Effect::Apply, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn leveler_rates_reach_their_minimum_off_the_grid() {
+        // 0.05 dB/s is not a multiple of either step: a step down that would
+        // pass it stops on it, and from it a step up goes back on the grid.
+        let mut t = tuner();
+        select(&mut t, Setting::LevelerRise);
+        let mut rates = vec![];
+        while press(&mut t, Key::ShiftLeft) == Effect::Apply {
+            rates.push(t.profile().leveler.rise_db_per_s);
+        }
+        assert_eq!(rates, [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05]);
+        assert_eq!(selected(&t).1, "0.05 dB/s");
+        assert_eq!(
+            t.message(),
+            "refused: leveler.rise_db_per_s = 0 is outside 0.05..=20"
+        );
+        assert_eq!(press(&mut t, Key::ShiftRight), Effect::Apply);
+        assert_eq!(t.profile().leveler.rise_db_per_s, 0.1);
+        assert_eq!(press(&mut t, Key::Left), Effect::Apply);
+        assert_eq!(t.profile().leveler.rise_db_per_s, 0.05);
+        assert_eq!(press(&mut t, Key::Right), Effect::Apply);
+        assert_eq!(t.profile().leveler.rise_db_per_s, 0.5);
+        // A hand-written value between the minimum and the grid.
+        let mut p = Profile::default();
+        p.leveler.fall_db_per_s = 0.07;
+        let mut t = Tuner::new(p, String::new());
+        select(&mut t, Setting::LevelerFall);
+        assert_eq!(press(&mut t, Key::ShiftLeft), Effect::Apply);
+        assert_eq!(t.profile().leveler.fall_db_per_s, 0.05);
+        assert_eq!(press(&mut t, Key::Left), Effect::None);
+    }
+
+    #[test]
+    fn new_switches_toggle_with_space_or_left_and_right() {
+        type Set = fn(&mut Profile, bool);
+        let cases: [(Setting, &str, Set); 7] = [
+            (Setting::LevelerEnabled, "off", |p, on| {
+                p.leveler.enabled = on
+            }),
+            (Setting::BassEnabled, "off", |p, on| p.bass.enabled = on),
+            (Setting::BassRemoveLows, "off", |p, on| {
+                p.bass.remove_lows = on
+            }),
+            (Setting::ContourEnabled, "off", |p, on| {
+                p.contour.enabled = on
+            }),
+            (Setting::CrossfeedEnabled, "off", |p, on| {
+                p.crossfeed.enabled = on
+            }),
+            (Setting::CorrectionEnabled, "off", |p, on| {
+                p.correction.enabled = on
+            }),
+            (Setting::TruePeak, "on", |p, on| p.limiter.true_peak = on),
+        ];
+        for (setting, shown, set) in cases {
+            let mut t = tuner();
+            select(&mut t, setting);
+            assert_eq!(selected(&t).1, shown, "{setting:?}");
+            let was = shown == "on";
+            let mut flipped = Profile::default();
+            set(&mut flipped, !was);
+            // Only this switch moves, each way.
+            for (key, want) in [
+                (Key::Char(' '), &flipped),
+                (Key::Left, &Profile::default()),
+                (Key::Char('l'), &flipped),
+                (Key::ShiftLeft, &Profile::default()),
+            ] {
+                assert_eq!(press(&mut t, key), Effect::Apply, "{setting:?} {key:?}");
+                assert_eq!(t.profile(), want, "{setting:?} {key:?}");
+            }
+            assert!(!t.dirty());
+            press(&mut t, Key::Char(' '));
+            assert_eq!(selected(&t).1, if was { "off" } else { "on" });
+        }
+    }
+
     fn scratch_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("dps-tuner-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1874,6 +2386,7 @@ mod tests {
     #[test]
     fn saved_toml_reads_back_as_the_same_profile() {
         let mut t = tuner();
+        select(&mut t, Setting::InputGain);
         let keys = [
             Key::Char('L'), // input gain 0.1
             Key::Down,
@@ -1917,7 +2430,10 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("[limiter]\nenabled = false\nceiling_db = -1.1\nrelease_ms = 110.0\n"),
+            text.contains(
+                "[limiter]\nenabled = false\nceiling_db = -1.1\nrelease_ms = 110.0\n\
+                 lookahead_ms = 1.5\ntrue_peak = true\n"
+            ),
             "{text}"
         );
 

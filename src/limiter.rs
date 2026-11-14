@@ -28,6 +28,8 @@ pub struct Limiter {
     reduction: f32,
     /// Frames still to hold before the release starts.
     hold_left: u32,
+    /// The gain applied to the last frame.
+    gain: f32,
 }
 
 impl Limiter {
@@ -38,6 +40,7 @@ impl Limiter {
             hold: (HOLD_SECONDS * sample_rate).round() as u32,
             reduction: 0.0,
             hold_left: 0,
+            gain: 1.0,
         }
     }
 
@@ -72,6 +75,17 @@ impl Limiter {
                 *x *= gain;
             }
         }
+        self.gain = gain;
+    }
+
+    /// The linear gain applied to the last frame.
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+
+    /// Frames by which the output lags the input.
+    pub fn latency_frames(&self) -> usize {
+        0
     }
 
     /// Starts where `from` is: its gain and what is left of its hold.
@@ -93,6 +107,8 @@ mod tests {
             enabled: true,
             ceiling_db,
             release_ms,
+            lookahead_ms: 0.0,
+            true_peak: false,
         };
         Limiter::new(&params, sample_rate)
     }
@@ -332,6 +348,26 @@ mod tests {
         let mut frame = [0.3, -0.3];
         lim.frame(&mut frame);
         assert_eq!(frame, [0.3, -0.3]);
+    }
+
+    #[test]
+    fn gain_is_what_the_last_frame_was_multiplied_by() {
+        let mut lim = limiter(-1.0, 100.0, FS);
+        assert_eq!(lim.gain(), 1.0);
+        lim.frame(&mut [0.5, -0.25]);
+        assert_eq!(lim.gain(), 1.0);
+        let input = [2.0, -0.5];
+        let mut frame = input;
+        lim.frame(&mut frame);
+        assert!(lim.gain() < level(-1.0) / 2.0 + 1e-6, "{}", lim.gain());
+        assert_eq!(frame, input.map(|x| x * lim.gain()));
+        // Through the hold and the release.
+        for n in 0..2000 {
+            let mut frame = [0.25f32];
+            lim.frame(&mut frame);
+            assert_eq!(frame[0], 0.25 * lim.gain(), "frame {n}");
+        }
+        assert!(lim.gain() > level(-1.0) / 2.0 && lim.gain() < 1.0);
     }
 
     #[test]

@@ -1,5 +1,10 @@
+use crate::bass::Bass;
 use crate::bell::Bell;
 use crate::compressor::Compressor;
+use crate::contour::Contour;
+use crate::correction::Correction;
+use crate::crossfeed::Crossfeed;
+use crate::leveler::Leveler;
 use crate::limiter::Limiter;
 use crate::profile::{EQ_BANDS, Profile};
 use crate::shelf::Shelf;
@@ -22,6 +27,9 @@ struct Channel {
     bells: Vec<Bell>,
     comp2: Compressor,
     output_gain: f32,
+    /// The smallest gain each compressor applied since the last `meters`.
+    comp1_min: f32,
+    comp2_min: f32,
 }
 
 impl Channel {
@@ -52,25 +60,61 @@ impl Channel {
                 .collect(),
             comp2: Compressor::new(&p.compressor2, fs),
             output_gain: db_to_gain(p.output_gain_db),
+            comp1_min: 1.0,
+            comp2_min: 1.0,
         }
     }
 
     fn tick(&mut self, x: f32) -> f32 {
         let x = self.high1.tick(self.low1.tick(x * self.input_gain));
-        let x = self.comp1.tick(x);
-        let x = self.high2.tick(self.low2.tick(x));
+        // `Compressor::tick` split open, to see the gain; the same products.
+        let gain1 = self.comp1.gain(x);
+        self.comp1_min = self.comp1_min.min(gain1);
+        let x = self.high2.tick(self.low2.tick(x * gain1));
         let x = self.bells.iter_mut().fold(x, |x, bell| bell.tick(x));
-        self.comp2.tick(x) * self.output_gain
+        let gain2 = self.comp2.gain(x);
+        self.comp2_min = self.comp2_min.min(gain2);
+        x * gain2 * self.output_gain
+    }
+}
+
+/// Gain reduction and levelling since the last `Processor::meters` call.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Meters {
+    /// The leveler's gain now, in dB; 0 without one.
+    pub leveler_db: f32,
+    /// The largest gain reduction since the last `meters` call, in dB
+    /// (>= 0), over all channels.
+    pub compressor1_db: f32,
+    pub compressor2_db: f32,
+    pub limiter_db: f32,
+}
+
+/// A gain as a reduction in dB, 0 for unity or more.
+fn reduction_db(gain: f32) -> f32 {
+    if gain < 1.0 {
+        -20.0 * gain.log10()
+    } else {
+        0.0
     }
 }
 
 /// The full chain for one stream. State carries across `process` calls, so
 /// the output does not depend on how the stream is split into blocks.
+///
+/// Each optional stage is absent when disabled, which passes audio through
+/// it unchanged.
 pub struct Processor {
+    leveler: Option<Leveler>,
     channels: Vec<Channel>,
+    bass: Option<Bass>,
+    contour: Option<Contour>,
     stereo: Option<StereoEnhancer>,
-    /// Absent when disabled, which passes audio through it unchanged.
+    crossfeed: Option<Crossfeed>,
+    correction: Option<Correction>,
     limiter: Option<Limiter>,
+    /// The limiter's smallest gain since the last `meters`.
+    limiter_min: f32,
 }
 
 impl Processor {
@@ -81,14 +125,33 @@ impl Processor {
         let stereo = (channels == 2 && profile.stereo.enabled)
             .then(|| StereoEnhancer::new(&profile.stereo, f64::from(profile.shelf_corner_hz), fs));
         Self {
+            leveler: profile
+                .leveler
+                .enabled
+                .then(|| Leveler::new(&profile.leveler, fs, channels)),
             channels: (0..channels)
                 .map(|_| Channel::new(profile, sample_rate))
                 .collect(),
+            bass: profile
+                .bass
+                .enabled
+                .then(|| Bass::new(&profile.bass, fs, channels)),
+            contour: profile
+                .contour
+                .enabled
+                .then(|| Contour::new(&profile.contour, fs, channels)),
             stereo,
+            crossfeed: (channels == 2 && profile.crossfeed.enabled)
+                .then(|| Crossfeed::new(&profile.crossfeed, fs)),
+            correction: profile
+                .correction
+                .enabled
+                .then(|| Correction::new(&profile.correction, fs, channels)),
             limiter: profile
                 .limiter
                 .enabled
                 .then(|| Limiter::new(&profile.limiter, fs)),
+            limiter_min: 1.0,
         }
     }
 
@@ -97,33 +160,96 @@ impl Processor {
     pub fn process(&mut self, samples: &mut [f32]) {
         assert_eq!(samples.len() % self.channels.len(), 0);
         for frame in samples.chunks_exact_mut(self.channels.len()) {
+            if let Some(leveler) = &mut self.leveler {
+                leveler.frame(frame);
+            }
             for (x, channel) in frame.iter_mut().zip(&mut self.channels) {
                 *x = channel.tick(*x);
+            }
+            if let Some(bass) = &mut self.bass {
+                bass.frame(frame);
+            }
+            if let Some(contour) = &mut self.contour {
+                contour.frame(frame);
             }
             if let Some(stereo) = &mut self.stereo {
                 (frame[0], frame[1]) = stereo.tick(frame[0], frame[1]);
             }
+            if let Some(crossfeed) = &mut self.crossfeed {
+                (frame[0], frame[1]) = crossfeed.tick(frame[0], frame[1]);
+            }
+            if let Some(correction) = &mut self.correction {
+                correction.frame(frame);
+            }
             if let Some(limiter) = &mut self.limiter {
                 limiter.frame(frame);
+                self.limiter_min = self.limiter_min.min(limiter.gain());
             }
         }
     }
 
-    /// Starts every level detector, and the limiter's gain, where `from`'s
-    /// are, so a chain that takes over from a running one does not
-    /// under-compress while its detectors rise from zero, nor jump up while
-    /// `from` is limiting. Does nothing unless the channel counts match.
-    /// Neither allocates nor frees.
+    /// Frames by which the output lags the input.
+    pub fn latency_frames(&self) -> usize {
+        self.limiter.as_ref().map_or(0, Limiter::latency_frames)
+    }
+
+    /// The system volume in dB below maximum, or `None` when unknown, for
+    /// the loudness contour. No allocation.
+    pub fn set_volume_db(&mut self, volume_db: Option<f32>) {
+        if let Some(contour) = &mut self.contour {
+            contour.set_volume_db(volume_db);
+        }
+    }
+
+    /// The leveler's gain and the largest gain reductions since the last
+    /// call, which starts them over. No allocation.
+    pub fn meters(&mut self) -> Meters {
+        let (mut comp1, mut comp2) = (1.0f32, 1.0f32);
+        for channel in &mut self.channels {
+            comp1 = comp1.min(channel.comp1_min);
+            comp2 = comp2.min(channel.comp2_min);
+            channel.comp1_min = 1.0;
+            channel.comp2_min = 1.0;
+        }
+        let limiter = std::mem::replace(&mut self.limiter_min, 1.0);
+        Meters {
+            leveler_db: self.leveler.as_ref().map_or(0.0, Leveler::gain_db),
+            compressor1_db: reduction_db(comp1),
+            compressor2_db: reduction_db(comp2),
+            limiter_db: reduction_db(limiter),
+        }
+    }
+
+    /// Starts every level detector, the limiter's gain and the other
+    /// stages' running state where `from`'s are, so a chain that takes over
+    /// from a running one does not under-compress while its detectors rise
+    /// from zero, nor jump up while `from` is limiting. Does nothing unless
+    /// the channel counts match. Neither allocates nor frees.
     pub fn adopt_levels(&mut self, from: &Processor) {
         if self.channels.len() != from.channels.len() {
             return;
+        }
+        if let (Some(to), Some(from)) = (&mut self.leveler, &from.leveler) {
+            to.adopt(from);
         }
         for (to, from) in self.channels.iter_mut().zip(&from.channels) {
             to.comp1.adopt_level(&from.comp1);
             to.comp2.adopt_level(&from.comp2);
         }
+        if let (Some(to), Some(from)) = (&mut self.bass, &from.bass) {
+            to.adopt(from);
+        }
+        if let (Some(to), Some(from)) = (&mut self.contour, &from.contour) {
+            to.adopt(from);
+        }
         if let (Some(to), Some(from)) = (&mut self.stereo, &from.stereo) {
             to.adopt_level(from);
+        }
+        if let (Some(to), Some(from)) = (&mut self.crossfeed, &from.crossfeed) {
+            to.adopt(from);
+        }
+        if let (Some(to), Some(from)) = (&mut self.correction, &from.correction) {
+            to.adopt(from);
         }
         if let (Some(to), Some(from)) = (&mut self.limiter, &from.limiter) {
             to.adopt(from);
@@ -677,5 +803,169 @@ mod tests {
         assert!((high_db - 8.0).abs() < 0.25, "high side {high_db} dB");
         assert!(low_db.abs() < 0.05, "low side {low_db} dB");
         assert!(mid_db.abs() < 0.01, "mid {mid_db} dB");
+    }
+
+    /// Every new stage's table written out with values other than the
+    /// defaults, and each stage off.
+    const NEW_STAGES_OFF: &str = "\
+[leveler]
+enabled = false
+target_lufs = -23.0
+max_boost_db = 20.0
+max_cut_db = 3.0
+rise_db_per_s = 0.05
+fall_db_per_s = 40.0
+
+[bass]
+enabled = false
+cutoff_hz = 180.0
+harmonics_db = 9.0
+remove_lows = true
+
+[contour]
+enabled = false
+reference_db = 0.0
+bass_per_db = 1.0
+treble_per_db = 1.0
+max_bass_db = 18.0
+max_treble_db = 12.0
+
+[crossfeed]
+enabled = false
+cutoff_hz = 300.0
+level_db = -1.0
+
+[correction]
+enabled = false
+preamp_db = 12.0
+
+[[correction.bands]]
+kind = \"low_shelf\"
+freq_hz = 100.0
+q = 0.7
+gain_db = 24.0
+
+[[correction.bands]]
+freq_hz = 3000.0
+gain_db = -24.0
+";
+
+    #[test]
+    fn new_stages_switched_off_leave_the_chain_as_it_was() {
+        let written: Profile = toml::from_str(NEW_STAGES_OFF).unwrap();
+        assert_eq!(written.correction.bands.len(), 2);
+        assert_ne!(written, Profile::default());
+        assert!(written.validate(FS).is_ok());
+        for stereo in [false, true] {
+            let (mut default, mut off) = (Profile::default(), written.clone());
+            default.stereo.enabled = stereo;
+            off.stereo.enabled = stereo;
+            for channels in [1, 2, 6] {
+                // Loud enough for both compressors and the limiter to act.
+                let input: Vec<f32> = noise(channels * 20_000, 30)
+                    .iter()
+                    .map(|x| x * 3.0)
+                    .collect();
+                let (mut a, mut b) = (input.clone(), input);
+                Processor::new(&default, FS, channels).process(&mut a);
+                Processor::new(&off, FS, channels).process(&mut b);
+                assert_eq!(a, b, "{channels} channels, stereo {stereo}");
+            }
+        }
+    }
+
+    #[test]
+    fn latency_is_the_limiters() {
+        let profile = Profile::default();
+        let limiter = Limiter::new(&profile.limiter, FS_HZ);
+        let chain = Processor::new(&profile, FS, 2);
+        assert_eq!(chain.latency_frames(), limiter.latency_frames());
+        assert_eq!(Processor::new(&flat(), FS, 2).latency_frames(), 0);
+    }
+
+    /// Steady compression on the left channel only: a sine through one
+    /// compressor with equal attack and release, the right channel under its
+    /// threshold.
+    fn metered(compressor1: bool) -> (Profile, Vec<f32>, f64) {
+        let c = CompressorParams {
+            threshold_db: -20.0,
+            ratio: 4.0,
+            attack_ms: 50.0,
+            release_ms: 50.0,
+        };
+        let mut profile = flat();
+        if compressor1 {
+            profile.compressor1 = c;
+        } else {
+            profile.compressor2 = c;
+        }
+        let left = sine(1000.0, 0.5, FS as usize);
+        let right = sine(1000.0, 0.05, FS as usize);
+        let input = interleave(
+            &left.iter().map(|v| *v as f32).collect::<Vec<_>>(),
+            &right.iter().map(|v| *v as f32).collect::<Vec<_>>(),
+        );
+        let want_db = -20.0 * static_gain(&c, 0.5).log10();
+        (profile, input, want_db)
+    }
+
+    #[test]
+    fn meters_show_each_compressors_largest_reduction_and_start_over() {
+        for compressor1 in [true, false] {
+            let (profile, input, want_db) = metered(compressor1);
+            let mut chain = Processor::new(&profile, FS, 2);
+            let mut x = input.clone();
+            // The attack, then a second of steady compression on its own.
+            chain.process(&mut x);
+            chain.meters();
+            let mut x = input.clone();
+            chain.process(&mut x);
+            let m = chain.meters();
+            let (active, idle) = if compressor1 {
+                (m.compressor1_db, m.compressor2_db)
+            } else {
+                (m.compressor2_db, m.compressor1_db)
+            };
+            assert!(
+                (f64::from(active) - want_db).abs() < 0.01,
+                "compressor1 {compressor1}: {m:?}, want {want_db} dB"
+            );
+            assert_eq!((idle, m.limiter_db, m.leveler_db), (0.0, 0.0, 0.0));
+            // About 7.5 dB, not a no-op.
+            assert!(want_db > 7.0, "{want_db}");
+            // Read again at once, nothing has been reduced since.
+            assert_eq!(chain.meters(), Meters::default());
+
+            // Silence: the detector takes a while to fall under the
+            // threshold, then nothing more is reduced.
+            let mut quiet = vec![0.0f32; FS as usize];
+            chain.process(&mut quiet);
+            assert!(chain.meters() != Meters::default());
+            let mut quiet = vec![0.0f32; FS as usize];
+            chain.process(&mut quiet);
+            assert_eq!(chain.meters(), Meters::default());
+        }
+    }
+
+    #[test]
+    fn meters_show_the_limiters_largest_reduction() {
+        // A frame at twice full scale under a -1 dB ceiling: the limiter's
+        // gain is ceiling / 2, a 7.02 dB reduction.
+        let profile = limited(&flat(), true);
+        let mut chain = Processor::new(&profile, FS, 2);
+        let mut x = vec![0.1f32; 2 * 1000];
+        x[500] = 2.0;
+        chain.process(&mut x);
+        let m = chain.meters();
+        let want = 20.0 * 2.0f64.log10() + 1.0;
+        assert!((f64::from(m.limiter_db) - want).abs() < 1e-4, "{m:?}");
+        assert_eq!((m.compressor1_db, m.compressor2_db), (0.0, 0.0));
+        // Metering does not change the output.
+        let mut plain = vec![0.1f32; 2 * 1000];
+        plain[500] = 2.0;
+        let mut unmetered = Processor::new(&profile, FS, 2);
+        unmetered.process(&mut plain);
+        assert_eq!(x, plain);
+        assert_eq!(chain.meters(), Meters::default());
     }
 }

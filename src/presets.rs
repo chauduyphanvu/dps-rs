@@ -7,7 +7,8 @@ use dps::Profile;
 pub struct Preset {
     pub name: &'static str,
     pub description: &'static str,
-    /// Every key of a profile, so it can be copied and edited as it is.
+    /// Every key of the stages it tunes, so it can be copied and edited as
+    /// it is; the stages it leaves out take their defaults.
     pub toml: &'static str,
 }
 
@@ -99,12 +100,49 @@ mod tests {
         assert_eq!(names, sorted);
     }
 
+    /// The tables the presets predate, and the keys of the limiter's they
+    /// predate.
+    const NOT_IN_PRESETS: [&str; 7] = [
+        "leveler.",
+        "bass.",
+        "contour.",
+        "crossfeed.",
+        "correction.",
+        "limiter.lookahead_ms",
+        "limiter.true_peak",
+    ];
+
     #[test]
-    fn every_preset_sets_every_key() {
-        let want = keys(&toml::to_string(&Profile::default()).unwrap());
+    fn every_preset_sets_every_key_but_those_of_the_newer_stages() {
+        let all = keys(&toml::to_string(&Profile::default()).unwrap());
+        assert_eq!(all.len(), 50);
+        let newer = |key: &String| NOT_IN_PRESETS.iter().any(|n| key.starts_with(n));
+        let want: Vec<String> = all.iter().filter(|k| !newer(k)).cloned().collect();
         assert_eq!(want.len(), 26);
+        let default = Profile::default();
         for preset in &PRESETS {
             assert_eq!(keys(preset.toml), want, "{}", preset.name);
+            // What they leave out is the default: those stages off, the
+            // limiter's lookahead and true peak as they come.
+            let p = preset.profile();
+            assert_eq!(
+                (p.leveler, p.bass, p.contour, p.crossfeed, &p.correction),
+                (
+                    default.leveler,
+                    default.bass,
+                    default.contour,
+                    default.crossfeed,
+                    &default.correction
+                ),
+                "{}",
+                preset.name
+            );
+            assert_eq!(
+                (p.limiter.lookahead_ms, p.limiter.true_peak),
+                (default.limiter.lookahead_ms, default.limiter.true_peak),
+                "{}",
+                preset.name
+            );
         }
     }
 

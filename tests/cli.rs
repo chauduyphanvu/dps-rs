@@ -581,13 +581,19 @@ fn printed_profile_is_the_default_and_loads_back() {
             .map(|v| v.as_table().map_or(1, count_keys))
             .sum()
     }
-    assert_eq!(count_keys(&text.parse().unwrap()), 26, "{text}");
+    assert_eq!(count_keys(&text.parse().unwrap()), 50, "{text}");
     for key in [
         "output_gain_db",
+        "[leveler]",
         "[compressor2]",
         "gains_db",
+        "[bass]",
+        "[contour]",
         "crossover_hz",
+        "[crossfeed]",
+        "[correction]",
         "[limiter]",
+        "lookahead_ms",
     ] {
         assert!(text.contains(key), "{key} not in\n{text}");
     }
