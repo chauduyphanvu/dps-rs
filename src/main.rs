@@ -15,6 +15,8 @@ use config::{Dirs, Source};
 use presets::{PRESETS, Preset};
 
 mod config;
+#[cfg(target_os = "macos")]
+mod devices;
 mod doctor;
 mod ffmpeg;
 mod import;
@@ -35,6 +37,8 @@ Examples:
   dps live --preset music   The same with the built-in music preset
   dps start                 The same in the background (dps status, dps stop)
   dps doctor                Check that live mode can work here
+  dps devices               List the outputs and the profile each plays with
+  dps devices assign        Give the default output a profile of its own
   dps process song.flac     Write song.dps.flac (formats other than WAV use ffmpeg)
   dps import hd650.txt      Import an AutoEQ headphone correction (ParametricEQ.txt)
   dps calibrate             Measure your speakers with the microphone and correct them
@@ -42,7 +46,8 @@ Examples:
   dps profile               Print the default profile as TOML
 
 Settings file: $XDG_CONFIG_HOME/dps/profile.toml, else ~/.config/dps/profile.toml,
-created with the default profile on first use; --profile or --preset overrides it.";
+created with the default profile on first use; --profile or --preset overrides it.
+config.toml beside it gives output devices profiles of their own (dps devices).";
 
 #[cfg(not(target_os = "macos"))]
 const EXAMPLES: &str = "\
@@ -124,6 +129,18 @@ enum Command {
         #[command(flatten)]
         source: SourceArgs,
     },
+    /// List the output devices and the profile live mode plays on each.
+    ///
+    /// Live mode with the settings file follows the output: a device given a
+    /// profile of its own (`dps devices assign`) plays with that profile,
+    /// every other device with the settings file. The assignments are kept
+    /// in config.toml beside the settings file; --profile and --preset use
+    /// one profile on every device.
+    #[cfg(target_os = "macos")]
+    Devices {
+        #[command(subcommand)]
+        action: Option<devices::Action>,
+    },
     /// Process an audio file: WAV directly, other formats through ffmpeg.
     ///
     /// WAV to WAV keeps the sample rate, channels, sample format, channel
@@ -149,13 +166,15 @@ enum Command {
     /// model it covers, in its results, as a "ParametricEQ.txt" file. This
     /// fills the [correction] table of the settings file (or of --profile)
     /// with that file's preamp and filters and turns it on, so the EQ and
-    /// every other value stay as they are. Importing again replaces the
-    /// earlier correction. The profile file is rewritten, so comments in it
-    /// are not kept; a running dps picks the change up on its own.
+    /// every other value stay as they are. On macOS, a default output device
+    /// with a profile of its own (`dps devices`) gets it in that profile
+    /// instead. Importing again replaces the earlier correction. The profile
+    /// file is rewritten, so comments in it are not kept; a running dps
+    /// picks the change up on its own.
     Import {
         /// The ParametricEQ.txt file to import.
         input: PathBuf,
-        /// Profile to write the correction into instead of the settings file.
+        /// Profile to write the correction into instead.
         #[arg(short, long, value_name = "FILE.toml")]
         profile: Option<PathBuf>,
     },
@@ -226,13 +245,17 @@ fn main() -> ExitCode {
         }) => source
             .resolve(&dirs)
             .and_then(|source| process(&input, output, &source)),
-        Some(Command::Import { input, profile }) => import::run(&input, profile, &dirs),
+        Some(Command::Import { input, profile }) => import_target(profile, &dirs)
+            .and_then(|(profile, why)| import::run(&input, profile, why, &dirs)),
         #[cfg(target_os = "macos")]
         Some(Command::Calibrate {
             profile,
             level,
             dry_run,
-        }) => live::calibrate(profile, level, dry_run, &dirs),
+        }) => import_target(profile, &dirs)
+            .and_then(|(profile, _)| live::calibrate(profile, level, dry_run, &dirs)),
+        #[cfg(target_os = "macos")]
+        Some(Command::Devices { action }) => devices::run(action, &dirs),
         Some(Command::Presets) => print_presets(),
         Some(Command::Profile { preset }) => print_profile(preset),
         Some(Command::Doctor { source }) => return doctor::run(source.resolve(&dirs), &dirs),
@@ -249,6 +272,28 @@ fn main() -> ExitCode {
 impl SourceArgs {
     fn resolve(self, dirs: &Dirs) -> Result<Source, String> {
         Source::new(self.profile, self.preset, dirs)
+    }
+}
+
+/// Where `dps import` and `dps calibrate` write: --profile, or on macOS the profile of the
+/// default output device if it has its own (else the settings file), with
+/// a sentence saying why.
+fn import_target(
+    profile: Option<PathBuf>,
+    dirs: &Dirs,
+) -> Result<(Option<PathBuf>, Option<String>), String> {
+    if profile.is_some() {
+        return Ok((profile, None));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (own, why) = devices::default_device_profile(dirs)?;
+        Ok((own, Some(why)))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dirs;
+        Ok((None, None))
     }
 }
 
@@ -536,16 +581,21 @@ fn run_live(args: SourceArgs, background: bool, dirs: &Dirs) -> Result<(), Strin
 
 /// A profile file, or else the settings file, is watched and saved to. A
 /// preset is not watched, and edits to it are saved to the settings file.
+/// Only the settings file gives way to an output device's own profile.
 #[cfg(target_os = "macos")]
 fn live_options(source: Source, dirs: &Dirs) -> Result<live::Options, String> {
     let profile = source.load()?;
     let name = source.name();
+    let config = dirs.config_file().ok();
+    let follow_devices = matches!(source, Source::Settings(_));
     Ok(match source {
         Source::File(path) | Source::Settings(path) => live::Options {
             profile,
             name,
             watch: Some(path.clone()),
             save_path: path,
+            config,
+            follow_devices,
             background: None,
         },
         Source::Preset(_) => live::Options {
@@ -553,6 +603,8 @@ fn live_options(source: Source, dirs: &Dirs) -> Result<live::Options, String> {
             name,
             watch: None,
             save_path: dirs.settings_file()?,
+            config,
+            follow_devices,
             background: None,
         },
     })
@@ -818,11 +870,13 @@ mod live_tests {
             live_options(source, &dirs).unwrap()
         };
 
+        let config = dirs.config_file().unwrap();
         let o = options(Some(&mine), None);
         assert_eq!(o.watch.as_deref(), Some(mine.as_path()));
         assert_eq!(o.save_path, mine);
         assert_eq!(o.name, mine.display().to_string());
         assert_eq!(o.profile.output_gain_db, -2.0);
+        assert!(!o.follow_devices && o.config.as_ref() == Some(&config));
         assert!(!settings.exists());
 
         let o = options(None, Some("music"));
@@ -830,13 +884,16 @@ mod live_tests {
         assert_eq!(o.save_path, settings);
         assert_eq!(o.name, "preset music");
         assert_eq!(o.profile, presets::find("music").unwrap().profile());
+        assert!(!o.follow_devices && o.config.as_ref() == Some(&config));
         assert!(!settings.exists(), "a preset run does not create it");
 
+        // Only the settings file gives way to a device's own profile.
         let o = options(None, None);
         assert_eq!(o.watch.as_deref(), Some(settings.as_path()));
         assert_eq!(o.save_path, settings);
         assert_eq!(o.name, settings.display().to_string());
         assert_eq!(o.profile, Profile::default());
+        assert!(o.follow_devices && o.config == Some(config));
         assert_eq!(
             fs::read_to_string(&settings).unwrap(),
             config::default_toml()

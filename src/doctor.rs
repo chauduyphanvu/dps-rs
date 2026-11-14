@@ -51,6 +51,7 @@ pub fn run(source: Result<Source, String>, dirs: &Dirs) -> ExitCode {
         for check in macos::service_checks(dirs) {
             report(check);
         }
+        report(macos::config_check(dirs, rate.unwrap_or(48_000)));
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -228,10 +229,127 @@ fn macos_check(version: Result<String, String>) -> Check {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::path::Path;
+
     use super::Check;
-    use crate::config::Dirs;
+    use crate::config::{Config, Dirs, load_profile};
+    use crate::devices::{self, Device};
     use crate::live::{self, Capture};
     use crate::service::{Launchctl, LiveLock, Paths, Snapshot};
+
+    /// config.toml, and the profile the default output device plays with
+    /// at `rate`. Live mode works without it.
+    pub fn config_check(dirs: &Dirs, rate: u32) -> Check {
+        let mut check = match dirs.config_file() {
+            Ok(path) => config_verdict(&path, Config::load(&path), devices::default_device, rate),
+            Err(e) => Check::new("config", false, e),
+        };
+        check.needed = false;
+        check
+    }
+
+    /// What `config_check` says of the config at `path`, read as `config`;
+    /// `default` finds the default output device when it matters.
+    pub fn config_verdict(
+        path: &Path,
+        config: Result<Config, String>,
+        default: impl FnOnce() -> Result<Option<Device>, String>,
+        rate: u32,
+    ) -> Check {
+        let config = match config {
+            Ok(config) => config,
+            Err(e) => {
+                return Check::new(
+                    "config",
+                    false,
+                    format!(
+                        "{e}; fix: correct it (until then live mode ignores it and plays the \
+                         settings file on every output device)"
+                    ),
+                );
+            }
+        };
+        if !path.exists() {
+            return Check::new(
+                "config",
+                true,
+                format!(
+                    "{} does not exist, so every output device plays with the settings file",
+                    path.display()
+                ),
+            );
+        }
+        let head = match config.devices.len() {
+            0 => format!(
+                "{} gives no output device a profile of its own",
+                path.display()
+            ),
+            1 => format!(
+                "{} gives 1 output device a profile of its own",
+                path.display()
+            ),
+            n => format!(
+                "{} gives {n} output devices profiles of their own",
+                path.display()
+            ),
+        };
+        if config.devices.is_empty() {
+            return Check::new("config", true, head);
+        }
+        let device = match default() {
+            Ok(Some(device)) => device,
+            Ok(None) => {
+                return Check::new(
+                    "config",
+                    true,
+                    format!("{head}; there is no default output"),
+                );
+            }
+            Err(e) => {
+                return Check::new(
+                    "config",
+                    false,
+                    format!("{head}, but which one the default output is cannot be read: {e}"),
+                );
+            }
+        };
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let Some(own) = config.profile_for(&device.uid, dir) else {
+            return Check::new(
+                "config",
+                true,
+                format!(
+                    "{head}; the default output, {}, plays with the settings file",
+                    device.name
+                ),
+            );
+        };
+        let usable = load_profile(&own).and_then(|profile| {
+            profile
+                .validate(rate)
+                .map_err(|e| format!("{} does not fit {rate} Hz: {e}", own.display()))
+        });
+        match usable {
+            Ok(()) => Check::new(
+                "config",
+                true,
+                format!(
+                    "{head}; the default output, {}, plays with {}",
+                    device.name,
+                    own.display()
+                ),
+            ),
+            Err(e) => Check::new(
+                "config",
+                false,
+                format!(
+                    "{head}; the default output, {}, should play with its own, but {e}, so live \
+                     mode plays the settings file; fix: correct it, or `dps devices unassign`",
+                    device.name
+                ),
+            ),
+        }
+    }
 
     /// The default output device's name and rate.
     pub fn default_output() -> Result<(String, u32), String> {
@@ -496,6 +614,111 @@ mod tests {
 
     fn fs_write(path: &std::path::Path, text: &str) {
         std::fs::write(path, text).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_config_check_names_the_profile_the_default_output_plays_with() {
+        use crate::config::{Config, DeviceEntry};
+        use crate::devices::Device;
+        let dir = TestDir::new("doctor-config");
+        let path = dir.0.join("config.toml");
+        let speakers = || {
+            Ok(Some(Device {
+                uid: "spk".into(),
+                name: "Speakers".into(),
+                default: true,
+                present: true,
+            }))
+        };
+        let unused = || -> Result<Option<Device>, String> { panic!("no device needed") };
+
+        let check = macos::config_verdict(&path, Ok(Config::default()), unused, 48_000);
+        assert!(check.ok, "{}", check.text);
+        assert_eq!(
+            check.text,
+            format!(
+                "{} does not exist, so every output device plays with the settings file",
+                path.display()
+            )
+        );
+        let check = macos::config_verdict(&path, Err("config.toml:2: bad".into()), unused, 48_000);
+        assert!(!check.ok);
+        assert!(
+            check
+                .text
+                .starts_with("config.toml:2: bad; fix: correct it")
+        );
+
+        fs_write(&path, "");
+        let check = macos::config_verdict(&path, Ok(Config::default()), unused, 48_000);
+        assert!(
+            check
+                .text
+                .ends_with("gives no output device a profile of its own")
+        );
+
+        let mut config = Config::default();
+        config.devices.insert(
+            "spk".into(),
+            DeviceEntry {
+                name: "Speakers".into(),
+                profile: "devices/speakers.toml".into(),
+            },
+        );
+        let own = dir.0.join("devices/speakers.toml");
+        let check = macos::config_verdict(&path, Ok(config.clone()), speakers, 48_000);
+        assert!(!check.ok);
+        assert!(check.text.contains("gives 1 output device a profile of its own; the default output, Speakers, should play with its own, but cannot read profile "), "{}", check.text);
+        assert!(
+            check
+                .text
+                .ends_with("fix: correct it, or `dps devices unassign`")
+        );
+
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        fs_write(&own, "output_gain_db = -2.0\n");
+        let check = macos::config_verdict(&path, Ok(config.clone()), speakers, 48_000);
+        assert!(check.ok);
+        assert!(
+            check.text.ends_with(&format!(
+                "; the default output, Speakers, plays with {}",
+                own.display()
+            )),
+            "{}",
+            check.text
+        );
+        fs_write(&own, "shelf_corner_hz = 3000.0\n");
+        let check = macos::config_verdict(&path, Ok(config.clone()), speakers, 8_000);
+        assert!(!check.ok);
+        assert!(
+            check.text.contains("does not fit 8000 Hz"),
+            "{}",
+            check.text
+        );
+
+        let other = || {
+            Ok(Some(Device {
+                uid: "hp".into(),
+                name: "Headphones".into(),
+                default: true,
+                present: true,
+            }))
+        };
+        let check = macos::config_verdict(&path, Ok(config.clone()), other, 48_000);
+        assert!(check.ok);
+        assert!(
+            check
+                .text
+                .ends_with("; the default output, Headphones, plays with the settings file")
+        );
+        let check = macos::config_verdict(&path, Ok(config), || Err("no HAL".into()), 48_000);
+        assert!(!check.ok);
+        assert!(
+            check.text.ends_with("cannot be read: no HAL"),
+            "{}",
+            check.text
+        );
     }
 
     #[cfg(target_os = "macos")]

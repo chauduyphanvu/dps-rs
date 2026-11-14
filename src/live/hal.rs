@@ -23,12 +23,13 @@ use objc2_core_audio::{
     kAudioAggregateDeviceSubDeviceListKey, kAudioAggregateDeviceTapListKey,
     kAudioAggregateDeviceUIDKey, kAudioDevicePropertyDeviceIsRunning,
     kAudioDevicePropertyDeviceUID, kAudioHardwareBadPropertySizeError,
-    kAudioHardwarePropertyProcessObjectList, kAudioHardwarePropertyTranslatePIDToProcessObject,
-    kAudioHardwareUnspecifiedError, kAudioObjectPropertyElementMain, kAudioObjectPropertyName,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioObjectUnknown,
-    kAudioProcessPropertyIsRunningOutput, kAudioStreamPropertyTerminalType,
-    kAudioStreamPropertyVirtualFormat, kAudioSubDeviceUIDKey, kAudioSubTapDriftCompensationKey,
-    kAudioSubTapUIDKey, kAudioTapPropertyFormat, kAudioTapPropertyUID,
+    kAudioHardwarePropertyDevices, kAudioHardwarePropertyProcessObjectList,
+    kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioHardwareUnspecifiedError,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectSystemObject, kAudioObjectUnknown, kAudioProcessPropertyIsRunningOutput,
+    kAudioStreamPropertyTerminalType, kAudioStreamPropertyVirtualFormat, kAudioSubDeviceUIDKey,
+    kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, kAudioTapPropertyFormat,
+    kAudioTapPropertyUID,
 };
 use objc2_core_audio_types::AudioStreamBasicDescription;
 use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType};
@@ -289,19 +290,40 @@ pub struct Stream {
     pub terminal: u32,
 }
 
-/// The device's streams in `scope`, in the order the IOProc's buffer lists
-/// use.
-pub fn streams(device: ObjectId, scope: AudioObjectPropertyScope) -> Result<Vec<Stream>, Error> {
+/// Every audio device, input or output.
+pub fn devices() -> Result<Vec<ObjectId>, Error> {
+    // SAFETY: an array of AudioObjectIDs.
+    unsafe {
+        get_list(
+            SYSTEM_OBJECT,
+            kAudioHardwarePropertyDevices,
+            GLOBAL,
+            "list the audio devices",
+        )
+    }
+}
+
+/// The device's stream objects in `scope`, in the order the IOProc's
+/// buffer lists use.
+pub fn stream_ids(
+    device: ObjectId,
+    scope: AudioObjectPropertyScope,
+) -> Result<Vec<ObjectId>, Error> {
     // SAFETY: an array of AudioStreamIDs.
-    let streams: Vec<ObjectId> = unsafe {
+    unsafe {
         get_list(
             device,
             kAudioDevicePropertyStreams,
             scope,
             "list the device's streams",
-        )?
-    };
-    streams
+        )
+    }
+}
+
+/// The device's streams in `scope`, in the order the IOProc's buffer lists
+/// use.
+pub fn streams(device: ObjectId, scope: AudioObjectPropertyScope) -> Result<Vec<Stream>, Error> {
+    stream_ids(device, scope)?
         .into_iter()
         .map(|stream| {
             // SAFETY: an AudioStreamBasicDescription and a UInt32 property.

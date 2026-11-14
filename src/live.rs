@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 use std::ffi::{c_int, c_void};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::mem::size_of;
+use std::mem::{self, size_of};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
@@ -46,6 +46,7 @@ use objc2_core_audio_types::{
     kAudioFormatFlagIsPacked, kAudioFormatLinearPCM,
 };
 
+use crate::config::Config;
 use hal::ObjectId;
 use mix::{Controls, Mixer};
 use render::{Buffers, BuffersMut, TapChannels};
@@ -120,6 +121,11 @@ pub struct Options {
     pub watch: Option<PathBuf>,
     /// Where settings changed while running are saved.
     pub save_path: PathBuf,
+    /// config.toml, watched for changes.
+    pub config: Option<PathBuf>,
+    /// Each output device plays with the profile config.toml assigns it, or
+    /// else with `save_path`, the settings file.
+    pub follow_devices: bool,
     /// Set for a background run, which has no terminal and reports here.
     pub background: Option<Arc<dyn Report>>,
 }
@@ -128,8 +134,9 @@ pub struct Options {
 pub trait Report: Send + Sync {
     /// Starting audio is blocked on the macOS permission prompt.
     fn waiting_for_permission(&self);
-    /// Audio runs on `device` at `rate`.
-    fn running(&self, device: &str, rate: u32);
+    /// Audio runs on `device` at `rate` with the profile `profile`; said
+    /// again when the profile changes.
+    fn running(&self, device: &str, rate: u32, profile: &str);
     /// The tap has delivered sound, so the permission is there.
     fn heard(&self);
     fn reload_failed(&self, message: &str);
@@ -168,7 +175,10 @@ pub fn run(options: Options) -> Result<(), String> {
     let mut restarted = false;
     let mut announced = false;
     let mut rebuilds = Rebuilds::default();
+    // Kept until a session announces it, past one that ends at once.
+    let mut switched = None;
     loop {
+        switched = live.follow(&target.uid, &target.name, None).or(switched);
         let rate = target.validated_rate(live.tuner.profile(), &live.name)?;
         let notice = live.permission_notice();
         let background = live.background.clone();
@@ -216,7 +226,7 @@ pub fn run(options: Options) -> Result<(), String> {
                         .map_err(|e| format!("cannot set up the terminal for the tuner: {e}"))?;
                     live.screen = Some(screen);
                 }
-                live.announce(&target.name, rate, announced);
+                live.announce(&target.name, rate, announced, switched.take());
                 announced = true;
                 watch(&target, own, &stats, &controls, &session, rate, &mut live)?
             }
@@ -300,6 +310,61 @@ impl ProfileFile {
     }
 }
 
+/// config.toml, watched for saves like the profile file, and what it last
+/// said that could be read.
+struct ConfigFile {
+    path: PathBuf,
+    seen: Option<(SystemTime, u64)>,
+    config: Config,
+}
+
+impl ConfigFile {
+    /// The file as it is now; one that cannot be read counts as empty, and
+    /// why is returned to be said.
+    fn new(path: &Path) -> (Self, Option<String>) {
+        let (config, problem) = match Config::load(path) {
+            Ok(config) => (config, None),
+            Err(e) => (Config::default(), Some(e)),
+        };
+        let file = Self {
+            path: path.to_owned(),
+            seen: ProfileFile::stamp(path),
+            config,
+        };
+        (file, problem)
+    }
+
+    fn dir(&self) -> &Path {
+        self.path.parent().unwrap_or(Path::new("."))
+    }
+
+    /// Takes the file in if it was saved since the last look; why not, once
+    /// per save, if it cannot be read.
+    fn changed(&mut self) -> Option<Result<(), String>> {
+        // A missing or empty file is an editor mid-save, as for the profile.
+        let stamp = ProfileFile::stamp(&self.path)?;
+        if self.seen == Some(stamp) {
+            return None;
+        }
+        self.seen = Some(stamp);
+        if fs::read_to_string(&self.path).is_ok_and(|text| text.trim().is_empty()) {
+            return None;
+        }
+        Some(Config::load(&self.path).map(|config| self.config = config))
+    }
+}
+
+/// The profile in the file at `path`, checked at `rate` if given.
+fn load_checked(path: &Path, rate: Option<u32>) -> Result<Profile, String> {
+    let profile = super::load_profile(path)?;
+    if let Some(rate) = rate {
+        profile
+            .validate(rate)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(profile)
+}
+
 fn same_file(a: &Path, b: &Path) -> bool {
     a == b || matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
 }
@@ -311,6 +376,12 @@ struct Live {
     name: String,
     save_path: PathBuf,
     profile_file: Option<ProfileFile>,
+    config: Option<ConfigFile>,
+    /// The settings file, when each output device plays with the profile
+    /// config.toml assigns it and every other device with this one.
+    settings: Option<PathBuf>,
+    /// The output device of the session: its UID and name.
+    device: Option<(String, String)>,
     /// Set in interactive runs once audio first runs.
     screen: Option<Screen>,
     background: Option<Arc<dyn Report>>,
@@ -320,15 +391,106 @@ struct Live {
 
 impl Live {
     fn new(options: Options) -> Self {
-        Self {
+        let (config, problem) = options.config.as_deref().map(ConfigFile::new).unzip();
+        let mut live = Self {
             tuner: Tuner::new(options.profile, options.save_path.display().to_string()),
             profile_file: options.watch.as_deref().map(ProfileFile::new),
             name: options.name,
+            settings: options.follow_devices.then(|| options.save_path.clone()),
             save_path: options.save_path,
+            config,
+            device: None,
             screen: None,
             background: options.background,
             heard: false,
+        };
+        if let Some(problem) = problem.flatten() {
+            live.warn(format!(
+                "config.toml is ignored until it is fixed: {problem}"
+            ));
         }
+        live
+    }
+
+    /// Says a problem that does not end the run, and reports it to `dps
+    /// status`.
+    fn warn(&mut self, message: String) {
+        if let Some(report) = &self.background {
+            report.reload_failed(&message);
+        }
+        self.say(message);
+    }
+
+    /// Points the run at the profile the output device `uid`, called
+    /// `device`, plays with, if that follows the device; the profile is
+    /// checked at `rate` if given. Returns what to add to the announcement,
+    /// " with <file>" and more, if the profile changed or the device's own
+    /// cannot be used.
+    fn follow(&mut self, uid: &str, device: &str, rate: Option<u32>) -> Option<String> {
+        self.device = Some((uid.into(), device.into()));
+        let settings = self.settings.clone()?;
+        let config = self.config.as_ref()?;
+        let mut problem = None;
+        let mut next = None;
+        if let Some(own) = config.config.profile_for(uid, config.dir()) {
+            if same_file(&own, &self.save_path) {
+                return None;
+            }
+            match load_checked(&own, rate) {
+                Ok(profile) => next = Some((own, profile)),
+                Err(e) => problem = Some(format!("its own profile cannot be used: {e}")),
+            }
+        }
+        let switched = match next {
+            Some((own, profile)) => Some(self.switch(own, profile)),
+            None if same_file(&settings, &self.save_path) => None,
+            None => match load_checked(&settings, rate) {
+                Ok(profile) => Some(self.switch(settings, profile)),
+                Err(e) => {
+                    let mut message = format!("{device} keeps {}", self.name);
+                    if let Some(problem) = &problem {
+                        message += &format!(", since {problem},");
+                    }
+                    self.warn(format!(
+                        "{message} as the settings file cannot be used: {e}"
+                    ));
+                    return None;
+                }
+            },
+        };
+        if switched.is_none() && problem.is_none() {
+            return None;
+        }
+        let mut note = format!(" with {}", self.name);
+        if let Some(problem) = &problem {
+            note += &format!(", since {problem}");
+            if let Some(report) = &self.background {
+                report.reload_failed(&format!("{device} plays{note}"));
+            }
+        }
+        Some(note + &switched.unwrap_or_default())
+    }
+
+    /// Plays, edits and saves `profile` from the file `path` from now on;
+    /// returns what to add after "with <path>" in a message.
+    fn switch(&mut self, path: PathBuf, profile: Profile) -> String {
+        let asked = self.tuner.prompt().is_some();
+        let dropped = self.tuner.reload(profile);
+        let old = mem::replace(&mut self.save_path, path);
+        self.name = self.save_path.display().to_string();
+        self.tuner.set_save_to(self.name.clone());
+        self.profile_file = Some(ProfileFile::new(&self.save_path));
+        if let Some(report) = &self.background {
+            report.reloaded();
+        }
+        let mut note = String::new();
+        if dropped {
+            note += &format!("; unsaved changes to {} were dropped", old.display());
+        }
+        if asked {
+            note += ", so there is nothing to save; press q to quit";
+        }
+        note
     }
 
     fn permission_hint(&self) -> &'static str {
@@ -371,21 +533,26 @@ impl Live {
         }
     }
 
-    fn announce(&mut self, device: &str, rate: u32, again: bool) {
+    /// Says that audio runs on `device` at `rate`, `again` after a change,
+    /// with `switched` from `follow` after it.
+    fn announce(&mut self, device: &str, rate: u32, again: bool, switched: Option<String>) {
         if let Some(screen) = &mut self.screen {
             // A restart may have written over the screen.
             screen.invalidate();
         }
         if let Some(report) = &self.background {
-            report.running(device, rate);
+            report.running(device, rate, &self.name);
         }
+        let switched = switched.unwrap_or_default();
         if again {
-            self.say(format!("now on {device} at {rate} Hz"));
+            self.say(format!("now on {device} at {rate} Hz{switched}"));
         } else if self.screen.is_some() || self.background.is_some() {
-            self.say(format!("processing system audio on {device} at {rate} Hz"));
+            self.say(format!(
+                "processing system audio on {device} at {rate} Hz{switched}"
+            ));
         } else {
             print_line(&format!(
-                "processing system audio on {device} at {rate} Hz; press Ctrl-C to stop"
+                "processing system audio on {device} at {rate} Hz{switched}; press Ctrl-C to stop"
             ));
         }
     }
@@ -434,16 +601,43 @@ impl Live {
                 }
                 self.reloaded(new);
             }
-            Some(Err(e)) => {
-                let message = format!("profile not reloaded: {e}");
-                if let Some(report) = &self.background {
-                    report.reload_failed(&message);
-                }
-                self.say(message);
-            }
+            Some(Err(e)) => self.warn(format!("profile not reloaded: {e}")),
             None => {}
         }
+        self.reload_config(rate, handoff);
         false
+    }
+
+    /// Takes in a save of config.toml, switching to the profile it now
+    /// assigns the output device, if that changed.
+    fn reload_config(&mut self, rate: u32, handoff: &Handoff<Processor>) {
+        match self.config.as_mut().and_then(ConfigFile::changed) {
+            None => {}
+            Some(Err(e)) => self.warn(format!("config.toml not reloaded: {e}")),
+            Some(Ok(())) => {
+                let before = self.save_path.clone();
+                let followed = self
+                    .device
+                    .clone()
+                    .and_then(|(uid, name)| Some((self.follow(&uid, &name, Some(rate))?, name)));
+                if self.save_path != before {
+                    handoff.post(Processor::new(self.tuner.profile(), rate, 2));
+                    if let (Some(report), Some((_, device))) = (&self.background, &self.device) {
+                        report.running(device, rate, &self.name);
+                    }
+                }
+                match followed {
+                    Some((note, device)) => self.say(format!("{device} now plays{note}")),
+                    None => {
+                        if let Some(report) = &self.background {
+                            report.reloaded();
+                        }
+                        let path = self.config.as_ref().map(|c| c.path.display().to_string());
+                        self.say(format!("reloaded {}", path.unwrap_or_default()));
+                    }
+                }
+            }
+        }
     }
 
     /// Acts on a key; true if the run should end.
@@ -1185,6 +1379,32 @@ pub fn default_output() -> Result<(String, u32), String> {
     Ok((target.name, target.sample_rate.round() as u32))
 }
 
+/// A device with output streams.
+pub struct OutputDevice {
+    pub uid: String,
+    pub name: String,
+    /// The default output device.
+    pub default: bool,
+}
+
+/// The devices with output streams, in the HAL's order. One that goes away
+/// while they are read is left out.
+pub fn output_devices() -> Result<Vec<OutputDevice>, String> {
+    let default = hal::default_output_device()?;
+    Ok(hal::devices()?
+        .into_iter()
+        .filter_map(|device| {
+            let streams = hal::stream_ids(device, hal::kAudioObjectPropertyScopeOutput).ok()?;
+            (!streams.is_empty()).then_some(())?;
+            Some(OutputDevice {
+                uid: hal::device_uid(device).ok()?,
+                name: hal::name(device).ok()?,
+                default: Some(device) == default,
+            })
+        })
+        .collect())
+}
+
 /// Whether any process but `pid`, which may be a live run's, has audio
 /// output running.
 pub fn others_playing(pid: u32) -> Result<bool, String> {
@@ -1847,8 +2067,8 @@ mod tests {
         fn waiting_for_permission(&self) {
             self.push("waiting".into());
         }
-        fn running(&self, device: &str, rate: u32) {
-            self.push(format!("running on {device} at {rate}"));
+        fn running(&self, device: &str, rate: u32, profile: &str) {
+            self.push(format!("running on {device} at {rate} with {profile}"));
         }
         fn heard(&self) {
             self.push("heard".into());
@@ -1871,6 +2091,8 @@ mod tests {
             name: "settings.toml".into(),
             watch: Some(path.clone()),
             save_path: path.clone(),
+            config: None,
+            follow_devices: false,
             background: background.map(|r| r as Arc<dyn Report>),
         };
         (Live::new(options), path)
@@ -2038,7 +2260,7 @@ mod tests {
         assert!(!live.step(Some(Key::Char('q')), 48_000, &handoff, &controls));
         assert!(live.tuner.prompt().is_some());
         // Other messages leave the question up.
-        live.announce("External Headphones", 44_100, true);
+        live.announce("External Headphones", 44_100, true, None);
         assert!(live.tuner.prompt().is_some());
         stamp(&path, "output_gain_db = -1.0\n", 1);
         live.step(None, 48_000, &handoff, &controls);
@@ -2062,12 +2284,12 @@ mod tests {
         let dir = Scratch::new("announce");
         let reports = Arc::new(Reports::default());
         let (mut live, _) = live_in(&dir, "", Some(Arc::clone(&reports)));
-        live.announce("MacBook Pro Speakers", 48_000, false);
+        live.announce("MacBook Pro Speakers", 48_000, false, None);
         assert_eq!(
             live.tuner.message(),
             "processing system audio on MacBook Pro Speakers at 48000 Hz"
         );
-        live.announce("External Headphones", 44_100, true);
+        live.announce("External Headphones", 44_100, true, None);
         assert_eq!(
             live.tuner.message(),
             "now on External Headphones at 44100 Hz"
@@ -2075,10 +2297,222 @@ mod tests {
         assert_eq!(
             reports.take(),
             [
-                "running on MacBook Pro Speakers at 48000",
-                "running on External Headphones at 44100"
+                "running on MacBook Pro Speakers at 48000 with settings.toml",
+                "running on External Headphones at 44100 with settings.toml"
             ]
         );
+    }
+
+    /// A run on `settings.toml` in `dir` that follows the output device,
+    /// with config.toml there saying `config`.
+    fn following(dir: &Scratch, config: &str, background: Option<Arc<Reports>>) -> (Live, PathBuf) {
+        let path = dir.0.join("settings.toml");
+        stamp(&path, "output_gain_db = -3.0\n", 0);
+        let config_path = dir.0.join("config.toml");
+        stamp(&config_path, config, 0);
+        let options = Options {
+            profile: super::super::load_profile(&path).unwrap(),
+            name: path.display().to_string(),
+            watch: Some(path.clone()),
+            save_path: path.clone(),
+            config: Some(config_path),
+            follow_devices: true,
+            background: background.map(|r| r as Arc<dyn Report>),
+        };
+        (Live::new(options), path)
+    }
+
+    fn gain(db: f32) -> Profile {
+        Profile {
+            output_gain_db: db,
+            ..Profile::default()
+        }
+    }
+
+    const PHONES: &str = "[devices.phones]\nname = \"Phones\"\nprofile = \"phones.toml\"\n";
+
+    #[test]
+    fn each_output_plays_with_its_own_profile_or_else_the_settings_file() {
+        let dir = Scratch::new("follow");
+        let phones = dir.0.join("phones.toml");
+        stamp(&phones, "output_gain_db = -6.0\n", 0);
+        let reports = Arc::new(Reports::default());
+        let (mut live, settings) = following(&dir, PHONES, Some(Arc::clone(&reports)));
+        let (handoff, controls) = (Handoff::new(), Controls::default());
+
+        // A device without a profile of its own keeps the settings file.
+        assert_eq!(live.follow("spk", "Speakers", None), None);
+        assert_eq!(live.tuner.profile(), &gain(-3.0));
+
+        assert_eq!(
+            live.follow("phones", "Phones", None),
+            Some(format!(" with {}", phones.display()))
+        );
+        assert_eq!(live.tuner.profile(), &gain(-6.0));
+        assert_eq!(live.name, phones.display().to_string());
+        assert_eq!(live.save_path, phones);
+        assert_eq!(live.follow("phones", "Phones", None), None);
+        // Edits are saved to the device's own file, and a save of it reloads.
+        live.step(Some(Key::Right), 48_000, &handoff, &controls);
+        live.step(Some(Key::Char('s')), 48_000, &handoff, &controls);
+        let edited = super::super::load_profile(&phones).unwrap();
+        assert_ne!(edited, gain(-6.0));
+        assert_eq!(super::super::load_profile(&settings).unwrap(), gain(-3.0));
+        stamp(&phones, "output_gain_db = -9.0\n", 5);
+        handoff.take();
+        live.step(None, 48_000, &handoff, &controls);
+        assert!(plays(*handoff.take().unwrap(), &gain(-9.0)));
+
+        // Back on the speakers, with an unsaved edit to the phones' profile.
+        live.step(Some(Key::Right), 48_000, &handoff, &controls);
+        assert_eq!(
+            live.follow("spk", "Speakers", None),
+            Some(format!(
+                " with {}; unsaved changes to {} were dropped",
+                settings.display(),
+                phones.display()
+            ))
+        );
+        assert_eq!(live.tuner.profile(), &gain(-3.0));
+        assert!(!live.tuner.dirty());
+        live.announce("Speakers", 44_100, true, Some(" with x".into()));
+        assert_eq!(live.tuner.message(), "now on Speakers at 44100 Hz with x");
+        let reports = reports.take();
+        assert_eq!(
+            reports.last().unwrap(),
+            &format!("running on Speakers at 44100 with {}", settings.display())
+        );
+    }
+
+    #[test]
+    fn a_devices_own_profile_that_cannot_be_used_gives_way_to_the_settings_file() {
+        let dir = Scratch::new("follow-broken");
+        let reports = Arc::new(Reports::default());
+        let (mut live, settings) = following(&dir, PHONES, Some(Arc::clone(&reports)));
+        let phones = dir.0.join("phones.toml");
+
+        // Missing: the settings file it already plays stays, and why is said.
+        let note = live.follow("phones", "Phones", None).unwrap();
+        assert!(
+            note.starts_with(&format!(
+                " with {}, since its own profile cannot be used: cannot read profile {}",
+                settings.display(),
+                phones.display()
+            )),
+            "{note}"
+        );
+        assert_eq!(live.save_path, settings);
+        assert_eq!(
+            reports.take(),
+            [format!("reload failed: Phones plays{note}")]
+        );
+
+        // From another device's own profile, it switches to the settings
+        // file. One that does not fit the rate cannot be used either.
+        stamp(
+            &dir.0.join("config.toml"),
+            &format!("{PHONES}[devices.dac]\nprofile = \"dac.toml\"\n"),
+            1,
+        );
+        stamp(&dir.0.join("dac.toml"), "output_gain_db = -1.0\n", 0);
+        assert!(live.config.as_mut().unwrap().changed().unwrap().is_ok());
+        assert!(live.follow("dac", "DAC", None).is_some());
+        stamp(&phones, "shelf_corner_hz = 3000.0\n", 0);
+        let note = live.follow("phones", "Phones", Some(8_000)).unwrap();
+        assert!(
+            note.contains("does not fit") || note.contains("shelf_corner_hz"),
+            "{note}"
+        );
+        assert!(
+            note.starts_with(&format!(" with {}, since", settings.display())),
+            "{note}"
+        );
+        assert_eq!(live.tuner.profile(), &gain(-3.0));
+    }
+
+    #[test]
+    fn a_save_of_config_toml_switches_the_profile_in_place() {
+        let dir = Scratch::new("follow-config");
+        let reports = Arc::new(Reports::default());
+        let (mut live, settings) = following(&dir, "", Some(Arc::clone(&reports)));
+        let config = dir.0.join("config.toml");
+        let phones = dir.0.join("phones.toml");
+        stamp(&phones, "output_gain_db = -6.0\n", 0);
+        let (handoff, controls) = (Handoff::new(), Controls::default());
+        assert_eq!(live.follow("phones", "Phones", None), None);
+        live.step(None, 48_000, &handoff, &controls);
+        assert!(handoff.take().is_none());
+
+        stamp(&config, PHONES, 1);
+        live.step(None, 48_000, &handoff, &controls);
+        assert!(plays(*handoff.take().unwrap(), &gain(-6.0)));
+        assert_eq!(
+            live.tuner.message(),
+            format!("Phones now plays with {}", phones.display())
+        );
+        assert_eq!(
+            reports.take(),
+            [
+                "reloaded".to_owned(),
+                format!("running on Phones at 48000 with {}", phones.display())
+            ]
+        );
+
+        // A broken save is said once and changes nothing.
+        stamp(&config, "[devices.phones]\nprofil = \"x.toml\"\n", 2);
+        live.step(None, 48_000, &handoff, &controls);
+        let message = live.tuner.message().to_owned();
+        assert!(
+            message.starts_with("config.toml not reloaded: "),
+            "{message}"
+        );
+        assert!(message.contains("profil"), "{message}");
+        assert!(handoff.take().is_none());
+        live.tuner.set_message(String::new());
+        live.step(None, 48_000, &handoff, &controls);
+        assert_eq!(live.tuner.message(), "");
+        assert_eq!(live.save_path, phones);
+
+        // Unassigned again: back to the settings file. A change that leaves
+        // the device alone is only said.
+        stamp(&config, "exclude = []\n", 3);
+        live.step(None, 48_000, &handoff, &controls);
+        assert!(plays(*handoff.take().unwrap(), &gain(-3.0)));
+        assert_eq!(live.save_path, settings);
+        stamp(&config, "exclude = [\"x\"]\n", 4);
+        live.step(None, 48_000, &handoff, &controls);
+        assert!(handoff.take().is_none());
+        assert_eq!(
+            live.tuner.message(),
+            format!("reloaded {}", config.display())
+        );
+    }
+
+    #[test]
+    fn a_profile_file_or_preset_run_plays_it_on_every_device() {
+        let dir = Scratch::new("follow-not");
+        let (mut live, path) = live_in(&dir, "", None);
+        stamp(&dir.0.join("phones.toml"), "", 0);
+        let config = dir.0.join("config.toml");
+        stamp(&config, PHONES, 0);
+        live.config = Some(ConfigFile::new(&config).0);
+        assert_eq!(live.follow("phones", "Phones", None), None);
+        assert_eq!(live.save_path, path);
+    }
+
+    #[test]
+    fn a_broken_config_toml_at_the_start_is_said_and_ignored() {
+        let dir = Scratch::new("follow-start");
+        let (live, settings) = following(&dir, "exclude = 3\n", None);
+        assert!(
+            live.tuner
+                .message()
+                .starts_with("config.toml is ignored until it is fixed: "),
+            "{}",
+            live.tuner.message()
+        );
+        assert_eq!(live.config.unwrap().config, Config::default());
+        assert_eq!(live.save_path, settings);
     }
 
     unsafe extern "C" {

@@ -336,6 +336,10 @@ pub struct State {
     pub phase: Phase,
     pub device: Option<String>,
     pub rate: Option<u32>,
+    /// The profile file the device plays with, when that is not
+    /// `settings`: the device's own.
+    #[serde(default)]
+    pub profile: Option<String>,
     /// The tap has delivered sound.
     #[serde(default)]
     pub heard: bool,
@@ -346,6 +350,11 @@ pub struct State {
 impl State {
     pub fn read(path: &Path) -> Option<Self> {
         toml::from_str(&fs::read_to_string(path).ok()?).ok()
+    }
+
+    /// What messages call the profile in use.
+    pub fn profile(&self) -> &str {
+        self.profile.as_deref().unwrap_or(&self.settings)
     }
 }
 
@@ -398,11 +407,12 @@ impl live::Report for StateFile {
         self.update(|state, _| state.phase = Phase::WaitingForPermission);
     }
 
-    fn running(&self, device: &str, rate: u32) {
+    fn running(&self, device: &str, rate: u32, profile: &str) {
         self.update(|state, _| {
             state.phase = Phase::Running;
             state.device = Some(device.into());
             state.rate = Some(rate);
+            state.profile = (profile != state.settings).then(|| profile.into());
         });
     }
 
@@ -552,6 +562,7 @@ pub fn serve(
             phase: Phase::Starting,
             device: None,
             rate: None,
+            profile: None,
             heard: false,
             problem: None,
         },
@@ -671,7 +682,7 @@ impl Snapshot {
         let since = local_time(state.started);
         let head = format!(
             "running in the background since {since}{pid} with {}",
-            state.settings
+            state.profile()
         );
         match (state.phase, &state.device, state.rate) {
             (Phase::WaitingForPermission, _, _) => (
@@ -858,7 +869,10 @@ pub fn start(source: Source, login: bool, dirs: &Dirs) -> Result<(), String> {
                      {BACKGROUND_PERMISSION_HINT})"
                 ));
             }
-            let running_with = state.map_or_else(|| settings_of(&loaded.arguments), |s| s.settings);
+            let running_with = state.map_or_else(
+                || settings_of(&loaded.arguments),
+                |s| s.profile().to_owned(),
+            );
             if login {
                 write_plist(&paths.login_plist, &job)?;
             }
@@ -965,7 +979,7 @@ pub fn start(source: Source, login: bool, dirs: &Dirs) -> Result<(), String> {
         "dps is running in the background on {} at {} Hz with {}; `dps stop` stops it{at_login}",
         state.device.as_deref().unwrap_or("the default output"),
         state.rate.unwrap_or(0),
-        state.settings
+        state.profile()
     );
     Ok(())
 }
@@ -983,7 +997,7 @@ pub fn stop(login: bool, dirs: &Dirs) -> Result<(), String> {
                 (true, Some(state)) => format!(
                     "stopped dps, which ran in the background since {} with {}",
                     local_time(state.started),
-                    state.settings
+                    state.profile()
                 ),
                 (true, None) => "stopped dps in the background".into(),
                 (false, _) => "dps was not running in the background".into(),
@@ -1322,6 +1336,7 @@ mod tests {
             phase,
             device: Some("Speakers".into()),
             rate: Some(48_000),
+            profile: None,
             heard: false,
             problem: None,
         }
@@ -1340,13 +1355,20 @@ mod tests {
             State::read(&path).unwrap().phase,
             Phase::WaitingForPermission
         );
-        file.running("Headphones", 44_100);
+        file.running("Headphones", 44_100, "preset music");
         file.heard();
         let s = State::read(&path).unwrap();
         assert_eq!(
             (s.phase, s.device.as_deref(), s.rate, s.heard),
             (Phase::Running, Some("Headphones"), Some(44_100), true)
         );
+        assert_eq!((s.profile.as_deref(), s.profile()), (None, "preset music"));
+        // A device with a profile of its own.
+        file.running("AirPods", 48_000, "/c/devices/airpods.toml");
+        let s = State::read(&path).unwrap();
+        assert_eq!(s.profile(), "/c/devices/airpods.toml");
+        file.running("Headphones", 44_100, "preset music");
+        assert_eq!(State::read(&path).unwrap().profile, None);
 
         file.reload_failed("profile not reloaded: bad");
         assert_eq!(
@@ -1512,6 +1534,16 @@ mod tests {
                 "dps is running in the background since {since} (pid 9) with preset music on \
                  Speakers at 48000 Hz; start at login is off\n"
             )
+        );
+
+        let own = State {
+            profile: Some("/c/devices/speakers.toml".into()),
+            ..running.clone()
+        };
+        let text = status(snapshot(Some(loaded(true, Some(9), None)), Some(own), None));
+        assert!(
+            text.contains("(pid 9) with /c/devices/speakers.toml on Speakers at 48000 Hz;"),
+            "{text}"
         );
 
         let warned = State {

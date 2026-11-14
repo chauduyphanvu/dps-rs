@@ -685,6 +685,11 @@ impl Tuner {
         self.transient = false;
     }
 
+    /// Where `s` saves from now on, as shown to the user.
+    pub fn set_save_to(&mut self, save_to: String) {
+        self.save_to = save_to;
+    }
+
     /// Records that the profile was saved.
     pub fn saved(&mut self) {
         self.saved = self.profile.clone();

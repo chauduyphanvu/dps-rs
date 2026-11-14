@@ -22,7 +22,14 @@ const CHECK_RATE: u32 = 48_000;
 /// The rates a band too high for is warned about.
 const COMMON_RATES: [u32; 2] = [44_100, 48_000];
 
-pub fn run(input: &Path, profile: Option<PathBuf>, dirs: &Dirs) -> Result<(), String> {
+/// Imports `input` into `profile`, else the settings file; `why`, if
+/// given, says why that file and is printed after the first line.
+pub fn run(
+    input: &Path,
+    profile: Option<PathBuf>,
+    why: Option<String>,
+    dirs: &Dirs,
+) -> Result<(), String> {
     let text =
         fs::read_to_string(input).map_err(|e| format!("cannot read {}: {e}", input.display()))?;
     let correction = parse(&text).map_err(|e| format!("{}: {e}", input.display()))?;
@@ -45,12 +52,13 @@ pub fn run(input: &Path, profile: Option<PathBuf>, dirs: &Dirs) -> Result<(), St
 
     let bands = target.correction.bands.len();
     crate::write_stdout(&format!(
-        "imported {bands} band{} and a preamp of {} dB into {}\n\
+        "imported {bands} band{} and a preamp of {} dB into {}\n{}\
          rewrote the file, so comments in it are not kept; a running dps picks the change up \
          on its own\n",
         if bands == 1 { "" } else { "s" },
         target.correction.preamp_db,
         source.name(),
+        why.map(|why| why + "\n").unwrap_or_default(),
     ))?;
     for warning in skipped_warnings(&target) {
         eprintln!("warning: {warning}");
