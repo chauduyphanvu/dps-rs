@@ -1,0 +1,63 @@
+# Preset "laptop-speakers": no deep bass, more presence, firm levelling,
+# wider stereo. A starting point reasoned from what each stage of the chain
+# does, not a Bongiovi tuning (the patents publish none).
+
+input_gain_db = 0.0
+# Gain added back after the levelling; the limiter below catches the peaks
+# it raises. Measured (BS.1770) on synthetic program material at 48 kHz: a
+# band mix at -14 LUFS comes out 0.2 LU quieter, at -20 LUFS 4.1 LU louder
+# and at -30 LUFS 6.2 LU louder; speech at -16 LUFS 1.9 LU louder. Loud
+# masters, which the firm levelling turns down most, still come out quieter:
+# one at -8 LUFS by 5.0 LU, one at -4 LUFS by 8.4 LU. Half a dB more would
+# start limiting the -20 LUFS mix.
+output_gain_db = 7.0
+shelf_corner_hz = 1000.0
+# Compressor 1 hears bass 10 dB quieter, so bass the speakers cannot play
+# does not pump what they can. The mirrored shelves after it restore the
+# tone.
+low_shelf_db = -10.0
+high_shelf_db = 6.0
+
+# Firmer levelling, so quiet passages stay audible on small speakers.
+[compressor1]
+threshold_db = -24.0
+ratio = 2.5
+attack_ms = 5.0
+release_ms = 120.0
+
+[compressor2]
+threshold_db = -18.0
+ratio = 3.0
+attack_ms = 3.0
+release_ms = 100.0
+
+# Laptop speakers play little below about 100 Hz, so nothing there is boosted
+# and 30-56 Hz is cut: it would only use up headroom. Upper bass at 200 Hz
+# gives fullness they can play, 2.5-4.7 kHz presence adds clarity, and the
+# top octave is left alone, since boosting it on small tweeters mostly adds
+# hiss.
+[eq]
+freqs_hz = [30.0, 56.4, 106.0, 199.0, 375.0, 705.0, 1327.0, 2497.0, 4698.0, 8839.0, 16000.0]
+q = [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5]
+gains_db = [-6.0, -4.0, 0.0, 2.0, -1.0, 0.0, 1.0, 2.5, 2.5, 1.0, 0.0]
+
+# The two speakers sit close together, so the side signal gets up to 4 dB
+# above 500 Hz to widen a narrow image.
+[stereo]
+enabled = true
+crossover_hz = 500.0
+side_boost_db = 4.0
+threshold_db = -30.0
+ratio = 4.0
+attack_ms = 10.0
+release_ms = 200.0
+
+# The last stage: no sample leaves above -1 dBFS. On the material above it
+# takes at most 1.5 dB off peaks within a passage and nothing off the -20
+# LUFS mix; where loud music starts, or comes back after a quiet break,
+# before the compressors react, up to 9.5 dB for a moment, and 10.8 dB at
+# an abrupt full-scale start.
+[limiter]
+enabled = true
+ceiling_db = -1.0
+release_ms = 100.0

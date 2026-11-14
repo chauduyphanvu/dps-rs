@@ -1,0 +1,61 @@
+# Preset "headphones": the gentlest levelling, a little bass and air, mild
+# widening. A starting point reasoned from what each stage of the chain does,
+# not a Bongiovi tuning (the patents publish none).
+
+input_gain_db = 0.0
+# Gain added back after the levelling; the limiter below catches the peaks
+# it raises. Measured (BS.1770) on synthetic program material at 48 kHz: a
+# band mix at -14 LUFS comes out 0.6 LU louder, at -20 LUFS 3.2 LU louder and
+# at -30 LUFS 4.2 LU louder; speech at -16 LUFS 0.8 LU louder. Loud masters,
+# which the levelling turns down most, still come out quieter: one at -8
+# LUFS by 3.0 LU, one at -4 LUFS by 5.0 LU.
+output_gain_db = 2.5
+shelf_corner_hz = 1000.0
+# A smaller tilt than the default, so compressor 1 hears the spectrum more
+# evenly and levels gently instead of chasing treble. The mirrored shelves
+# after it restore the tone.
+low_shelf_db = -6.0
+high_shelf_db = 4.0
+
+# The gentlest ratio: headphones carry quiet detail well, so more dynamics
+# are kept.
+[compressor1]
+threshold_db = -24.0
+ratio = 1.5
+attack_ms = 20.0
+release_ms = 200.0
+
+[compressor2]
+threshold_db = -12.0
+ratio = 2.0
+attack_ms = 10.0
+release_ms = 200.0
+
+# Headphones reproduce deep bass, so about +2 dB at 30-100 Hz costs little.
+# A slight dip at 2.5-4.7 kHz, where many headphones are fatiguing, and a
+# touch of air at 12-16 kHz.
+[eq]
+freqs_hz = [30.0, 56.4, 106.0, 199.0, 375.0, 705.0, 1327.0, 2497.0, 4698.0, 8839.0, 16000.0]
+q = [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5]
+gains_db = [1.5, 2.0, 1.5, 0.0, -0.5, 0.0, 0.0, -0.5, -1.0, 0.5, 1.0]
+
+# Mild: each ear already hears only its own channel, so the side signal gets
+# at most 2 dB above 500 Hz.
+[stereo]
+enabled = true
+crossover_hz = 500.0
+side_boost_db = 2.0
+threshold_db = -30.0
+ratio = 4.0
+attack_ms = 10.0
+release_ms = 200.0
+
+# The last stage: no sample leaves above -1 dBFS. On the material above it
+# takes at most 1.8 dB off peaks within a passage (1.1 dB on the -14 LUFS
+# mix) and nothing off the -20 LUFS mix; where loud music starts, or comes
+# back after a quiet break, before the compressors react, up to 4.7 dB for a
+# moment, and 4.8 dB at an abrupt full-scale start.
+[limiter]
+enabled = true
+ceiling_db = -1.0
+release_ms = 100.0

@@ -1,0 +1,18 @@
+[package]
+name = "dps"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+hound = "3.5.1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+crossterm = { version = "0.29.0", default-features = false }
+objc2 = { version = "0.6.5", default-features = false, features = ["std"] }
+objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware", "objc2", "objc2-core-audio-types", "objc2-foundation"] }
+objc2-core-audio-types = { version = "0.3.2", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFDictionary", "CFNumber", "CFString"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString", "NSValue"] }
