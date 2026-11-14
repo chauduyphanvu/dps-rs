@@ -76,8 +76,9 @@ const BUTTERWORTH_Q: [f64; 2] = [0.541_196_100_146_197, 1.306_562_964_876_376_5]
 /// A band is usable this far above the room's noise.
 const MIN_SNR_DB: f64 = 10.0;
 const MIN_USABLE: usize = 8;
-/// The bands whose mean level the deviations are taken from, so that the
-/// correction leaves the overall loudness alone.
+/// The bands whose median level the deviations are taken from, so that the
+/// correction leaves the overall loudness alone. The median, as one deep
+/// null would pull a mean down and have every other band cut to meet it.
 const REFERENCE_HZ: RangeInclusive<f64> = 300.0..=3000.0;
 /// Boosting a null wastes headroom and never fills it.
 pub const MAX_BOOST_DB: f64 = 6.0;
@@ -281,7 +282,7 @@ pub struct Band {
     /// How far the band came through above the room's noise; `None` if it
     /// was not played.
     pub snr_db: Option<f64>,
-    /// Its level less the mean level of the usable bands from 300 Hz to
+    /// Its level less the median level of the usable bands from 300 Hz to
     /// 3 kHz; `None` if it is unusable.
     pub deviation_db: Option<f64>,
     /// What the fit aimed at: the deviation's inverse, limited to
@@ -410,7 +411,7 @@ pub fn analyse(plan: &Plan, recording: &[f32], anchor: usize) -> Result<Calibrat
         .collect();
 
     let usable = measured.iter().filter(|(_, level)| level.is_some()).count();
-    let reference: Vec<f64> = measured
+    let mut reference: Vec<f64> = measured
         .iter()
         .filter(|(band, _)| REFERENCE_HZ.contains(&band.centre_hz))
         .filter_map(|(_, level)| *level)
@@ -421,12 +422,18 @@ pub fn analyse(plan: &Plan, recording: &[f32], anchor: usize) -> Result<Calibrat
             level_db: plan.level_db,
         });
     }
-    let mean = reference.iter().sum::<f64>() / reference.len() as f64;
+    reference.sort_by(f64::total_cmp);
+    let middle = reference.len() / 2;
+    let median = if reference.len() % 2 == 1 {
+        reference[middle]
+    } else {
+        (reference[middle - 1] + reference[middle]) / 2.0
+    };
     let mut targets = Vec::new();
     let mut bands = Vec::with_capacity(BANDS);
     for (mut band, level) in measured {
         if let Some(level) = level {
-            let deviation = level - mean;
+            let deviation = level - median;
             let wanted = (-deviation).clamp(-MAX_CUT_DB, MAX_BOOST_DB);
             band.deviation_db = Some(deviation);
             band.wanted_db = Some(wanted);
@@ -1161,6 +1168,12 @@ mod tests {
         assert!(null.deviation_db.unwrap() < -MAX_BOOST_DB, "{null:?}");
         assert_eq!(null.wanted_db, Some(MAX_BOOST_DB));
         assert!(null.applied_db <= MAX_BOOST_DB);
+        // The bands away from the null are barely cut to meet it: 2.4 dB,
+        // for the skirts of a null this deep, against 4.8 dB from a mean.
+        for centre in [250.0, 4000.0] {
+            let wanted = band(&c, centre).wanted_db.unwrap();
+            assert!(wanted.abs() < 3.0, "{centre} Hz wants {wanted} dB");
+        }
         let highest = max_curve_db(&c.correction.bands, FS);
         assert!(highest <= MAX_BOOST_DB && highest > 3.0, "{highest}");
         let preamp = -(highest * 10.0).ceil() / 10.0;
