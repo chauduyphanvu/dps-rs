@@ -1,0 +1,128 @@
+# Preset "night": late-night listening at low volume without disturbing
+# others: quiet passages up, loud moments held down, less of the bass that
+# carries through walls, dialogue lifted, stereo off. A starting point
+# reasoned from what each stage of the chain does, not a Bongiovi tuning
+# (the patents publish none).
+
+input_gain_db = 0.0
+# Gain added back after the heavy levelling; the limiter below catches the
+# peaks it raises. Measured (BS.1770) at 48 kHz, once the leveler has
+# settled: speech (macOS text-to-speech) at -16 and -24 LUFS comes out at
+# -16.2 LUFS, and so does a synthetic band mix at -14 LUFS, 2.2 LU quieter;
+# the mix at -20 LUFS at -16.4, at -30 LUFS at -16.8, and at -8 and -4 LUFS,
+# which the leveler does not cut, at -15.7 and -15.4. The mix's 4.6 LU step
+# from verse to chorus comes out 1.0 LU. A programme alternating 10 s at -30
+# LUFS with 10 s at -10 LUFS, 20 LU apart, comes out 3.4 LU apart (mean
+# short-term loudness of each passage, settled; 2.0 LU for the first pair).
+# Settling takes 3-5 s, 9 s for speech at -24 LUFS and the mix at -30; over
+# the first 8 s a -4 LUFS mix comes out 11.4 LU quieter and a -30 LUFS one
+# 11.6 LU louder.
+output_gain_db = 12.5
+shelf_corner_hz = 1000.0
+# Compressor 1 hears bass 10 dB quieter, so a rumble or an explosion's low
+# end does not push the dialogue over it down, and treble 6 dB louder. The
+# mirrored shelves after it restore the tone.
+low_shelf_db = -10.0
+high_shelf_db = 6.0
+
+# Brings quiet programmes up to -16 LUFS, a common level for speech, by at
+# most 9 dB rather than 12, so less of a quiet source's noise comes up with
+# it. It never cuts: after a loud scene it holds its gain for 5 s through
+# the quieter passage that follows, and a cut held there would bury the
+# dialogue. With the default 12 dB of cut the alternating programme above
+# comes out 7.9 LU apart instead of 3.4; loud material is the compressors'
+# job.
+[leveler]
+enabled = true
+target_lufs = -16.0
+max_boost_db = 9.0
+max_cut_db = 0.0
+rise_db_per_s = 1.0
+fall_db_per_s = 4.0
+
+# Heavier than music's: compressor 1 from -28 dB at 3:1 and compressor 2
+# from -24 dB at 4:1, so loud moments come out little louder than the
+# dialogue around them. Releases of 200 and 150 ms, slower than voice's,
+# so the gain does not follow each syllable. Compressor 2's 1 ms attack
+# catches what compressor 1's 5 ms lets through: at 2 ms the limiter would
+# take up to 2.8 dB off settled material instead of 1.0 dB.
+[compressor1]
+threshold_db = -28.0
+ratio = 3.0
+attack_ms = 5.0
+release_ms = 200.0
+
+[compressor2]
+threshold_db = -24.0
+ratio = 4.0
+attack_ms = 1.0
+release_ms = 150.0
+
+# A gentle low cut, -6, -5 and -2 dB at 30, 56 and 106 Hz, where bass
+# carries through walls and floors; +2 and +1.5 dB at 2.5 and 4.7 kHz, where
+# consonants carry, so dialogue stays clear at low volume; -1 dB at 16 kHz
+# eases the hiss the makeup gain lifts.
+[eq]
+freqs_hz = [30.0, 56.4, 106.0, 199.0, 375.0, 705.0, 1327.0, 2497.0, 4698.0, 8839.0, 16000.0]
+q = [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5]
+gains_db = [-6.0, -5.0, -2.0, 0.0, 0.0, 0.0, 0.5, 2.0, 1.5, 0.0, -1.0]
+
+# Off: the point here is less bass, not bass heard another way.
+[bass]
+enabled = false
+cutoff_hz = 100.0
+harmonics_db = 0.0
+remove_lows = false
+
+# Live only: it follows the system volume, so it adds nothing when
+# processing files. Low volume is what it is for, but its bass is held to
+# 0.1 dB per dB below -12 dB of volume and 2 dB at most, so it gives back
+# at most 2 of the 5-6 dB the EQ takes off at 30-56 Hz; treble 0.1 dB per
+# dB up to 3 dB. At its caps the limiter takes up to 0.5 dB off the settled
+# -14 LUFS mix.
+[contour]
+enabled = true
+reference_db = -12.0
+bass_per_db = 0.1
+treble_per_db = 0.1
+max_bass_db = 2.0
+max_treble_db = 3.0
+
+# Off: dialogue sits in the middle, and widening lifts the effects and music
+# around it. Mild values, 2 dB above 300 Hz, should it be turned on.
+[stereo]
+enabled = false
+crossover_hz = 300.0
+side_boost_db = 2.0
+threshold_db = -30.0
+ratio = 4.0
+attack_ms = 10.0
+release_ms = 200.0
+
+# Off: it is for headphones, and on headphones nobody else hears anyway.
+[crossfeed]
+enabled = false
+cutoff_hz = 700.0
+level_db = -4.5
+
+# Off: `dps import` fills it for a measured headphone or speaker.
+[correction]
+enabled = false
+preamp_db = 0.0
+bands = []
+
+# The last stage: no sample leaves above -2 dBFS, 1 dB under the other
+# presets, so peaks stand 1 dB less above the programme at the same
+# loudness. The lookahead brings the gain down over 1.5 ms instead of at
+# once, and true peak also counts peaks between samples. Once the leveler
+# has settled it takes nothing off the mixes above and at most 1.0 dB off
+# speech. For about a tenth of a second it takes much more where loud sound
+# starts before the compressors catch up, the price of their makeup gain:
+# up to 15.3 dB at the start of a -4 LUFS mix, 15.6 dB at an abrupt
+# full-scale start, and 14.6 dB where loud music follows 10 s of quiet.
+[limiter]
+enabled = true
+ceiling_db = -2.0
+release_ms = 100.0
+lookahead_ms = 1.5
+true_peak = true

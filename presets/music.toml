@@ -4,11 +4,13 @@
 
 input_gain_db = 0.0
 # Gain added back after the levelling; the limiter below catches the peaks
-# it raises. Measured (BS.1770) on synthetic program material at 48 kHz: a
-# band mix at -14 LUFS comes out 0.6 LU louder, at -20 LUFS 4.6 LU louder and
-# at -30 LUFS 6.2 LU louder; speech at -16 LUFS 1.7 LU louder. Loud masters,
-# which the levelling turns down most, still come out quieter: one at -8
-# LUFS by 3.8 LU, one at -4 LUFS by 6.9 LU.
+# it raises. Measured (BS.1770) at 48 kHz on a synthetic band mix, once the
+# leveler has settled: at -14 LUFS it comes out 0.9 LU louder, at -13.1
+# LUFS, and at -20, -8 and -4 LUFS just as loud; at -30 LUFS, past the
+# leveler's 12 dB of boost, at -14.3 LUFS. Speech (macOS text-to-speech) at
+# -16 and -24 LUFS comes out at -13.8 LUFS. Settling takes 3-6 s, 11 s for
+# speech at -24 LUFS and 12 s for the mix at -30; over the first 8 s a -4
+# LUFS mix comes out 8.6 LU quieter and a -30 LUFS one 10.4 LU louder.
 output_gain_db = 4.0
 shelf_corner_hz = 1000.0
 # Compressor 1 hears bass 8 dB quieter and treble 6 dB louder, so kick and
@@ -16,6 +18,19 @@ shelf_corner_hz = 1000.0
 # mirrored shelves after it restore the tone.
 low_shelf_db = -8.0
 high_shelf_db = 6.0
+
+# Brings every source to -14 LUFS before the compressors, within 12 dB
+# either way, so they work where they were balanced whatever the master's
+# level. The default rates take little off a song's own dynamics: the band
+# mix's 4.6 LU step from verse to chorus comes out 1.4 LU, against 1.6 LU
+# without the leveler.
+[leveler]
+enabled = true
+target_lufs = -14.0
+max_boost_db = 12.0
+max_cut_db = 12.0
+rise_db_per_s = 1.0
+fall_db_per_s = 4.0
 
 # Lighter levelling than laptop-speakers and voice.
 [compressor1]
@@ -37,6 +52,28 @@ freqs_hz = [30.0, 56.4, 106.0, 199.0, 375.0, 705.0, 1327.0, 2497.0, 4698.0, 8839
 q = [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5]
 gains_db = [1.0, 2.5, 2.0, 0.5, -1.0, -0.5, 0.0, 0.5, 1.5, 2.0, 1.0]
 
+# Off: the speakers are unknown, and on ones that play the bass the
+# harmonics would only thicken it and take headroom.
+[bass]
+enabled = false
+cutoff_hz = 100.0
+harmonics_db = 0.0
+remove_lows = false
+
+# Live only: it follows the system volume, so it adds nothing when
+# processing files. Below -12 dB of volume, for the ear's loss of bass and
+# treble at low levels, it adds 0.25 dB of bass (120 Hz shelf) and 0.1 dB of
+# treble (8 kHz shelf) per dB, up to 4 and 3 dB. The bass stops well short
+# of the stage's default 9 dB because it raises peaks: at 4 dB the limiter
+# takes up to 3.1 dB off the settled -14 LUFS mix, against 0.8 dB without.
+[contour]
+enabled = true
+reference_db = -12.0
+bass_per_db = 0.25
+treble_per_db = 0.1
+max_bass_db = 4.0
+max_treble_db = 3.0
+
 # Some widening: the side signal up to 3 dB louder above 300 Hz, pulled back
 # while the mix is loud.
 [stereo]
@@ -48,12 +85,29 @@ ratio = 4.0
 attack_ms = 10.0
 release_ms = 200.0
 
-# The last stage: no sample leaves above -1 dBFS. On the material above it
-# takes at most 1.8 dB off peaks within a passage and nothing off the -20
-# LUFS mix; where loud music starts, or comes back after a quiet break,
-# before the compressors react, up to 5.4 dB for a moment, and 7.8 dB at an
-# abrupt full-scale start.
+# Off: it is for headphones.
+[crossfeed]
+enabled = false
+cutoff_hz = 700.0
+level_db = -4.5
+
+# Off: `dps import` fills it for a measured headphone or speaker.
+[correction]
+enabled = false
+preamp_db = 0.0
+bands = []
+
+# The last stage: no sample leaves above -1 dBFS. The lookahead brings the
+# gain down over 1.5 ms instead of at once, and true peak also counts peaks
+# between samples. Once the leveler has settled it takes at most 0.8 dB off
+# peaks of the mixes above and 2.4 dB off speech. For about a tenth of a
+# second it takes more where loud music starts before the leveler and
+# compressors catch up: up to 7.3 dB at the start of a -4 LUFS mix, 8.7 dB
+# at an abrupt full-scale start, and 10.6 dB where loud music follows 10 s
+# of quiet music that the leveler has turned up.
 [limiter]
 enabled = true
 ceiling_db = -1.0
 release_ms = 100.0
+lookahead_ms = 1.5
+true_peak = true

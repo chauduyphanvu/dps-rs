@@ -7,34 +7,39 @@ use dps::Profile;
 pub struct Preset {
     pub name: &'static str,
     pub description: &'static str,
-    /// Every key of the stages it tunes, so it can be copied and edited as
-    /// it is; the stages it leaves out take their defaults.
+    /// Every key of a profile, so it can be copied and edited as it is.
     pub toml: &'static str,
 }
 
-pub const PRESETS: [Preset; 4] = [
+pub const PRESETS: [Preset; 5] = [
     Preset {
         name: "headphones",
-        description: "gentlest levelling, a little bass and air, mild widening (a -14 LUFS mix \
-                      about as loud, loud masters 3-5 LU quieter)",
+        description: "gentlest levelling, a little bass and air, mild widening, crossfeed (mixes \
+                      at -20 to -4 LUFS settle at -13.5 LUFS)",
         toml: include_str!("../presets/headphones.toml"),
     },
     Preset {
         name: "laptop-speakers",
-        description: "no deep bass, more presence, wider stereo, firm levelling (a -14 LUFS mix \
-                      about as loud, loud masters 5-8 LU quieter)",
+        description: "bass through harmonics, more presence, wider stereo, firm levelling (mixes \
+                      at -20 to -4 LUFS settle at -14.9 LUFS)",
         toml: include_str!("../presets/laptop-speakers.toml"),
     },
     Preset {
         name: "music",
-        description: "all-rounder: bass and treble lift, some widening, levelling (a -14 LUFS \
-                      mix about as loud, loud masters 4-7 LU quieter)",
+        description: "all-rounder: bass and treble lift, some widening, levelling (mixes at -20 \
+                      to -4 LUFS settle at -13.1 LUFS)",
         toml: include_str!("../presets/music.toml"),
+    },
+    Preset {
+        name: "night",
+        description: "low volume late at night: heavy levelling, low cut, dialogue lift, stereo \
+                      off (a 20 LU quiet/loud swing comes out 3.4 LU)",
+        toml: include_str!("../presets/night.toml"),
     },
     Preset {
         name: "voice",
         description: "speech: rumble cut, presence lift, stereo off, firm levelling (speech at \
-                      -16 LUFS 1.5 LU louder, loud masters 5-8 LU quieter)",
+                      -16 to -24 LUFS settles at -14.5 LUFS)",
         toml: include_str!("../presets/voice.toml"),
     },
 ];
@@ -100,49 +105,12 @@ mod tests {
         assert_eq!(names, sorted);
     }
 
-    /// The tables the presets predate, and the keys of the limiter's they
-    /// predate.
-    const NOT_IN_PRESETS: [&str; 7] = [
-        "leveler.",
-        "bass.",
-        "contour.",
-        "crossfeed.",
-        "correction.",
-        "limiter.lookahead_ms",
-        "limiter.true_peak",
-    ];
-
     #[test]
-    fn every_preset_sets_every_key_but_those_of_the_newer_stages() {
-        let all = keys(&toml::to_string(&Profile::default()).unwrap());
-        assert_eq!(all.len(), 50);
-        let newer = |key: &String| NOT_IN_PRESETS.iter().any(|n| key.starts_with(n));
-        let want: Vec<String> = all.iter().filter(|k| !newer(k)).cloned().collect();
-        assert_eq!(want.len(), 26);
-        let default = Profile::default();
+    fn every_preset_sets_every_key_of_the_profile() {
+        let want = keys(&toml::to_string(&Profile::default()).unwrap());
+        assert_eq!(want.len(), 50);
         for preset in &PRESETS {
             assert_eq!(keys(preset.toml), want, "{}", preset.name);
-            // What they leave out is the default: those stages off, the
-            // limiter's lookahead and true peak as they come.
-            let p = preset.profile();
-            assert_eq!(
-                (p.leveler, p.bass, p.contour, p.crossfeed, &p.correction),
-                (
-                    default.leveler,
-                    default.bass,
-                    default.contour,
-                    default.crossfeed,
-                    &default.correction
-                ),
-                "{}",
-                preset.name
-            );
-            assert_eq!(
-                (p.limiter.lookahead_ms, p.limiter.true_peak),
-                (default.limiter.lookahead_ms, default.limiter.true_peak),
-                "{}",
-                preset.name
-            );
         }
     }
 

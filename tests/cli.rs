@@ -13,7 +13,7 @@ use hound::{SampleFormat, WavSpec};
 /// Mirrors `BLOCK_FRAMES` in src/main.rs.
 const BLOCK_FRAMES: usize = 4096;
 
-const PRESETS: [&str; 4] = ["headphones", "laptop-speakers", "music", "voice"];
+const PRESETS: [&str; 5] = ["headphones", "laptop-speakers", "music", "night", "voice"];
 
 /// Both compressors at 1:1 with every gain at 0 dB, stereo and the limiter
 /// off, which makes the chain an identity within float rounding.
@@ -1194,33 +1194,45 @@ fn loud_material(rate: u32) -> Vec<f32> {
 #[test]
 fn presets_do_not_clip_loud_full_scale_material() {
     let dir = TempDir::new("preset-clipping");
-    for rate in [44_100, 48_000, 96_000, 192_000] {
-        let input = dir.join(&format!("loud-{rate}.wav"));
-        let stored = write_wav(&input, int_spec(2, rate, 16), &loud_material(rate));
-        let input_peak = stored.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-        assert!(input_peak >= 32_767.0, "the material is not full scale");
-        for name in PRESETS {
-            let output = dir.join(&format!("{name}-{rate}.wav"));
-            let out = dir
-                .dps()
-                .args(["process", path_str(&input), path_str(&output)])
-                .args(["--preset", name])
-                .output()
-                .unwrap();
-            // A clipped sample would have printed a warning.
-            assert_quiet_success(&out);
-            let (_, samples) = read_wav(&output);
-            let peak = samples.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-            let peak_db = 20.0 * (peak / 32_768.0).log10();
-            // The limiter's -1 dBFS ceiling, give or take the 16-bit rounding.
-            assert!(
-                peak <= (10f64.powf(-1.0 / 20.0) * 32_768.0).round(),
-                "{name} at {rate} Hz peaks at {peak_db:.2} dBFS"
-            );
-            fs::remove_file(&output).unwrap();
+    let ceilings: Vec<f32> = PRESETS
+        .iter()
+        .map(|name| preset_profile(&dir, name).limiter.ceiling_db)
+        .collect();
+    let dir = &dir;
+    // Every preset at every rate at once: each run takes seconds in a debug
+    // build.
+    std::thread::scope(|scope| {
+        for rate in [44_100, 48_000, 96_000, 192_000] {
+            let input = dir.join(&format!("loud-{rate}.wav"));
+            let stored = write_wav(&input, int_spec(2, rate, 16), &loud_material(rate));
+            let input_peak = stored.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            assert!(input_peak >= 32_767.0, "the material is not full scale");
+            for (name, &ceiling_db) in PRESETS.into_iter().zip(&ceilings) {
+                let input = input.clone();
+                scope.spawn(move || {
+                    let output = dir.join(&format!("{name}-{rate}.wav"));
+                    let out = dir
+                        .dps()
+                        .args(["process", path_str(&input), path_str(&output)])
+                        .args(["--preset", name])
+                        .output()
+                        .unwrap();
+                    // A clipped sample would have printed a warning.
+                    assert_quiet_success(&out);
+                    let (_, samples) = read_wav(&output);
+                    let peak = samples.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                    let peak_db = 20.0 * (peak / 32_768.0).log10();
+                    // The limiter's ceiling, give or take the 16-bit rounding.
+                    let ceiling = (10f64.powf(f64::from(ceiling_db) / 20.0) * 32_768.0).round();
+                    assert!(
+                        peak <= ceiling,
+                        "{name} at {rate} Hz peaks at {peak_db:.2} dBFS, over its {ceiling_db} dBFS"
+                    );
+                    fs::remove_file(&output).unwrap();
+                });
+            }
         }
-        fs::remove_file(&input).unwrap();
-    }
+    });
 }
 
 /// `x` through the biquad b / a (a[0] = 1).
@@ -1235,44 +1247,55 @@ fn biquad(x: &[f64], b: [f64; 3], a: [f64; 3]) -> Vec<f64> {
         .collect()
 }
 
-/// BS.1770-4 integrated loudness of interleaved stereo, in LUFS: K-weighted
-/// (a +4 dB high shelf at 1.5 kHz, then a 38 Hz high-pass), 400 ms blocks
-/// every 100 ms, gated at -70 LUFS and at 10 LU under the mean of the rest.
-/// Within 0.1 LU of ffmpeg's ebur128 on the material the presets were tuned
-/// on.
-fn integrated_lufs(x: &[f64], rate: u32) -> f64 {
+/// One channel K-weighted as BS.1770-4 has it: a +4 dB high shelf at
+/// 1.5 kHz, then a 38 Hz high-pass.
+fn k_weighted(x: Vec<f64>, rate: u32) -> Vec<f64> {
     let fs = f64::from(rate);
-    let k_weight = |x: Vec<f64>| {
-        let a = 10f64.powf(4.0 / 40.0);
-        let w = 2.0 * PI * 1500.0 / fs;
-        let (alpha, c) = (w.sin() / 2f64.sqrt(), w.cos());
-        let sa = 2.0 * a.sqrt() * alpha;
-        let a0 = (a + 1.0) - (a - 1.0) * c + sa;
-        let shelf = biquad(
-            &x,
-            [
-                a * ((a + 1.0) + (a - 1.0) * c + sa) / a0,
-                -2.0 * a * ((a - 1.0) + (a + 1.0) * c) / a0,
-                a * ((a + 1.0) + (a - 1.0) * c - sa) / a0,
-            ],
-            [
-                1.0,
-                2.0 * ((a - 1.0) - (a + 1.0) * c) / a0,
-                ((a + 1.0) - (a - 1.0) * c - sa) / a0,
-            ],
-        );
-        let w = 2.0 * PI * 38.0 / fs;
-        let (alpha, c) = (w.sin(), w.cos());
-        let a0 = 1.0 + alpha;
-        biquad(
-            &shelf,
-            [(1.0 + c) / 2.0 / a0, -(1.0 + c) / a0, (1.0 + c) / 2.0 / a0],
-            [1.0, -2.0 * c / a0, (1.0 - alpha) / a0],
-        )
-    };
-    let channel = |c: usize| k_weight(x.iter().skip(c).step_by(2).copied().collect());
-    let (l, r) = (channel(0), channel(1));
-    let block = (0.4 * fs) as usize;
+    let a = 10f64.powf(4.0 / 40.0);
+    let w = 2.0 * PI * 1500.0 / fs;
+    let (alpha, c) = (w.sin() / 2f64.sqrt(), w.cos());
+    let sa = 2.0 * a.sqrt() * alpha;
+    let a0 = (a + 1.0) - (a - 1.0) * c + sa;
+    let shelf = biquad(
+        &x,
+        [
+            a * ((a + 1.0) + (a - 1.0) * c + sa) / a0,
+            -2.0 * a * ((a - 1.0) + (a + 1.0) * c) / a0,
+            a * ((a + 1.0) + (a - 1.0) * c - sa) / a0,
+        ],
+        [
+            1.0,
+            2.0 * ((a - 1.0) - (a + 1.0) * c) / a0,
+            ((a + 1.0) - (a - 1.0) * c - sa) / a0,
+        ],
+    );
+    let w = 2.0 * PI * 38.0 / fs;
+    let (alpha, c) = (w.sin(), w.cos());
+    let a0 = 1.0 + alpha;
+    biquad(
+        &shelf,
+        [(1.0 + c) / 2.0 / a0, -(1.0 + c) / a0, (1.0 + c) / 2.0 / a0],
+        [1.0, -2.0 * c / a0, (1.0 - alpha) / a0],
+    )
+}
+
+/// The left and right channels of interleaved stereo, each K-weighted.
+fn k_weighted_stereo(x: &[f64], rate: u32) -> (Vec<f64>, Vec<f64>) {
+    let channel = |c: usize| k_weighted(x.iter().skip(c).step_by(2).copied().collect(), rate);
+    (channel(0), channel(1))
+}
+
+fn lufs_of(power: f64) -> f64 {
+    -0.691 + 10.0 * power.log10()
+}
+
+/// BS.1770-4 integrated loudness of interleaved stereo, in LUFS: K-weighted,
+/// 400 ms blocks every 100 ms, gated at -70 LUFS and at 10 LU under the mean
+/// of the rest. Within 0.1 LU of ffmpeg's ebur128 on the material the
+/// presets were tuned on.
+fn integrated_lufs(x: &[f64], rate: u32) -> f64 {
+    let (l, r) = k_weighted_stereo(x, rate);
+    let block = (0.4 * f64::from(rate)) as usize;
     let powers: Vec<f64> = (0..=(l.len() - block) / (block / 4))
         .map(|k| {
             let span = k * block / 4..k * block / 4 + block;
@@ -1284,12 +1307,11 @@ fn integrated_lufs(x: &[f64], rate: u32) -> f64 {
                 / block as f64
         })
         .collect();
-    let lufs = |p: f64| -0.691 + 10.0 * p.log10();
     let mean = |p: &[f64]| p.iter().sum::<f64>() / p.len() as f64;
-    let audible: Vec<f64> = powers.into_iter().filter(|&p| lufs(p) > -70.0).collect();
-    let gate = lufs(mean(&audible)) - 10.0;
-    let gated: Vec<f64> = audible.into_iter().filter(|&p| lufs(p) > gate).collect();
-    lufs(mean(&gated))
+    let audible: Vec<f64> = powers.into_iter().filter(|&p| lufs_of(p) > -70.0).collect();
+    let gate = lufs_of(mean(&audible)) - 10.0;
+    let gated: Vec<f64> = audible.into_iter().filter(|&p| lufs_of(p) > gate).collect();
+    lufs_of(mean(&gated))
 }
 
 /// Eight seconds of a band at 120 bpm, a quieter verse then a chorus: kick,
@@ -1334,55 +1356,193 @@ fn band_mix(rate: u32, lufs: f64) -> Vec<f64> {
     mix.iter().map(|v| v * gain).collect()
 }
 
+/// `samples`, interleaved stereo, through the chain as `processed` has it,
+/// with the most the limiter took off in each 100 ms, in dB.
+fn processed_with_limiting(profile: &Profile, rate: u32, samples: &[f32]) -> (Vec<f64>, Vec<f32>) {
+    let mut chain = Processor::new(profile, rate, 2);
+    let latency = chain.latency_frames() * 2;
+    let mut x = samples.to_vec();
+    x.resize(samples.len() + latency, 0.0);
+    let mut limiting = Vec::new();
+    for block in x.chunks_mut(rate as usize / 10 * 2) {
+        chain.process(block);
+        limiting.push(chain.meters().limiter_db);
+    }
+    let out = x[latency..].iter().copied().map(f64::from).collect();
+    (out, limiting)
+}
+
+/// The largest sample of `x` is at or under `ceiling_db`, exactly as the
+/// limiter rounds its ceiling.
+fn assert_under_ceiling(x: &[f64], ceiling_db: f32, what: &str) {
+    let ceiling = f64::from(10f64.powf(f64::from(ceiling_db) / 20.0) as f32);
+    let peak = x.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    assert!(
+        peak <= ceiling,
+        "{what} peaks at {:.3} dBFS, over its {ceiling_db} dBFS ceiling",
+        20.0 * peak.log10()
+    );
+}
+
+/// What each preset's comments state for the band mix once its leveler has
+/// settled: the change in loudness at -14 LUFS, in LU, and the most the
+/// limiter takes off the mixes at -30 to -4 LUFS, in dB.
+const SETTLED: [(&str, f64, f64); 5] = [
+    ("headphones", 0.5, 0.0),
+    ("laptop-speakers", -0.9, 1.6),
+    ("music", 0.9, 0.8),
+    ("night", -2.2, 0.0),
+    ("voice", -1.0, 0.9),
+];
+
 #[test]
-fn presets_keep_typical_material_at_least_about_as_loud() {
-    // Each preset adds back the gain its levelling takes, so a -14 or -20
-    // LUFS mix comes out no more than 1 LU quieter than it went in (they were
-    // tuned to about 0 and +3 to +5 LU on similar material), and the limiter
-    // leaves the -20 LUFS mix alone.
+fn presets_level_every_mix_to_about_the_loudness_of_a_minus_14_lufs_one() {
+    // The band mix looped for 40 s at -30 to -4 LUFS, measured over the last
+    // 8 s, by when every leveler has settled: the last two passes measure
+    // alike. The -14 LUFS mix changes by what the preset's comment says, the
+    // mixes at -20 to -4 LUFS come out within 1 LU of it and the one at -30
+    // LUFS, past the levelers' boost, within 2 LU. The limiter takes no more
+    // than the comment says, and no sample passes the ceiling, the abrupt
+    // start included.
     let dir = TempDir::new("preset-loudness");
     let rate = 48_000;
-    for target in [-14.0, -20.0] {
-        let input = band_mix(rate, target);
-        let peak = input.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-        assert!(
-            20.0 * peak.log10() <= -1.0,
-            "a {target} LUFS mix peaks at {:.2} dBFS",
-            20.0 * peak.log10()
-        );
-        let samples: Vec<f32> = input.iter().map(|&v| v as f32).collect();
-        for name in PRESETS {
-            let profile = preset_profile(&dir, name);
-            let out = processed(&profile, rate, 2, &samples);
-            let change = integrated_lufs(&out, rate) - target;
-            let unlimited = Profile {
-                limiter: dps::profile::LimiterParams {
-                    enabled: false,
-                    ..profile.limiter
-                },
-                ..profile.clone()
-            };
-            let raw = processed(&unlimited, rate, 2, &samples);
-            let reduction = raw
-                .iter()
-                .zip(&out)
-                .filter(|(r, _)| r.abs() > 1e-6)
-                .fold(0.0f64, |m, (r, o)| m.max(20.0 * (r / o).abs().log10()));
-            eprintln!(
-                "{name} on a {target} LUFS mix: {change:+.2} LU, limiter at most {reduction:.2} dB"
-            );
-            assert!(
-                change > -1.0,
-                "{name} on a {target} LUFS mix: {change:+.2} LU"
-            );
-            if target == -20.0 {
-                assert!(
-                    reduction < 0.5,
-                    "{name} limits a -20 LUFS mix by {reduction:.2} dB"
-                );
+    let pass = 8 * rate as usize * 2;
+    let levels = [-30.0, -20.0, -14.0, -8.0, -4.0];
+    let inputs: Vec<Vec<f32>> = levels
+        .iter()
+        .map(|&lufs| {
+            let mix = band_mix(rate, lufs);
+            if (-20.0..=-14.0).contains(&lufs) {
+                let peak = mix.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                assert!(20.0 * peak.log10() <= -1.0, "a {lufs} LUFS mix clips");
             }
+            mix.iter()
+                .cycle()
+                .take(5 * pass)
+                .map(|&v| v as f32)
+                .collect()
+        })
+        .collect();
+    let profiles: Vec<Profile> = PRESETS.iter().map(|n| preset_profile(&dir, n)).collect();
+    assert_eq!(SETTLED.map(|(name, ..)| name), PRESETS);
+    // Every preset at every level at once: each run takes seconds in a debug
+    // build. A run gives the last two passes' loudness and the most the
+    // limiter took off the last.
+    let runs: Vec<Vec<(f64, f64, f32)>> = std::thread::scope(|scope| {
+        let handles: Vec<Vec<_>> = profiles
+            .iter()
+            .zip(PRESETS)
+            .map(|(profile, name)| {
+                levels
+                    .iter()
+                    .zip(&inputs)
+                    .map(|(lufs, input)| {
+                        scope.spawn(move || {
+                            let what = format!("{name} on a {lufs} LUFS mix");
+                            let (out, limiting) = processed_with_limiting(profile, rate, input);
+                            assert_under_ceiling(&out, profile.limiter.ceiling_db, &what);
+                            let limited = limiting[limiting.len() - 81..]
+                                .iter()
+                                .fold(0.0f32, |m, &v| m.max(v));
+                            (
+                                integrated_lufs(&out[3 * pass..4 * pass], rate),
+                                integrated_lufs(&out[4 * pass..], rate),
+                                limited,
+                            )
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|runs| runs.into_iter().map(|h| h.join().unwrap()).collect())
+            .collect()
+    });
+    for ((name, change_at_14, most_limiting), runs) in SETTLED.into_iter().zip(runs) {
+        let at_14 = runs[2].1;
+        for (lufs, (before, last, limited)) in levels.iter().zip(runs) {
+            let what = format!("{name} on a {lufs} LUFS mix");
+            eprintln!(
+                "{what}: {:+.2} LU settled, at {last:.2} LUFS, limiter at most {limited:.2} dB",
+                last - lufs
+            );
+            assert!((last - before).abs() < 0.05, "{what}: still moving");
+            assert!(
+                f64::from(limited) <= most_limiting + 0.05,
+                "{what}: limiter at {limited:.2} dB"
+            );
+            let window = if *lufs == -30.0 { 2.0 } else { 1.0 };
+            assert!(
+                (last - at_14).abs() <= window,
+                "{what}: at {last:.2} LUFS, the -14 LUFS one at {at_14:.2}"
+            );
         }
+        assert!(
+            (at_14 + 14.0 - change_at_14).abs() <= 0.1,
+            "{name} on a -14 LUFS mix: {:+.2} LU",
+            at_14 + 14.0
+        );
     }
+}
+
+/// The mean short-term (3 s) loudness of each 10 s passage of interleaved
+/// stereo, in LUFS: the power mean of the windows that lie within it, a
+/// window every 100 ms.
+fn passage_loudness(x: &[f64], rate: u32) -> Vec<f64> {
+    let (l, r) = k_weighted_stereo(x, rate);
+    let block = rate as usize / 10;
+    let blocks: Vec<f64> = l
+        .chunks_exact(block)
+        .zip(r.chunks_exact(block))
+        .map(|(l, r)| l.iter().chain(r).map(|v| v * v).sum::<f64>() / block as f64)
+        .collect();
+    blocks
+        .chunks_exact(100)
+        .map(|passage| {
+            let windows: Vec<f64> = passage
+                .windows(30)
+                .map(|w| w.iter().sum::<f64>() / 30.0)
+                .collect();
+            lufs_of(windows.iter().sum::<f64>() / windows.len() as f64)
+        })
+        .collect()
+}
+
+#[test]
+fn night_narrows_the_gap_between_quiet_and_loud_passages() {
+    // 10 s of the band mix at -30 LUFS, then 10 s at -10 LUFS, four times.
+    // The last two passages, 20 LU apart going in, come out 3.4 LU apart,
+    // as night's comment says: at least 16.4 LU nearer.
+    let dir = TempDir::new("night-range");
+    let rate = 48_000;
+    let profile = preset_profile(&dir, "night");
+    let mix = band_mix(rate, -20.0);
+    let passage: Vec<f64> = mix
+        .iter()
+        .cycle()
+        .take(10 * rate as usize * 2)
+        .copied()
+        .collect();
+    let at = |lufs: f64| {
+        let gain = 10f64.powf((lufs - integrated_lufs(&passage, rate)) / 20.0);
+        passage.iter().map(move |v| v * gain)
+    };
+    let input: Vec<f64> = (0..4).flat_map(|_| at(-30.0).chain(at(-10.0))).collect();
+    let samples: Vec<f32> = input.iter().map(|&v| v as f32).collect();
+    let out = processed(&profile, rate, 2, &samples);
+    assert_under_ceiling(&out, profile.limiter.ceiling_db, "night on the passages");
+    let gap = |x: &[f64]| {
+        let loudness = passage_loudness(x, rate);
+        loudness[7] - loudness[6]
+    };
+    let (before, after) = (gap(&input), gap(&out));
+    eprintln!("night: passages {before:.2} LU apart going in, {after:.2} LU coming out");
+    assert!(
+        (before - 20.0).abs() < 0.05,
+        "{before:.2} LU apart going in"
+    );
+    assert!(before - after >= 16.4, "{after:.2} LU apart coming out");
 }
 
 // Output naming and formats other than WAV.

@@ -197,7 +197,7 @@ impl Default for Profile {
             input_gain_db: 0.0,
             // Makeup for the two 4:1 compressors, with the limiter catching
             // the peaks it raises: measured (BS.1770) on a synthetic band mix
-            // at -14 LUFS, the output is within 0.3 LU of the input.
+            // at -14 LUFS, the output is within 0.1 LU of the input.
             output_gain_db: 7.0,
             shelf_corner_hz: 1000.0,
             low_shelf_db: -10.0,

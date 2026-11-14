@@ -4,12 +4,13 @@
 
 input_gain_db = 0.0
 # Gain added back after the levelling; the limiter below catches the peaks
-# it raises. Measured (BS.1770) at 48 kHz: speech (macOS text-to-speech) at
-# -16 LUFS comes out 1.5 LU louder and at -24 LUFS 6.9 LU louder; a synthetic
-# band mix at -14 LUFS 0.2 LU quieter, at -20 LUFS 3.7 LU louder and at -30
-# LUFS 7.6 LU louder. Loud masters, which the firm levelling turns down
-# most, still come out quieter: one at -8 LUFS by 5.2 LU, one at -4 LUFS by
-# 8.0 LU.
+# it raises. Measured (BS.1770) at 48 kHz, once the leveler has settled:
+# speech (macOS text-to-speech) at -16 LUFS comes out 1.5 LU louder, at
+# -14.5 LUFS, and at -24 LUFS just as loud; a synthetic band mix at -14,
+# -20 and -8 LUFS at -15.0 LUFS, at -4 LUFS at -14.8 and at -30 LUFS, past
+# the leveler's 12 dB of boost, at -15.7. Settling takes 3-5 s, 7 s for the
+# mix at -30 LUFS; over the first 8 s a -4 LUFS mix comes out 10.3 LU
+# quieter and a -30 LUFS one 12.2 LU louder.
 output_gain_db = 9.5
 shelf_corner_hz = 1000.0
 # Compressor 1 hears lows 10 dB quieter, so plosives and rumble do not set
@@ -17,6 +18,19 @@ shelf_corner_hz = 1000.0
 # mirrored shelves after it restore the tone.
 low_shelf_db = -10.0
 high_shelf_db = 8.0
+
+# Brings every source to -16 LUFS, a common level for speech, before the
+# compressors, within 12 dB either way, so they work where they were
+# balanced for loud and soft speakers alike. It rises at twice the default
+# rate: speech at -24 LUFS is within 0.5 dB of its settled gain after 4.6 s
+# instead of 8.7 s.
+[leveler]
+enabled = true
+target_lufs = -16.0
+max_boost_db = 12.0
+max_cut_db = 12.0
+rise_db_per_s = 2.0
+fall_db_per_s = 4.0
 
 # Firm levelling evens out loud and soft speakers.
 [compressor1]
@@ -38,6 +52,23 @@ freqs_hz = [30.0, 56.4, 106.0, 199.0, 375.0, 705.0, 1327.0, 2497.0, 4698.0, 8839
 q = [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5]
 gains_db = [-6.0, -4.0, -1.0, -1.0, -1.5, 0.0, 1.0, 3.0, 2.5, 0.0, -2.0]
 
+# Off: speech has no bass to restore.
+[bass]
+enabled = false
+cutoff_hz = 100.0
+harmonics_db = 0.0
+remove_lows = false
+
+# Off: speech needs no extra bass at low volume, and the EQ already lifts
+# the consonants.
+[contour]
+enabled = false
+reference_db = -12.0
+bass_per_db = 0.35
+treble_per_db = 0.1
+max_bass_db = 9.0
+max_treble_db = 4.0
+
 # Off: widening speech mostly spreads room sound and noise.
 [stereo]
 enabled = false
@@ -48,12 +79,29 @@ ratio = 4.0
 attack_ms = 10.0
 release_ms = 200.0
 
-# The last stage: no sample leaves above -1 dBFS. On the material above it
-# takes at most 0.5 dB off speech, 1.4 dB off music peaks within a passage
-# and nothing off the -20 LUFS mix; where loud music starts, or comes back
-# after a quiet break, before the compressors react, up to 9.2 dB for a
-# moment, and 12.8 dB at an abrupt full-scale start.
+# Off: it is for headphones.
+[crossfeed]
+enabled = false
+cutoff_hz = 700.0
+level_db = -4.5
+
+# Off: `dps import` fills it for a measured headphone or speaker.
+[correction]
+enabled = false
+preamp_db = 0.0
+bands = []
+
+# The last stage: no sample leaves above -1 dBFS. The lookahead brings the
+# gain down over 1.5 ms instead of at once, and true peak also counts peaks
+# between samples. Once the leveler has settled it takes at most 2.1 dB off
+# speech and 0.9 dB off peaks of the mixes above. For about a tenth of a
+# second it takes more where loud music starts before the leveler and
+# compressors catch up: up to 11.9 dB at the start of a -4 LUFS mix, 11.4
+# dB at an abrupt full-scale start, and 14.7 dB where loud music follows
+# 10 s of quiet music that the leveler has turned up.
 [limiter]
 enabled = true
 ceiling_db = -1.0
 release_ms = 100.0
+lookahead_ms = 1.5
+true_peak = true

@@ -574,9 +574,9 @@ fn print_presets() -> Result<(), String> {
     }
     text += "\nStarting points reasoned from what each stage of the chain does, not \
              Bongiovi's\ntunings (the patents publish none). `dps profile --preset NAME` \
-             prints one.\nEach adds gain back after levelling: measured, a -14 LUFS mix \
-             comes out within\n1 LU of its loudness, quieter material louder, loud masters \
-             3-8 LU quieter. A\nlimiter keeps every peak at or below -1 dBFS, even at \
+             prints one.\nEach levels its input first: measured, once settled, a mix at \
+             -20 to -4 LUFS\ncomes out within 1 LU of a -14 LUFS one, at -30 LUFS within 2 LU. \
+             A limiter\nkeeps every peak at or below -1 dBFS (night: -2 dBFS), even at \
              abrupt starts.\n";
     write_stdout(&text)
 }

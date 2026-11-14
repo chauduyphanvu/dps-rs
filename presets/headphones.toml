@@ -1,14 +1,17 @@
 # Preset "headphones": the gentlest levelling, a little bass and air, mild
-# widening. A starting point reasoned from what each stage of the chain does,
-# not a Bongiovi tuning (the patents publish none).
+# widening, crossfeed. A starting point reasoned from what each stage of the
+# chain does, not a Bongiovi tuning (the patents publish none).
 
 input_gain_db = 0.0
 # Gain added back after the levelling; the limiter below catches the peaks
-# it raises. Measured (BS.1770) on synthetic program material at 48 kHz: a
-# band mix at -14 LUFS comes out 0.6 LU louder, at -20 LUFS 3.2 LU louder and
-# at -30 LUFS 4.2 LU louder; speech at -16 LUFS 0.8 LU louder. Loud masters,
-# which the levelling turns down most, still come out quieter: one at -8
-# LUFS by 3.0 LU, one at -4 LUFS by 5.0 LU.
+# it raises. Measured (BS.1770) at 48 kHz on a synthetic band mix, once the
+# leveler has settled: at -14 LUFS it comes out 0.5 LU louder, at -13.5
+# LUFS, and at -20, -8 and -4 LUFS just as loud; at -30 LUFS, past the
+# leveler's 12 dB of boost, at -15.3 LUFS. Speech (macOS text-to-speech) at
+# -16 and -24 LUFS comes out at -14.0 LUFS. Settling takes 3-6 s, 13 s from
+# -20 LUFS, 19 s for speech at -24 LUFS and 24 s for the mix at -30; over
+# the first 8 s a -4 LUFS mix comes out 8.0 LU quieter and a -30 LUFS one
+# 6.3 LU louder.
 output_gain_db = 2.5
 shelf_corner_hz = 1000.0
 # A smaller tilt than the default, so compressor 1 hears the spectrum more
@@ -16,6 +19,19 @@ shelf_corner_hz = 1000.0
 # after it restore the tone.
 low_shelf_db = -6.0
 high_shelf_db = 4.0
+
+# Brings every source to -14 LUFS before the compressors, within 12 dB
+# either way, so they work where they were balanced whatever the master's
+# level. At half the default rates it follows songs rather than their
+# sections: the band mix's 4.6 LU step from verse to chorus comes out 2.6
+# LU, against 2.5 LU without the leveler and 2.2 LU at the default rates.
+[leveler]
+enabled = true
+target_lufs = -14.0
+max_boost_db = 12.0
+max_cut_db = 12.0
+rise_db_per_s = 0.5
+fall_db_per_s = 2.0
 
 # The gentlest ratio: headphones carry quiet detail well, so more dynamics
 # are kept.
@@ -39,6 +55,27 @@ freqs_hz = [30.0, 56.4, 106.0, 199.0, 375.0, 705.0, 1327.0, 2497.0, 4698.0, 8839
 q = [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5]
 gains_db = [1.5, 2.0, 1.5, 0.0, -0.5, 0.0, 0.0, -0.5, -1.0, 0.5, 1.0]
 
+# Off: headphones play deep bass themselves.
+[bass]
+enabled = false
+cutoff_hz = 100.0
+harmonics_db = 0.0
+remove_lows = false
+
+# Live only: it follows the system volume, so it adds nothing when
+# processing files. Below -12 dB of volume, for the ear's loss of bass and
+# treble at low levels, it adds 0.25 dB of bass (120 Hz shelf) and 0.1 dB of
+# treble (8 kHz shelf) per dB, up to 4 and 3 dB. The bass stops well short
+# of the stage's default 9 dB because it raises peaks: at 4 dB the limiter
+# takes up to 3.0 dB off the settled -14 LUFS mix, against nothing without.
+[contour]
+enabled = true
+reference_db = -12.0
+bass_per_db = 0.25
+treble_per_db = 0.1
+max_bass_db = 4.0
+max_treble_db = 3.0
+
 # Mild: each ear already hears only its own channel, so the side signal gets
 # at most 2 dB above 500 Hz.
 [stereo]
@@ -50,12 +87,32 @@ ratio = 4.0
 attack_ms = 10.0
 release_ms = 200.0
 
-# The last stage: no sample leaves above -1 dBFS. On the material above it
-# takes at most 1.8 dB off peaks within a passage (1.1 dB on the -14 LUFS
-# mix) and nothing off the -20 LUFS mix; where loud music starts, or comes
-# back after a quiet break, before the compressors react, up to 4.7 dB for a
-# moment, and 4.8 dB at an abrupt full-scale start.
+# Each ear also gets the other channel's lows, below 700 Hz at -4.5 dB (the
+# stage's defaults), as it would from speakers, so hard-panned sound is less
+# tiring. The mid signal is untouched: the loudness figures above move by
+# less than 0.1 LU with it.
+[crossfeed]
+enabled = true
+cutoff_hz = 700.0
+level_db = -4.5
+
+# Off: `dps import` fills it for a measured headphone or speaker.
+[correction]
+enabled = false
+preamp_db = 0.0
+bands = []
+
+# The last stage: no sample leaves above -1 dBFS. The lookahead brings the
+# gain down over 1.5 ms instead of at once, and true peak also counts peaks
+# between samples. Once the leveler has settled it takes nothing off the
+# mixes above and at most 0.5 dB off speech. For under a tenth of a second
+# it takes more where loud music starts before the leveler and compressors
+# catch up: up to 6.7 dB at the start of a -4 LUFS mix, 6.5 dB at an abrupt
+# full-scale start, and 5.3 dB where loud music follows 10 s of quiet music
+# that the leveler has turned up.
 [limiter]
 enabled = true
 ceiling_db = -1.0
 release_ms = 100.0
+lookahead_ms = 1.5
+true_peak = true
