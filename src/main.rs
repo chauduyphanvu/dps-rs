@@ -15,6 +15,7 @@ use config::{Dirs, Source};
 use presets::{PRESETS, Preset};
 
 mod config;
+mod control;
 #[cfg(target_os = "macos")]
 mod devices;
 mod doctor;
@@ -36,6 +37,8 @@ Examples:
   dps                       Process system audio live with your settings file
   dps live --preset music   The same with the built-in music preset
   dps start                 The same in the background (dps status, dps stop)
+  dps set eq.gains_db[3] --by +2
+                            Raise the fourth EQ band 2 dB (dps get eq prints the EQ)
   dps doctor                Check that live mode can work here
   dps devices               List the outputs and the profile each plays with
   dps devices assign        Give the default output a profile of its own
@@ -54,6 +57,8 @@ const EXAMPLES: &str = "\
 Examples:
   dps process song.flac     Write song.dps.flac (formats other than WAV use ffmpeg)
   dps process song.wav --preset music
+  dps set eq.gains_db[3] --by +2
+                            Raise the fourth EQ band 2 dB (dps get eq prints the EQ)
   dps import hd650.txt      Import an AutoEQ headphone correction (ParametricEQ.txt)
   dps presets               List the built-in presets
   dps profile               Print the default profile as TOML
@@ -178,6 +183,52 @@ enum Command {
         #[arg(short, long, value_name = "FILE.toml")]
         profile: Option<PathBuf>,
     },
+    /// Print one value of the profile, or all of it.
+    ///
+    /// Reads the settings file (or --profile); on macOS, a default output
+    /// device with a profile of its own (`dps devices`) has that profile
+    /// read instead. KEY is a path into the profile's TOML (`dps profile`
+    /// prints every key), with [N] for a position in a list, from 0:
+    /// output_gain_db, leveler.enabled, eq.gains_db[3],
+    /// correction.bands[0].gain_db. A single value prints as it is, a table
+    /// or a list as TOML.
+    Get {
+        /// [default: the whole profile]
+        key: Option<String>,
+        /// Profile to read instead.
+        #[arg(short, long, value_name = "FILE.toml")]
+        profile: Option<PathBuf>,
+    },
+    /// Change one value of the profile.
+    ///
+    /// Sets KEY, a path as `dps get` takes it, in the profile `dps get`
+    /// reads, to VALUE or by --by. VALUE is a number, true or false (or on
+    /// or off), or for correction.bands[N].kind peaking, low_shelf or
+    /// high_shelf. A value out of its range is refused and changes nothing.
+    /// The file is rewritten, so comments in it are not kept; a running dps
+    /// picks the change up on its own.
+    Set {
+        /// The key, such as eq.gains_db[3].
+        key: String,
+        /// The new value.
+        #[arg(
+            required_unless_present = "by",
+            conflicts_with = "by",
+            allow_negative_numbers = true
+        )]
+        value: Option<String>,
+        /// Add DELTA to the number instead, e.g. +2 or -1.5.
+        #[arg(
+            long,
+            value_name = "DELTA",
+            value_parser = control::finite,
+            allow_negative_numbers = true
+        )]
+        by: Option<f64>,
+        /// Profile to change instead.
+        #[arg(short, long, value_name = "FILE.toml")]
+        profile: Option<PathBuf>,
+    },
     /// Measure the speakers with the microphone and write a correction for them.
     ///
     /// Plays a quiet warble tone for each third of an octave from 100 Hz to
@@ -245,14 +296,30 @@ fn main() -> ExitCode {
         }) => source
             .resolve(&dirs)
             .and_then(|source| process(&input, output, &source)),
-        Some(Command::Import { input, profile }) => import_target(profile, &dirs)
+        Some(Command::Import { input, profile }) => edit_target(profile, &dirs)
             .and_then(|(profile, why)| import::run(&input, profile, why, &dirs)),
+        Some(Command::Get { key, profile }) => edit_target(profile, &dirs)
+            .and_then(|(profile, _)| control::get(key.as_deref(), profile, &dirs)),
+        Some(Command::Set {
+            key,
+            value,
+            by,
+            profile,
+        }) => {
+            let edit = match (value, by) {
+                (Some(value), _) => control::Edit::To(value),
+                (None, Some(delta)) => control::Edit::By(delta),
+                (None, None) => unreachable!("clap requires a value or --by"),
+            };
+            edit_target(profile, &dirs)
+                .and_then(|(profile, _)| control::set(&key, edit, profile, &dirs))
+        }
         #[cfg(target_os = "macos")]
         Some(Command::Calibrate {
             profile,
             level,
             dry_run,
-        }) => import_target(profile, &dirs)
+        }) => edit_target(profile, &dirs)
             .and_then(|(profile, _)| live::calibrate(profile, level, dry_run, &dirs)),
         #[cfg(target_os = "macos")]
         Some(Command::Devices { action }) => devices::run(action, &dirs),
@@ -275,10 +342,10 @@ impl SourceArgs {
     }
 }
 
-/// Where `dps import` and `dps calibrate` write: --profile, or on macOS the profile of the
-/// default output device if it has its own (else the settings file), with
-/// a sentence saying why.
-fn import_target(
+/// The profile `dps import`, `calibrate`, `get` and `set` work on: --profile,
+/// or on macOS the profile of the default output device if it has its own
+/// (else the settings file), with a sentence saying why.
+fn edit_target(
     profile: Option<PathBuf>,
     dirs: &Dirs,
 ) -> Result<(Option<PathBuf>, Option<String>), String> {
@@ -654,6 +721,51 @@ mod tests {
     fn cli_definition_is_consistent() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// What `dps set ARGS` asks for: the key, the value, the delta.
+    fn set_args(args: &[&str]) -> Result<(String, Option<String>, Option<f64>), clap::Error> {
+        let cli = Cli::try_parse_from(["dps", "set"].iter().chain(args))?;
+        let Some(Command::Set { key, value, by, .. }) = cli.command else {
+            panic!("not set");
+        };
+        Ok((key, value, by))
+    }
+
+    #[test]
+    fn set_takes_a_negative_value_and_a_signed_delta() {
+        let k = |s: &str| s.to_owned();
+        assert_eq!(
+            set_args(&["leveler.target_lufs", "-16"]).unwrap(),
+            (k("leveler.target_lufs"), Some(k("-16")), None)
+        );
+        assert_eq!(
+            set_args(&["eq.gains_db[3]", "--by", "+2"]).unwrap(),
+            (k("eq.gains_db[3]"), None, Some(2.0))
+        );
+        assert_eq!(
+            set_args(&["eq.gains_db[3]", "--by", "-1.5"]).unwrap(),
+            (k("eq.gains_db[3]"), None, Some(-1.5))
+        );
+        assert_eq!(
+            set_args(&["--by=-0.5", "eq.q[0]", "-p", "x.toml"]).unwrap(),
+            (k("eq.q[0]"), None, Some(-0.5))
+        );
+        assert_eq!(
+            set_args(&["stereo.enabled", "off"]).unwrap().1.as_deref(),
+            Some("off")
+        );
+        // Exactly one of a value and --by, and a delta that is a number.
+        for args in [
+            &["eq.q[0]"][..],
+            &["eq.q[0]", "1", "--by", "1"],
+            &["eq.q[0]", "--by", "x"],
+            &["eq.q[0]", "--by", "nan"],
+            &["eq.q[0]", "--by"],
+            &[],
+        ] {
+            assert!(set_args(args).is_err(), "{args:?}");
+        }
     }
 
     #[test]
