@@ -968,4 +968,50 @@ gain_db = -24.0
         assert_eq!(x, plain);
         assert_eq!(chain.meters(), Meters::default());
     }
+
+    #[test]
+    fn leveler_brings_loud_and_quiet_sources_out_at_about_the_same_loudness() {
+        // 20 s of a stereo programme at 120 bpm (a decaying 50 Hz kick on
+        // the beat, a 110 Hz bass, a chord detuned across the sides, hats of
+        // high-passed noise on the sixteenths, a low-passed noise bed), set
+        // to -8 and -30 LUFS. The leveler has settled on both by 15 s (the
+        // quiet one after 1 s to start and 12 s of rise to the +12 dB cap);
+        // the default chain alone turns the loud one down and the quiet one
+        // up, but not nearly as far.
+        use crate::biquad::{Biquad, Coefs};
+        use crate::loudness::{integrated_lufs, tests::at_lufs};
+        use std::f64::consts::FRAC_1_SQRT_2;
+        let n = 20 * FS as usize;
+        let (hiss, rumble) = (noise(2 * n, 40), noise(2 * n, 41));
+        let mut hats = [0, 1].map(|_| Biquad::new(Coefs::high_pass(6000.0, FRAC_1_SQRT_2, FS_HZ)));
+        let mut bed = [0, 1].map(|_| Biquad::new(Coefs::low_pass(400.0, FRAC_1_SQRT_2, FS_HZ)));
+        let mut programme = Vec::with_capacity(2 * n);
+        for i in 0..n {
+            let t = i as f64 / FS_HZ;
+            let kick = (2.0 * PI * 50.0 * t).sin() * (-(t % 0.5) / 0.12).exp();
+            let bass = 0.35 * (2.0 * PI * 110.0 * t).sin();
+            let hat_env = (-(t % 0.125) / 0.02).exp() as f32;
+            for c in 0..2 {
+                let detune = 1.0 + 0.003 * c as f64;
+                let chord = [261.6, 329.6, 392.0]
+                    .iter()
+                    .map(|f| (2.0 * PI * f * detune * t).sin())
+                    .sum::<f64>();
+                let hat = hats[c].tick(hiss[2 * i + c]) * hat_env;
+                let bed = bed[c].tick(rumble[2 * i + c]);
+                programme.push((kick + bass + 0.12 * chord) as f32 + 0.8 * hat + 0.3 * bed);
+            }
+        }
+        let settled = |lufs: f64, leveler: bool| {
+            let mut profile = Profile::default();
+            profile.leveler.enabled = leveler;
+            let mut x = at_lufs(&programme, 2, FS, lufs);
+            Processor::new(&profile, FS, 2).process(&mut x);
+            integrated_lufs(&x[2 * 15 * FS as usize..], 2, FS)
+        };
+        let on = (settled(-8.0, true), settled(-30.0, true));
+        let off = (settled(-8.0, false), settled(-30.0, false));
+        assert!((on.0 - on.1).abs() < 2.0, "leveler on: {on:?} LUFS");
+        assert!((off.0 - off.1).abs() > 8.0, "leveler off: {off:?} LUFS");
+    }
 }

@@ -13,6 +13,7 @@ pub mod correction;
 pub mod crossfeed;
 pub mod leveler;
 pub mod limiter;
+pub mod loudness;
 pub mod profile;
 pub mod shelf;
 pub mod stereo;
