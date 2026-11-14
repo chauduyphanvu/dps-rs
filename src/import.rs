@@ -137,6 +137,10 @@ pub fn parse(text: &str) -> Result<CorrectionParams, String> {
             bands.len()
         ));
     }
+    // An empty or wrong file would otherwise replace a correction with nothing.
+    if bands.is_empty() && preamp.is_none() {
+        return Err("no Preamp line and no filter that is ON".into());
+    }
     Ok(CorrectionParams {
         enabled: true,
         preamp_db: preamp.map_or(0.0, |(_, db)| db),
@@ -369,13 +373,28 @@ mod tests {
     #[test]
     fn filters_that_are_off_are_skipped_whatever_they_say() {
         let params = parse(
-            "Filter 1: OFF PK Fc 2000 Hz Gain 1.0 dB Q 1.00\n\
+            "Preamp: 0 dB\n\
+             Filter 1: OFF PK Fc 2000 Hz Gain 1.0 dB Q 1.00\n\
              Filter 2: off LP Fc 100 Hz\n\
              Filter 3: OFF\n",
         )
         .unwrap();
         assert!(params.enabled);
         assert!(params.bands.is_empty());
+    }
+
+    #[test]
+    fn a_file_with_no_preamp_and_no_filter_on_is_refused() {
+        for text in [
+            "",
+            "# nothing\n\n",
+            "Filter 1: OFF PK Fc 2000 Hz Gain 1 dB Q 1\n",
+        ] {
+            assert_eq!(
+                parse(text).unwrap_err(),
+                "no Preamp line and no filter that is ON"
+            );
+        }
     }
 
     #[test]
