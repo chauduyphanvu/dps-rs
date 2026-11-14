@@ -28,6 +28,9 @@ pub struct Probe {
     video: usize,
     /// Subtitle, data and attachment streams.
     other: usize,
+    /// The first audio stream's length in frames, where its container
+    /// states it exactly: a lossless codec timed in samples.
+    frames: Option<u64>,
 }
 
 /// The bodies of the `[name]` sections of ffprobe's default output.
@@ -57,7 +60,8 @@ impl Probe {
         let first = audio.first()?;
         // ffprobe guesses a format from the extension alone, so a file it
         // cannot decode can still come back with a codec but no audio.
-        if number(first, "sample_rate")? == 0 || number(first, "channels")? == 0 {
+        let rate = number(first, "sample_rate")?;
+        if rate == 0 || number(first, "channels")? == 0 {
             return None;
         }
         let video = streams
@@ -68,7 +72,7 @@ impl Probe {
             .first()
             .and_then(|f| number(f, "bit_rate"))
             .filter(|_| video == 0);
-        Some(Self {
+        let mut probe = Self {
             codec: field(first, "codec_name")?.to_owned(),
             sample_fmt: field(first, "sample_fmt")?.to_owned(),
             bits_per_raw_sample: number(first, "bits_per_raw_sample")
@@ -90,7 +94,28 @@ impl Probe {
                 .iter()
                 .filter(|s| !is(s, "audio") && !is(s, "video"))
                 .count(),
-        })
+            frames: None,
+        };
+        // A lossy stream's stated length includes the encoder's padding,
+        // which decoding trims, so only a lossless one gives a count to hold
+        // the decode to.
+        if probe.is_lossless() && field(first, "time_base") == Some(format!("1/{rate}").as_str()) {
+            probe.frames = number(first, "duration_ts");
+        }
+        Some(probe)
+    }
+
+    /// Fails when decoding `input` gave fewer frames than its stream states.
+    /// ffmpeg 6.1 exits 0 on a damaged file even with -xerror, leaving out
+    /// what it could not decode, and for some damage says nothing at all.
+    pub fn check_decoded(&self, frames: u64, input: &Path) -> Result<(), String> {
+        match self.frames {
+            Some(stated) if frames < stated => Err(format!(
+                "{}: it gave {frames} of {stated} frames",
+                decode_failure(input)
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// The layout to label the processed WAV with. hound marks its channels
@@ -210,7 +235,8 @@ pub fn probe(path: &Path, shown: &Path) -> Result<Probe, String> {
         "error".into(),
         "-show_entries".into(),
         "stream=index,codec_type,codec_name,sample_fmt,sample_rate,channels,channel_layout,\
-         bits_per_raw_sample,bit_rate:stream_disposition=attached_pic:format=bit_rate"
+         bits_per_raw_sample,bit_rate,time_base,duration_ts:stream_disposition=attached_pic:\
+         format=bit_rate"
             .into(),
         "-of".into(),
         "default".into(),
@@ -227,8 +253,11 @@ pub fn probe(path: &Path, shown: &Path) -> Result<Probe, String> {
 /// than leaving the output short.
 pub fn decode(input: &Path, wav: &Path) -> Result<(), String> {
     let args = decode_args(input, wav);
-    let failure = format!("ffmpeg could not decode all of {}", input.display());
-    run("ffmpeg", &args, input, &failure, &[]).map(drop)
+    run("ffmpeg", &args, input, &decode_failure(input), &[]).map(drop)
+}
+
+fn decode_failure(input: &Path) -> String {
+    format!("ffmpeg could not decode all of {}", input.display())
 }
 
 fn decode_args(input: &Path, wav: &Path) -> Vec<OsString> {
@@ -611,6 +640,25 @@ mod tests {
     }
 
     #[test]
+    fn a_decode_shorter_than_the_stated_length_fails() {
+        let stated = Probe {
+            frames: Some(441_000),
+            ..probe("flac", "s16", 16, None)
+        };
+        let input = Path::new("in.flac");
+        assert_eq!(stated.check_decoded(441_000, input), Ok(()));
+        assert_eq!(stated.check_decoded(441_001, input), Ok(()));
+        assert_eq!(
+            stated.check_decoded(420_000, input),
+            Err("ffmpeg could not decode all of in.flac: it gave 420000 of 441000 frames".into())
+        );
+        assert_eq!(
+            probe("mp3", "fltp", 0, None).check_decoded(1, input),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn probe_output_is_parsed_and_undecodable_streams_rejected() {
         let flac = stream(
             "index=0\ncodec_name=flac\ncodec_type=audio\nsample_fmt=s16\nsample_rate=44100\n\
@@ -631,6 +679,23 @@ mod tests {
         assert_eq!(
             Probe::parse(&mp3),
             Some(probe("mp3", "fltp", 0, Some(320_000)))
+        );
+        let timed = |codec: &str, time_base: &str| {
+            stream(&format!(
+                "index=0\ncodec_name={codec}\ncodec_type=audio\nsample_fmt=s16\n\
+                 sample_rate=44100\nchannels=2\ntime_base={time_base}\nduration_ts=441000\n"
+            ))
+        };
+        let frames = |text: String| Probe::parse(&text).unwrap().frames;
+        assert_eq!(frames(timed("flac", "1/44100")), Some(441_000));
+        assert_eq!(frames(timed("alac", "1/44100")), Some(441_000));
+        // Matroska times in milliseconds, and a lossy stream's stated length
+        // includes the encoder's padding.
+        assert_eq!(frames(timed("flac", "1/1000")), None);
+        assert_eq!(frames(timed("aac", "1/44100")), None);
+        assert_eq!(
+            frames(timed("flac", "1/44100").replace("441000", "N/A")),
+            None
         );
         // What ffprobe reports for a text file named .flac.
         let garbage = stream(

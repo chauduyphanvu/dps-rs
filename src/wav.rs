@@ -49,6 +49,11 @@ impl Reader {
         self.inner.spec()
     }
 
+    /// The length in frames that the header states.
+    pub fn frames(&self) -> u64 {
+        u64::from(self.inner.duration())
+    }
+
     /// Fills `out` from the start with the next interleaved samples and
     /// returns how many it read; 0 means the end of the file.
     pub fn read(&mut self, out: &mut [f32]) -> Result<usize, String> {

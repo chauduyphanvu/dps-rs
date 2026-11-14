@@ -456,6 +456,7 @@ fn process(input: &Path, output: Option<PathBuf>, source: &Source) -> Result<(),
                     let decoded = scratch.join("decoded.wav");
                     ffmpeg::decode(input, &decoded)?;
                     let reader = wav::Reader::open(&decoded)?;
+                    probe.check_decoded(reader.frames(), input)?;
                     let (sample_format, bits_per_sample) = probe.sample_format();
                     let spec = WavSpec {
                         sample_format,
