@@ -40,6 +40,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use dps::limiter::Limiter;
 use dps::{Processor, Profile};
 use objc2_core_audio_types::{
     AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp,
@@ -214,8 +215,17 @@ pub fn run(options: Options) -> Result<(), String> {
     // Kept until a session announces it, past one that ends at once.
     let mut switched = None;
     loop {
-        switched = live.follow(&target.uid, &target.name, None).or(switched);
+        // Checked at the device's rate, so a profile of its own that does
+        // not fit gives way to the settings file instead of ending the run.
+        let fits = target.sample_rate.round();
+        let fits = (1.0..=f64::from(u32::MAX))
+            .contains(&fits)
+            .then_some(fits as u32);
+        switched = live.follow(&target.uid, &target.name, fits).or(switched);
         let rate = target.validated_rate(live.tuner.profile(), &live.name)?;
+        // The session's first chain goes into the slot the controls name,
+        // which a switch of profile may just have changed in the tuner.
+        live.sync_controls(&controls);
         let notice = live.permission_notice();
         let background = live.background.clone();
         let on_slow_start = move || {
@@ -989,9 +999,37 @@ impl Live {
                 None => handoff.clear(slot),
             }
         }
+        self.sync_controls(controls);
+        self.sync_latency(rate);
+    }
+
+    /// Tells the audio which slot is heard, and of bypass and level matching.
+    fn sync_controls(&self, controls: &Controls) {
         controls.set_slot(self.tuner.slot());
         controls.set_matching(self.tuner.matching());
         controls.bypass.store(self.tuner.bypass(), Relaxed);
+    }
+
+    /// Keeps the stated latency to the heard profile's, which a change of
+    /// the limiter's lookahead or true peak moves.
+    fn sync_latency(&mut self, rate: u32) {
+        let limiter = &self.tuner.profile().limiter;
+        let chain = if limiter.enabled {
+            Limiter::new(limiter, f64::from(rate)).latency_frames()
+        } else {
+            0
+        };
+        let Some(latency) = &mut self.latency else {
+            return;
+        };
+        if latency.chain == chain {
+            return;
+        }
+        latency.chain = chain;
+        let latency = latency.describe();
+        if let (Some(report), Some((_, device))) = (&self.background, &self.device) {
+            report.running(device, rate, &self.name, Some(&latency));
+        }
     }
 
     /// Saves the profile; false, with the reason on screen, if that failed.
@@ -1140,6 +1178,14 @@ impl<C> Handoff<C> {
         !self.synced.swap(true, Relaxed)
     }
 
+    /// Callback: a slot's last chain handed back is uncollected, so that
+    /// slot cannot take its offer yet.
+    fn blocked(&self) -> bool {
+        self.lanes
+            .iter()
+            .any(|lane| !lane.retired.load(Acquire).is_null())
+    }
+
     /// Callback: takes the offer for `slot`, if any. Each offer taken may be
     /// followed by one `retire` to that slot before its next `take`.
     fn take(&self, slot: usize) -> Option<Offer<C>> {
@@ -1254,7 +1300,9 @@ fn watch(
                 && silence.exceeded(
                     now,
                     stats.callbacks.load(Relaxed),
-                    hal::others_playing(own)?,
+                    // An app the tap leaves out plays without the tap
+                    // hearing it, which is no sign of a missing permission.
+                    hal::others_playing(&live.apps.applied)?,
                 )
             {
                 let seen = format!(
@@ -1961,7 +2009,7 @@ fn run_capture_check() -> Result<Capture, String> {
     let end = Instant::now() + CHECK_RUN;
     let mut others_playing = false;
     while Instant::now() < end && !stats.heard.load(Relaxed) {
-        others_playing |= hal::others_playing(own)?;
+        others_playing |= hal::others_playing(&[own])?;
         thread::sleep(POLL);
     }
     drop(io);
@@ -2022,7 +2070,7 @@ pub fn audio_apps() -> Result<Vec<(String, bool)>, String> {
 /// output running.
 pub fn others_playing(pid: u32) -> Result<bool, String> {
     let own = hal::process_object(pid as i32)?.unwrap_or(hal::UNKNOWN);
-    Ok(hal::others_playing(own)?)
+    Ok(hal::others_playing(&[own])?)
 }
 
 /// The audio callback's state.
@@ -2963,6 +3011,26 @@ mod tests {
     }
 
     #[test]
+    fn the_stated_latency_follows_the_limiters_lookahead() {
+        let dir = Scratch::new("latency-follows");
+        let (mut live, path) = live_in(&dir, "output_gain_db = -3.0\n", None);
+        let (handoff, controls) = (Handoff::new(), Controls::default());
+        live.latency = Some(Latency {
+            rate: 48_000,
+            chain: 80,
+            ..Latency::default()
+        });
+        live.step(None, 48_000, &handoff, &controls);
+        assert_eq!(live.latency.unwrap().chain, 80);
+        stamp(&path, "[limiter]\nlookahead_ms = 5.0\n", 5);
+        live.step(None, 48_000, &handoff, &controls);
+        assert_eq!(live.latency.unwrap().chain, 248);
+        stamp(&path, "[limiter]\nenabled = false\n", 9);
+        live.step(None, 48_000, &handoff, &controls);
+        assert_eq!(live.latency.unwrap().chain, 0);
+    }
+
+    #[test]
     fn a_save_of_the_watched_file_is_played_and_said() {
         let dir = Scratch::new("reload");
         let reports = Arc::new(Reports::default());
@@ -3339,6 +3407,8 @@ mod tests {
         assert_eq!(live.follow("spk", "Speakers", None), None);
         live.latency = Some(speakers_latency());
         live.step(None, 48_000, &handoff, &controls);
+        // The step restated the latency with the settings file's chain.
+        reports.take();
 
         let said = live
             .control(&Request::Preset("night".into()), 48_000)

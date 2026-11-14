@@ -647,6 +647,12 @@ impl<C: Chain> Mixer<C> {
         if self.slots.iter().any(|s| s.fading.is_some()) {
             return;
         }
+        // Both offers wait while either slot cannot take its own: taken
+        // without the other's, an offer to play the other slot's chain
+        // could find that slot still without one and be lost.
+        if self.handoff.blocked() {
+            return;
+        }
         // A slot playing the other's chain goes first: the main thread only
         // asks a slot to play the other's chain once that one has its own,
         // and with the order of the lanes' offers that holds here too.
@@ -1996,13 +2002,40 @@ mod tests {
         rig.handoff.collect();
         assert_eq!(rig.drops.load(Relaxed), 1);
         assert!(rig.handoff.lanes[1].retired.load(Relaxed).is_null());
-        // Another B, posted while A fades, waits for the fade to end.
+        // Another B, posted while A fades, waits for the fade to end and for
+        // A's old chain to be collected.
         let a2 = rig.post_to(0, 0.6, 0);
         let b2 = rig.post_to(1, 0.4, 0);
         rig.run(&[0.1; 256]);
         assert_eq!((a2.load(Relaxed), b2.load(Relaxed)), (1, 0));
         rig.run(&[0.1; 6 * 256]);
+        assert_eq!(b2.load(Relaxed), 0);
+        rig.handoff.collect();
+        rig.run(&[0.1; 256]);
         assert_eq!(b2.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn an_offer_to_play_the_other_slot_waits_while_that_slot_cannot_take_its_chain() {
+        let mut rig = Rig::new(1.0);
+        rig.post_to(1, 0.5, 0);
+        rig.run(&[0.1; 8 * 256]);
+        rig.handoff.clear(1);
+        rig.run(&[0.1; 8 * 256]);
+        // B's old chain is handed back but not collected yet, so B cannot
+        // take the chain posted now; A is told to play B's.
+        assert!(!rig.handoff.lanes[1].retired.load(Relaxed).is_null());
+        rig.post_to(1, 0.25, 0);
+        rig.handoff.clear(0);
+        rig.run(&[0.1; 256]);
+        rig.handoff.collect();
+        rig.run(&[0.1; 20 * 256]);
+        rig.handoff.collect();
+        // A gave its chain up for B's: it runs no more and was handed back.
+        let calls = rig.calls.load(Relaxed);
+        rig.run(&[0.1; 4 * 256]);
+        assert_eq!(rig.calls.load(Relaxed), calls);
+        assert_eq!(rig.drops.load(Relaxed), 2);
     }
 
     #[test]

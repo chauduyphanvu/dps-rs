@@ -63,3 +63,12 @@ pub fn check() -> Result<(), String> {
 pub fn raise(signum: i32) {
     SIGNAL.store(signum, Relaxed);
 }
+
+/// Held by tests that raise the signal or run what checks it, so one test's
+/// signal does not stop another's run.
+#[cfg(test)]
+pub fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}

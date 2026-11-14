@@ -840,6 +840,7 @@ mod tests {
 
     #[test]
     fn a_signal_stops_the_chain_at_the_next_block() {
+        let _signal = interrupt::exclusive();
         let dir = config::tests::TestDir::new("interrupt-chain");
         let (input, output) = (dir.0.join("in.wav"), dir.0.join("out.wav"));
         let spec = WavSpec {
@@ -891,6 +892,7 @@ mod tests {
         writer.finalize().unwrap();
         let reader = wav::Reader::open(&input).unwrap();
         let writer = wav::Writer::new(File::create(&output).unwrap(), &output, spec).unwrap();
+        let _signal = interrupt::exclusive();
         assert_eq!(run_chain(reader, writer, profile, &input), Ok(0));
         hound::WavReader::open(&output)
             .unwrap()

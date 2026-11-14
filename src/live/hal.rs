@@ -570,11 +570,12 @@ pub fn bundle_id(process: ObjectId) -> Result<String, Error> {
     )
 }
 
-/// Whether any process other than `own` is currently running audio output.
-pub fn others_playing(own: ObjectId) -> Result<bool, Error> {
+/// Whether any process but those in `except` is currently running audio
+/// output.
+pub fn others_playing(except: &[ObjectId]) -> Result<bool, Error> {
     Ok(process_objects()?
         .into_iter()
-        .filter(|&p| p != own)
+        .filter(|p| !except.contains(p))
         .any(runs_output))
 }
 
