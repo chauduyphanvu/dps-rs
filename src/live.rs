@@ -148,9 +148,10 @@ pub struct Options {
 pub trait Report: Send + Sync {
     /// Starting audio is blocked on the macOS permission prompt.
     fn waiting_for_permission(&self);
-    /// Audio runs on `device` at `rate` with the profile `profile`; said
-    /// again when the profile changes.
-    fn running(&self, device: &str, rate: u32, profile: &str);
+    /// Audio runs on `device` at `rate` with the profile `profile`, with
+    /// `latency` as `Latency::describe` puts it if known; said again when
+    /// the profile changes.
+    fn running(&self, device: &str, rate: u32, profile: &str, latency: Option<&str>);
     /// The tap has delivered sound, so the permission is there.
     fn heard(&self);
     fn reload_failed(&self, message: &str);
@@ -255,6 +256,7 @@ pub fn run(options: Options) -> Result<(), String> {
                         .map_err(|e| format!("cannot set up the terminal for the tuner: {e}"))?;
                     live.screen = Some(screen);
                 }
+                live.latency = session.latency;
                 live.announce(&target.name, rate, announced, switched.take());
                 announced = true;
                 watch(&target, own, &stats, &controls, &session, rate, &mut live)?
@@ -428,6 +430,8 @@ struct Live {
     settings: Option<PathBuf>,
     /// The output device of the session: its UID and name.
     device: Option<(String, String)>,
+    /// What the HAL reported for the session.
+    latency: Option<Latency>,
     apps: Apps,
     /// Set in interactive runs once audio first runs.
     screen: Option<Screen>,
@@ -447,6 +451,7 @@ impl Live {
             save_path: options.save_path,
             config,
             device: None,
+            latency: None,
             apps: Apps::default(),
             screen: None,
             background: options.background,
@@ -686,10 +691,14 @@ impl Live {
             // A restart may have written over the screen.
             screen.invalidate();
         }
+        let latency = self.latency.map(|l| l.describe());
         if let Some(report) = &self.background {
-            report.running(device, rate, &self.name);
+            report.running(device, rate, &self.name, latency.as_deref());
         }
         let mut details = switched.unwrap_or_default();
+        if let Some(latency) = latency {
+            details += &format!("; {latency}");
+        }
         if let Some(apps) = self.apps_note() {
             details += &format!("; {apps}");
         }
@@ -771,9 +780,14 @@ impl Live {
                     .clone()
                     .and_then(|(uid, name)| Some((self.follow(&uid, &name, Some(rate))?, name)));
                 if self.save_path != before {
-                    handoff.post(Processor::new(self.tuner.profile(), rate, 2));
+                    let chain = Processor::new(self.tuner.profile(), rate, 2);
+                    if let Some(latency) = &mut self.latency {
+                        latency.chain = chain.latency_frames();
+                    }
+                    handoff.post(chain);
+                    let latency = self.latency.map(|l| l.describe());
                     if let (Some(report), Some((_, device))) = (&self.background, &self.device) {
-                        report.running(device, rate, &self.name);
+                        report.running(device, rate, &self.name, latency.as_deref());
                     }
                 }
                 match followed {
@@ -1235,6 +1249,110 @@ impl Target {
     }
 }
 
+/// The parts of a session's latency, in frames: what the HAL reports for
+/// the aggregate device and the output device, and the chain's own. The
+/// HAL's figures are what the devices declare, not a measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct Latency {
+    rate: u32,
+    /// The aggregate's IO buffer, which input and output each wait for.
+    buffer: u32,
+    /// The output device's latency, safety offset and stream latency.
+    output: u32,
+    output_safety: u32,
+    output_stream: u32,
+    /// The aggregate's input side, which carries the tap: its latency and
+    /// safety offset, and the tap stream's latency.
+    tap: u32,
+    tap_safety: u32,
+    tap_stream: u32,
+    chain: usize,
+}
+
+impl Latency {
+    /// What the HAL reports for a running session on `aggregate` and
+    /// `target`, with a chain that lags `chain` frames.
+    fn read(
+        aggregate: &hal::Aggregate,
+        target: &Target,
+        rate: u32,
+        chain: usize,
+    ) -> Result<Self, hal::Error> {
+        let (input, output) = (
+            hal::kAudioObjectPropertyScopeInput,
+            hal::kAudioObjectPropertyScopeOutput,
+        );
+        let stream_latency = |device, scope, last: bool| -> Result<u32, hal::Error> {
+            let streams = hal::stream_ids(device, scope)?;
+            let stream = if last {
+                streams.last()
+            } else {
+                streams.first()
+            };
+            stream.map_or(Ok(0), |&s| hal::stream_latency(s))
+        };
+        Ok(Self {
+            rate,
+            buffer: hal::buffer_frames(aggregate.id)?,
+            output: hal::device_latency(target.device, output)?,
+            output_safety: hal::safety_offset(target.device, output)?,
+            // The callback plays on the first output channels.
+            output_stream: stream_latency(target.device, output, false)?,
+            tap: hal::device_latency(aggregate.id, input)?,
+            tap_safety: hal::safety_offset(aggregate.id, input)?,
+            // The aggregate lists the tap's stream after its device's.
+            tap_stream: stream_latency(aggregate.id, input, true)?,
+            chain,
+        })
+    }
+
+    /// From the tap to the output: a buffer in, a buffer out, and every
+    /// other part once.
+    fn frames(&self) -> u64 {
+        2 * u64::from(self.buffer)
+            + [
+                self.output,
+                self.output_safety,
+                self.output_stream,
+                self.tap,
+                self.tap_safety,
+                self.tap_stream,
+            ]
+            .into_iter()
+            .map(u64::from)
+            .sum::<u64>()
+            + self.chain as u64
+    }
+
+    fn millis(&self) -> f64 {
+        self.frames() as f64 * 1000.0 / f64::from(self.rate.max(1))
+    }
+
+    /// The total and its parts, leaving out those the HAL reports as 0.
+    fn describe(&self) -> String {
+        let mut parts = vec![format!("IO buffer 2 × {}", self.buffer)];
+        for (name, frames) in [
+            ("output latency", self.output as usize),
+            ("output safety offset", self.output_safety as usize),
+            ("output stream latency", self.output_stream as usize),
+            ("tap latency", self.tap as usize),
+            ("tap safety offset", self.tap_safety as usize),
+            ("tap stream latency", self.tap_stream as usize),
+            ("chain", self.chain),
+        ] {
+            if frames > 0 {
+                parts.push(format!("{name} {frames}"));
+            }
+        }
+        format!(
+            "latency by the HAL's figures: {:.1} ms ({}; frames at {} Hz)",
+            self.millis(),
+            parts.join(", "),
+            self.rate
+        )
+    }
+}
+
 /// Everything one run on one output device owns. Fields drop in order: IO
 /// stops and the callback's state is freed before the listeners go, and the
 /// aggregate goes before the tap it holds.
@@ -1246,6 +1364,8 @@ struct Session {
     /// Where the callback reads the tap.
     tap_channels: TapChannels,
     handoff: Arc<Handoff<Processor>>,
+    /// What the HAL reports, if it could be read.
+    latency: Option<Latency>,
 }
 
 impl Session {
@@ -1268,8 +1388,10 @@ impl Session {
         let tap_channels = Layout::read(&aggregate, &tap, target)?.tap;
 
         let handoff = Arc::new(Handoff::new());
+        let chain = Processor::new(profile, rate, 2);
+        let chain_latency = chain.latency_frames();
         let engine = Box::new(Engine::new(
-            Processor::new(profile, rate, 2),
+            chain,
             rate,
             BLOCK_FRAMES,
             Arc::clone(&handoff),
@@ -1359,6 +1481,7 @@ impl Session {
             unsafe { hal::IoProc::start(aggregate.id, Some(io_proc::<Processor>), engine) }
         })
         .map_err(|e| format!("{e}; if this is a permission problem, {hint}"))?;
+        let latency = Latency::read(&aggregate, target, rate, chain_latency).ok();
         Ok(Self {
             _io: io,
             _listeners: listeners,
@@ -1366,6 +1489,7 @@ impl Session {
             tap,
             tap_channels,
             handoff,
+            latency,
         })
     }
 
@@ -2350,8 +2474,11 @@ mod tests {
         fn waiting_for_permission(&self) {
             self.push("waiting".into());
         }
-        fn running(&self, device: &str, rate: u32, profile: &str) {
-            self.push(format!("running on {device} at {rate} with {profile}"));
+        fn running(&self, device: &str, rate: u32, profile: &str, latency: Option<&str>) {
+            let latency = latency.map(|l| format!("; {l}")).unwrap_or_default();
+            self.push(format!(
+                "running on {device} at {rate} with {profile}{latency}"
+            ));
         }
         fn heard(&self) {
             self.push("heard".into());
@@ -2891,6 +3018,69 @@ mod tests {
         );
         live.announce("Speakers", 48_000, true, None);
         assert_eq!(live.tuner.message(), "now on Speakers at 48000 Hz");
+    }
+
+    /// What the HAL reports for the built-in speakers of the machine this
+    /// was written on, with an assumed tap side and chain.
+    fn speakers_latency() -> Latency {
+        Latency {
+            rate: 48_000,
+            buffer: 512,
+            output: 60,
+            output_safety: 48,
+            output_stream: 690,
+            tap: 0,
+            tap_safety: 32,
+            tap_stream: 0,
+            chain: 72,
+        }
+    }
+
+    #[test]
+    fn latency_adds_a_buffer_each_way_and_every_other_part_once() {
+        let latency = speakers_latency();
+        assert_eq!(latency.frames(), 2 * 512 + 60 + 48 + 690 + 32 + 72);
+        assert!((latency.millis() - 1926.0 / 48.0).abs() < 1e-9);
+        assert_eq!(
+            latency.describe(),
+            "latency by the HAL's figures: 40.1 ms (IO buffer 2 × 512, output latency 60, output \
+             safety offset 48, output stream latency 690, tap safety offset 32, chain 72; frames \
+             at 48000 Hz)"
+        );
+        let bare = Latency {
+            rate: 44_100,
+            buffer: 441,
+            ..Latency::default()
+        };
+        assert_eq!(
+            bare.describe(),
+            "latency by the HAL's figures: 20.0 ms (IO buffer 2 × 441; frames at 44100 Hz)"
+        );
+        assert_eq!(Latency::default().millis(), 0.0);
+    }
+
+    #[test]
+    fn each_session_announces_its_latency() {
+        let dir = Scratch::new("latency");
+        let reports = Arc::new(Reports::default());
+        let (mut live, _) = live_in(&dir, "", Some(Arc::clone(&reports)));
+        live.latency = Some(speakers_latency());
+        live.announce("Speakers", 48_000, false, None);
+        let said = live.tuner.message().to_owned();
+        assert!(
+            said.starts_with(
+                "processing system audio on Speakers at 48000 Hz; latency by the HAL's figures: \
+                 40.1 ms (IO buffer 2 × 512,"
+            ),
+            "{said}"
+        );
+        assert_eq!(
+            reports.take(),
+            [format!(
+                "running on Speakers at 48000 with settings.toml; {}",
+                speakers_latency().describe()
+            )]
+        );
     }
 
     #[test]

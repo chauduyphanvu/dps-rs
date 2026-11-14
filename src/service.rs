@@ -340,6 +340,9 @@ pub struct State {
     /// `settings`: the device's own.
     #[serde(default)]
     pub profile: Option<String>,
+    /// The session's latency and its parts, by the HAL's figures.
+    #[serde(default)]
+    pub latency: Option<String>,
     /// The tap has delivered sound.
     #[serde(default)]
     pub heard: bool,
@@ -410,12 +413,13 @@ impl live::Report for StateFile {
         self.update(|state, _| state.phase = Phase::WaitingForPermission);
     }
 
-    fn running(&self, device: &str, rate: u32, profile: &str) {
+    fn running(&self, device: &str, rate: u32, profile: &str, latency: Option<&str>) {
         self.update(|state, _| {
             state.phase = Phase::Running;
             state.device = Some(device.into());
             state.rate = Some(rate);
             state.profile = (profile != state.settings).then(|| profile.into());
+            state.latency = latency.map(String::from);
         });
     }
 
@@ -570,6 +574,7 @@ pub fn serve(
             device: None,
             rate: None,
             profile: None,
+            latency: None,
             heard: false,
             excluded: Vec::new(),
             problem: None,
@@ -754,17 +759,20 @@ impl Snapshot {
         })
     }
 
-    /// What `dps status` prints: a line, one for the apps a running service
-    /// leaves alone, and another for any warning.
+    /// What `dps status` prints: a line, for a running service one for its
+    /// latency and one for the apps it leaves alone, and another for any
+    /// warning.
     pub fn status(&self, log: &Path) -> String {
         let (_, service) = self.service(log);
         let (_, login) = self.login();
         let mut out = format!("dps is {service}; start at login is {login}\n");
-        if let Some(state) = self
-            .current_state()
-            .filter(|s| s.phase == Phase::Running && !s.excluded.is_empty())
-        {
-            out += &format!("apps left alone: {}\n", state.excluded.join(", "));
+        if let Some(state) = self.current_state().filter(|s| s.phase == Phase::Running) {
+            if let Some(latency) = &state.latency {
+                out += &format!("{latency}\n");
+            }
+            if !state.excluded.is_empty() {
+                out += &format!("apps left alone: {}\n", state.excluded.join(", "));
+            }
         }
         let mut notes = Vec::new();
         if let Some(problem) = self
@@ -1352,6 +1360,7 @@ mod tests {
             device: Some("Speakers".into()),
             rate: Some(48_000),
             profile: None,
+            latency: None,
             heard: false,
             excluded: Vec::new(),
             problem: None,
@@ -1371,7 +1380,7 @@ mod tests {
             State::read(&path).unwrap().phase,
             Phase::WaitingForPermission
         );
-        file.running("Headphones", 44_100, "preset music");
+        file.running("Headphones", 44_100, "preset music", Some("latency x"));
         file.heard();
         let s = State::read(&path).unwrap();
         assert_eq!(
@@ -1379,11 +1388,13 @@ mod tests {
             (Phase::Running, Some("Headphones"), Some(44_100), true)
         );
         assert_eq!((s.profile.as_deref(), s.profile()), (None, "preset music"));
+        assert_eq!(s.latency.as_deref(), Some("latency x"));
         // A device with a profile of its own.
-        file.running("AirPods", 48_000, "/c/devices/airpods.toml");
+        file.running("AirPods", 48_000, "/c/devices/airpods.toml", None);
         let s = State::read(&path).unwrap();
         assert_eq!(s.profile(), "/c/devices/airpods.toml");
-        file.running("Headphones", 44_100, "preset music");
+        assert_eq!(s.latency, None);
+        file.running("Headphones", 44_100, "preset music", None);
         assert_eq!(State::read(&path).unwrap().profile, None);
         file.excluded(&["us.zoom.xos".into()]);
         assert_eq!(State::read(&path).unwrap().excluded, ["us.zoom.xos"]);
@@ -1566,6 +1577,7 @@ mod tests {
 
         let leaving = State {
             excluded: vec!["com.google.Chrome".into(), "us.zoom.xos".into()],
+            latency: Some("latency by the HAL's figures: 26.0 ms (x)".into()),
             problem: Some("profile not reloaded: x".into()),
             ..running.clone()
         };
@@ -1576,8 +1588,8 @@ mod tests {
         ));
         assert!(
             text.ends_with(
-                "; start at login is off\napps left alone: com.google.Chrome, us.zoom.xos\nlast \
-                 warning: profile not reloaded: x\n"
+                "; start at login is off\nlatency by the HAL's figures: 26.0 ms (x)\napps left \
+                 alone: com.google.Chrome, us.zoom.xos\nlast warning: profile not reloaded: x\n"
             ),
             "{text}"
         );

@@ -23,13 +23,15 @@ use objc2_core_audio::{
     kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceIsStackedKey,
     kAudioAggregateDeviceMainSubDeviceKey, kAudioAggregateDeviceNameKey,
     kAudioAggregateDeviceSubDeviceListKey, kAudioAggregateDeviceTapListKey,
-    kAudioAggregateDeviceUIDKey, kAudioDevicePropertyDeviceIsRunning,
-    kAudioDevicePropertyDeviceUID, kAudioDevicePropertyPreferredChannelsForStereo,
-    kAudioDevicePropertyVolumeRangeDecibels, kAudioHardwareBadPropertySizeError,
-    kAudioHardwarePropertyDevices, kAudioHardwarePropertyTranslatePIDToProcessObject,
-    kAudioHardwareUnspecifiedError, kAudioObjectPropertyElementMain, kAudioObjectPropertyName,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioObjectUnknown,
-    kAudioProcessPropertyBundleID, kAudioProcessPropertyIsRunningOutput,
+    kAudioAggregateDeviceUIDKey, kAudioDevicePropertyBufferFrameSize,
+    kAudioDevicePropertyDeviceIsRunning, kAudioDevicePropertyDeviceUID,
+    kAudioDevicePropertyLatency, kAudioDevicePropertyPreferredChannelsForStereo,
+    kAudioDevicePropertySafetyOffset, kAudioDevicePropertyVolumeRangeDecibels,
+    kAudioHardwareBadPropertySizeError, kAudioHardwarePropertyDevices,
+    kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioHardwareUnspecifiedError,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectSystemObject, kAudioObjectUnknown, kAudioProcessPropertyBundleID,
+    kAudioProcessPropertyIsRunningOutput, kAudioStreamPropertyLatency,
     kAudioStreamPropertyTerminalType, kAudioStreamPropertyVirtualFormat, kAudioSubDeviceUIDKey,
     kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, kAudioTapPropertyDescription,
     kAudioTapPropertyFormat, kAudioTapPropertyUID,
@@ -383,6 +385,58 @@ pub fn below_max(readings: &[(f32, f64)]) -> Option<f32> {
         .filter(|db| db.is_finite())
         .collect();
     (!below.is_empty()).then(|| (below.iter().sum::<f64>() / below.len() as f64).min(0.0) as f32)
+}
+
+/// The device's IO buffer size in frames.
+pub fn buffer_frames(device: ObjectId) -> Result<u32, Error> {
+    // SAFETY: a UInt32 property.
+    unsafe {
+        get(
+            device,
+            kAudioDevicePropertyBufferFrameSize,
+            GLOBAL,
+            "read the IO buffer size",
+        )
+    }
+}
+
+/// The device's latency in `scope`, in frames.
+pub fn device_latency(device: ObjectId, scope: AudioObjectPropertyScope) -> Result<u32, Error> {
+    // SAFETY: a UInt32 property.
+    unsafe {
+        get(
+            device,
+            kAudioDevicePropertyLatency,
+            scope,
+            "read the device latency",
+        )
+    }
+}
+
+/// The device's safety offset in `scope`, in frames.
+pub fn safety_offset(device: ObjectId, scope: AudioObjectPropertyScope) -> Result<u32, Error> {
+    // SAFETY: a UInt32 property.
+    unsafe {
+        get(
+            device,
+            kAudioDevicePropertySafetyOffset,
+            scope,
+            "read the safety offset",
+        )
+    }
+}
+
+/// A stream's latency in frames.
+pub fn stream_latency(stream: ObjectId) -> Result<u32, Error> {
+    // SAFETY: a UInt32 property.
+    unsafe {
+        get(
+            stream,
+            kAudioStreamPropertyLatency,
+            GLOBAL,
+            "read a stream's latency",
+        )
+    }
 }
 
 pub fn is_running(device: ObjectId) -> Result<bool, Error> {
@@ -860,6 +914,23 @@ mod tests {
                 name(device),
                 volume_elements(device),
                 output_volume_db(device)
+            );
+            let streams = stream_ids(device, output).unwrap();
+            println!(
+                "device {device} {:?}: buffer {:?} frames at {:?} Hz, output latency {:?}, \
+                 safety offset {:?}, stream latencies {:?}; input latency {:?}, safety offset \
+                 {:?}",
+                name(device),
+                buffer_frames(device),
+                nominal_sample_rate(device),
+                device_latency(device, output),
+                safety_offset(device, output),
+                streams
+                    .iter()
+                    .map(|&s| stream_latency(s))
+                    .collect::<Vec<_>>(),
+                device_latency(device, kAudioObjectPropertyScopeInput),
+                safety_offset(device, kAudioObjectPropertyScopeInput),
             );
         }
     }
