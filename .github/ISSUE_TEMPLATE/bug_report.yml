@@ -1,0 +1,47 @@
+name: Bug report
+description: Something dps does that it should not, or does not do that it should
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: "`dps --version` output"
+      placeholder: dps 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: macOS version, or OS for file processing
+      placeholder: macOS 15.1
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`dps doctor` output"
+      description: "Run `dps doctor` and paste the output; it lists the output device and the apps playing audio, so remove anything you'd rather not share."
+      render: text
+  - type: input
+    id: output-device
+    attributes:
+      label: Output device
+      placeholder: MacBook Pro Speakers, AirPods Pro
