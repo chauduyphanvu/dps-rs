@@ -17,6 +17,7 @@ use presets::{PRESETS, Preset};
 mod config;
 mod doctor;
 mod ffmpeg;
+mod import;
 mod interrupt;
 #[cfg(target_os = "macos")]
 mod live;
@@ -35,6 +36,7 @@ Examples:
   dps start                 The same in the background (dps status, dps stop)
   dps doctor                Check that live mode can work here
   dps process song.flac     Write song.dps.flac (formats other than WAV use ffmpeg)
+  dps import hd650.txt      Import an AutoEQ headphone correction (ParametricEQ.txt)
   dps presets               List the built-in presets
   dps profile               Print the default profile as TOML
 
@@ -46,6 +48,7 @@ const EXAMPLES: &str = "\
 Examples:
   dps process song.flac     Write song.dps.flac (formats other than WAV use ffmpeg)
   dps process song.wav --preset music
+  dps import hd650.txt      Import an AutoEQ headphone correction (ParametricEQ.txt)
   dps presets               List the built-in presets
   dps profile               Print the default profile as TOML
   dps doctor                Check the settings and ffmpeg
@@ -139,6 +142,22 @@ enum Command {
         #[command(flatten)]
         source: SourceArgs,
     },
+    /// Import a headphone or speaker correction (AutoEQ / Equalizer APO parametric EQ text).
+    ///
+    /// The AutoEQ project publishes a measured correction for each headphone
+    /// model it covers, in its results, as a "ParametricEQ.txt" file. This
+    /// fills the [correction] table of the settings file (or of --profile)
+    /// with that file's preamp and filters and turns it on, so the EQ and
+    /// every other value stay as they are. Importing again replaces the
+    /// earlier correction. The profile file is rewritten, so comments in it
+    /// are not kept; a running dps picks the change up on its own.
+    Import {
+        /// The ParametricEQ.txt file to import.
+        input: PathBuf,
+        /// Profile to write the correction into instead of the settings file.
+        #[arg(short, long, value_name = "FILE.toml")]
+        profile: Option<PathBuf>,
+    },
     /// List the built-in presets.
     Presets,
     /// Print the default profile as TOML.
@@ -174,6 +193,7 @@ fn main() -> ExitCode {
         }) => source
             .resolve(&dirs)
             .and_then(|source| process(&input, output, &source)),
+        Some(Command::Import { input, profile }) => import::run(&input, profile, &dirs),
         Some(Command::Presets) => print_presets(),
         Some(Command::Profile { preset }) => print_profile(preset),
         Some(Command::Doctor { source }) => return doctor::run(source.resolve(&dirs), &dirs),

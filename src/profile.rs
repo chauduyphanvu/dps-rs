@@ -466,6 +466,24 @@ impl Profile {
             [rest @ .., last] => Some(format!("{} and {last}", rest.join(", "))),
         }
     }
+
+    /// The correction bands the stage skips at `sample_rate` (see
+    /// `CorrectionBand::is_skipped`), as indices into `correction.bands`.
+    pub fn skipped_correction_bands(&self, sample_rate: u32) -> Vec<usize> {
+        let sample_rate = f64::from(sample_rate);
+        (0..self.correction.bands.len())
+            .filter(|&i| self.correction.bands[i].is_skipped(sample_rate))
+            .collect()
+    }
+}
+
+impl CorrectionBand {
+    /// Whether the correction stage skips this band at `sample_rate`, passing
+    /// audio through it unchanged: its frequency is not below Nyquist, which
+    /// NaN is not either.
+    pub fn is_skipped(&self, sample_rate: f64) -> bool {
+        f64::from(self.freq_hz).partial_cmp(&(sample_rate / 2.0)) != Some(std::cmp::Ordering::Less)
+    }
 }
 
 #[cfg(test)]
@@ -871,6 +889,29 @@ mod tests {
         ];
         for fs in [32_000, 22_050, 16_000, 8_000] {
             accepted(&p, fs);
+        }
+    }
+
+    #[test]
+    fn skipped_correction_bands_are_those_at_or_above_nyquist() {
+        let mut p = Profile::default();
+        assert_eq!(p.skipped_correction_bands(48_000), []);
+        p.correction.bands = vec![
+            band(BandKind::Peaking, 1000.0, 1.0, 3.0),
+            band(BandKind::HighShelf, 16_000.0, 0.7, -2.0),
+            band(BandKind::Peaking, 22_050.0, 1.0, 1.0),
+            band(BandKind::LowShelf, 24_000.0, 0.7, 1.0),
+            band(BandKind::Peaking, f32::NAN, 1.0, 1.0),
+        ];
+        for (fs, skipped) in [
+            (96_000, &[4][..]),
+            (48_000, &[3, 4][..]),
+            (44_100, &[2, 3, 4][..]),
+            (32_000, &[1, 2, 3, 4][..]),
+            (8_000, &[1, 2, 3, 4][..]),
+            (2_000, &[0, 1, 2, 3, 4][..]),
+        ] {
+            assert_eq!(p.skipped_correction_bands(fs), skipped, "{fs} Hz");
         }
     }
 
