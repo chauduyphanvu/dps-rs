@@ -1,5 +1,7 @@
 # dps
 
+[![CI](https://github.com/chauduyphanvu/dps-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/chauduyphanvu/dps-rs/actions/workflows/ci.yml)
+
 A system-wide audio processor for macOS that needs no virtual audio driver:
 it levels, shapes and limits everything your Mac plays, with a profile for
 each output device. The same chain processes audio files on any platform.
@@ -56,15 +58,45 @@ File processing builds on other platforms; live mode is macOS only.
 
 ## Install
 
+**Homebrew**, on macOS 14 or later:
+
 ```sh
-cargo install --path .
+brew install chauduyphanvu/dps/dps
 ```
 
+**From a release**: each [release](https://github.com/chauduyphanvu/dps-rs/releases)
+has `dps-<version>-macos-universal.zip`, holding one `dps` binary for Apple
+silicon and Intel Macs, signed and notarised, and a `.sha256` file to check it
+against. Set `v` to the release you want:
+
+```sh
+v=0.1.0
+base=https://github.com/chauduyphanvu/dps-rs/releases/download/v$v
+curl -fL -O "$base/dps-$v-macos-universal.zip" -O "$base/dps-$v-macos-universal.zip.sha256"
+shasum -a 256 -c "dps-$v-macos-universal.zip.sha256"
+unzip "dps-$v-macos-universal.zip"
+sudo install -d /usr/local/bin && sudo install dps /usr/local/bin/
+```
+
+`/usr/local/bin` is on the `PATH` macOS sets up; any other directory on your
+`PATH` will do.
+
+**From source**, on any platform (live mode is macOS only):
+
+```sh
+cargo install --git https://github.com/chauduyphanvu/dps-rs --locked
+```
+
+or `cargo install --path . --locked` in a clone.
+
 On macOS, the background service (`dps start`) is asked for audio-recording
-consent as `dps` itself, and macOS ties that consent to the code signature. An
-unsigned build gets a new signature on every rebuild, so the prompt returns
-each time. `scripts/install.sh` installs and then signs the binary with a
-Developer ID certificate from your keychain, which makes one approval last.
+consent as `dps` itself, and macOS ties that consent to the code signature. The
+Homebrew and release binaries are signed with the same Developer ID every
+time, so one approval lasts across upgrades. A build from source gets a new
+signature on every rebuild, so the prompt returns each time, unless you install
+it from a clone with `scripts/install.sh`, which signs it with a Developer ID
+certificate from your keychain. Switching between a release and your own build
+asks again.
 
 Run `dps doctor` to check that everything live mode needs is in place.
 
@@ -254,14 +286,88 @@ Apple silicon Mac; the default profile about 0.5 %.
 
 ### Releasing
 
-One-time setup: `rustup target add aarch64-apple-darwin x86_64-apple-darwin`, then
-`xcrun notarytool store-credentials dps-notary --apple-id <id> --team-id <team>`
-(prompts for an app-specific password and keeps it in the keychain).
+Pushing a tag `vX.Y.Z` builds, signs, notarises and publishes the release and
+updates the Homebrew tap, through `.github/workflows/release.yml`.
 
-1. Bump `version` in `Cargo.toml`, run `cargo build` to refresh `Cargo.lock`, commit both and push.
-2. `scripts/release.sh` builds, signs and notarises `dist/dps-<version>-macos-universal.zip` and prints its sha256. It publishes nothing.
-3. `gh release create v<version> dist/dps-<version>-macos-universal.zip --generate-notes`
-4. In the Homebrew tap, copy `packaging/homebrew/dps.rb` to `Formula/dps.rb`, set `url` and `sha256`, push.
+One-time setup. The secrets live in 1Password and reach the keychain or GitHub
+through `op read`, so none is pasted or left in a file; `<vault>/<item>/<field>`
+stands for wherever you keep each one. Run the `gh` commands in a clone.
+
+1. For local runs of `scripts/release.sh`:
+   `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
+2. A notary key: an App Store Connect API team key, since Apple documents
+   individual keys as unable to notarise. As the Account Holder, request API
+   access in App Store Connect under Users and Access > Integrations, then
+   generate a team key with the Developer role. Keep the downloaded
+   `AuthKey_<key id>.p8`, the key ID and the issuer ID in 1Password, and delete
+   the download. For local runs, store them as the profile `scripts/release.sh`
+   uses. notarytool cannot read a pipe, so zsh's `=(...)` hands it a temporary
+   file that zsh deletes when the command ends:
+
+   ```sh
+   xcrun notarytool store-credentials dps-notary \
+     --key =(op read 'op://<vault>/<item>/<key file>') \
+     --key-id "$(op read 'op://<vault>/<item>/<key id>')" \
+     --issuer "$(op read 'op://<vault>/<item>/<issuer id>')"
+   ```
+
+3. The signing certificate. In Keychain Access, export your "Developer ID
+   Application" certificate with its private key as a `.p12` with a password,
+   keep both in 1Password, and delete the export.
+4. A `release` environment that only `v*` tags can use, holding the secrets:
+
+   ```sh
+   gh api -X PUT repos/chauduyphanvu/dps-rs/environments/release \
+     -F 'deployment_branch_policy[protected_branches]=false' \
+     -F 'deployment_branch_policy[custom_branch_policies]=true'
+   gh api -X POST repos/chauduyphanvu/dps-rs/environments/release/deployment-branch-policies \
+     -f name='v*' -f type=tag
+   op read -n 'op://<vault>/<item>/<p12 file>' | base64 | gh secret set DEVELOPER_ID_P12_BASE64 --env release
+   op read -n 'op://<vault>/<item>/<p12 password>' | gh secret set DEVELOPER_ID_P12_PASSWORD --env release
+   op read -n 'op://<vault>/<item>/<key file>' | gh secret set NOTARY_KEY_P8 --env release
+   op read -n 'op://<vault>/<item>/<key id>' | gh secret set NOTARY_KEY_ID --env release
+   op read -n 'op://<vault>/<item>/<issuer id>' | gh secret set NOTARY_ISSUER_ID --env release
+   ```
+
+5. The tap. Create it with
+   `gh repo create chauduyphanvu/homebrew-dps --public --add-readme`. Then, under
+   GitHub Settings > Developer settings > Personal access tokens > Fine-grained
+   tokens, create a token with access to `chauduyphanvu/homebrew-dps` only and
+   its Contents permission set to Read and write, keep it in 1Password, and:
+
+   ```sh
+   op read -n 'op://<vault>/<item>/<token>' | gh secret set TAP_GITHUB_TOKEN --env release
+   ```
+
+   When the token expires, replace it the same way.
+
+To release:
+
+1. Bump `version` in `Cargo.toml` and run `cargo build` to refresh `Cargo.lock`.
+2. Add a `## X.Y.Z` section to `CHANGELOG.md`; it becomes the release notes.
+3. Commit both, and push to `main`.
+4. `git tag vX.Y.Z && git push origin vX.Y.Z`
+
+The workflow runs CI, then checks that the tag matches `version` in
+`Cargo.toml`, that the tagged commit is on `main` and that `CHANGELOG.md` has a
+non-empty `## X.Y.Z` section, and stops there if not. It puts the certificate
+and the notary key in a temporary keychain, runs `scripts/release.sh`, and
+publishes the release `vX.Y.Z` with the zip, its `.sha256` and the changelog
+section. Last, it downloads the published zip, checks it against the sha256 of
+the one it built, and commits `Formula/dps.rb`, rendered from
+`packaging/homebrew/dps.rb` with the new `url` and `sha256`, to the tap as
+`dps X.Y.Z`.
+
+Nothing is public until the release is published. If a run fails before that
+for a reason outside the code (a secret, Apple's service), re-run it; for a fix
+in the code, delete the tag (`git push origin :vX.Y.Z && git tag -d vX.Y.Z`)
+and tag the fixed commit. If only the tap update fails, fix the cause and
+re-run the failed job.
+
+`scripts/release.sh` also runs on a Mac with a clean tree: it builds, signs
+and notarises `dist/dps-<version>-macos-universal.zip` and writes its
+`.sha256`, using the Developer ID certificate in your keychain and the
+`dps-notary` profile. It publishes nothing.
 
 ## License
 

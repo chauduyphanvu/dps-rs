@@ -1,14 +1,14 @@
 #!/bin/sh
 # Builds a universal macOS binary, signs it with the Developer ID certificate,
-# notarises it and leaves the zip in dist/. It never tags, pushes or uploads
-# anything except the notarisation submission to Apple; publishing is printed
-# at the end for you to run.
+# notarises it and leaves the zip and its .sha256 in dist/. It never tags,
+# pushes or uploads anything except the notarisation submission to Apple.
+# Pushing a vX.Y.Z tag runs it in .github/workflows/release.yml, which then
+# publishes what it left in dist/.
 #
-# One-time setup: store the notarisation credentials in the keychain. The
-# command prompts for an app-specific password, so nothing secret goes on disk
-# or into this script.
-#   xcrun notarytool store-credentials dps-notary --apple-id <id> --team-id <team>
-# Set DPS_NOTARY_PROFILE to use a profile with another name.
+# It signs with the "Developer ID Application" identity in the keychain and
+# notarises with the notarytool keychain profile dps-notary (or the one named
+# by DPS_NOTARY_PROFILE). README.md, under Releasing, shows how to create the
+# profile from the API key in 1Password.
 set -eu
 
 die() {
@@ -37,7 +37,7 @@ for target in aarch64-apple-darwin x86_64-apple-darwin; do
 done
 
 mkdir -p dist
-rm -f dist/dps "$archive"
+rm -f dist/dps "$archive" "$archive.sha256"
 lipo -create -output dist/dps \
     target/aarch64-apple-darwin/release/dps \
     target/x86_64-apple-darwin/release/dps
@@ -70,13 +70,11 @@ xcrun notarytool submit "$archive" \
 grep -q '^ *status: Accepted$' "$log" ||
     die "notarisation was not Accepted; see the output above (xcrun notarytool log <id> --keychain-profile ...)"
 
-sha256=$(shasum -a 256 "$archive" | awk '{print $1}')
+# The bare file name, so `shasum -a 256 -c` works beside the downloaded zip.
+(cd dist && shasum -a 256 "${archive#dist/}") >"$archive.sha256"
+sha256=$(awk '{print $1}' "$archive.sha256")
 cat <<EOF
 
 Built and notarised $archive
-sha256 $sha256
-
-Publish it yourself:
-  gh release create v$version $archive --generate-notes
-  Update url and sha256 in the formula in your tap (Formula/dps.rb).
+sha256 $sha256 (in $archive.sha256)
 EOF

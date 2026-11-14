@@ -1,0 +1,163 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+# Not named after github.workflow: the called CI workflow sees this workflow's
+# name there, so a CI concurrency group built from it could equal this one and
+# deadlock.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: macos-15
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      sha256: ${{ steps.publish.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # All branches, so the tagged commit can be checked against main.
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --target aarch64-apple-darwin,x86_64-apple-darwin
+          rustup default 1.95.0
+
+      - name: Check the tag, its branch and the changelog
+        id: check
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(cargo pkgid | sed 's/.*[#@]//')
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match version $version in Cargo.toml"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::tag $TAG is on a commit that is not on main"
+            exit 1
+          fi
+          notes="$RUNNER_TEMP/notes.md"
+          awk -v heading="## $version" '
+            /^## / { if (found) exit; found = ($0 == heading); next }
+            found
+          ' CHANGELOG.md > "$notes"
+          if ! grep -q '[^[:space:]]' "$notes"; then
+            echo "::error::CHANGELOG.md has no '## $version' section, or it is empty"
+            exit 1
+          fi
+          cat >> "$notes" <<'EOF'
+
+          ---
+
+          Install with `brew install chauduyphanvu/dps/dps`, or see [Install](https://github.com/chauduyphanvu/dps-rs#install) for the zip below and for building from source.
+          EOF
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # scripts/release.sh signs with the identity it finds in the keychain
+      # search list and notarises with the dps-notary profile from the default
+      # keychain, so the temporary keychain becomes both.
+      - name: Put the signing certificate and notary key in a temporary keychain
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          password=$(openssl rand -hex 32)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$DEVELOPER_ID_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$keychain" -f pkcs12 \
+            -P "$DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
+          # Without this, codesign asks for the keychain password in a dialog.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+          printf '%s\n' "$NOTARY_KEY_P8" > "$RUNNER_TEMP/notary-key.p8"
+          xcrun notarytool store-credentials dps-notary --key "$RUNNER_TEMP/notary-key.p8" \
+            --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID"
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/notary-key.p8"
+
+      - name: Build, sign and notarise
+        run: scripts/release.sh
+
+      - name: Publish the release
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          archive="dist/dps-$VERSION-macos-universal.zip"
+          gh release create "$TAG" "$archive" "$archive.sha256" --verify-tag \
+            --title "dps $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+          echo "sha256=$(cut -d ' ' -f 1 "$archive.sha256")" >> "$GITHUB_OUTPUT"
+
+      - name: Remove the keychain and key files
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/release.keychain-db" 2> /dev/null || true
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/notary-key.p8"
+
+  tap:
+    needs: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Update Formula/dps.rb in chauduyphanvu/homebrew-dps
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          VERSION: ${{ needs.release.outputs.version }}
+          SHA256: ${{ needs.release.outputs.sha256 }}
+        run: |
+          formula="$RUNNER_TEMP/dps.rb"
+          sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHA256@/$SHA256/g" packaging/homebrew/dps.rb > "$formula"
+          ruby -c "$formula" > /dev/null
+          url=$(sed -n 's/^  url "\(.*\)"$/\1/p' "$formula")
+          if [ -z "$url" ] || ! grep -qx "  sha256 \"$SHA256\"" "$formula"; then
+            echo "::error::packaging/homebrew/dps.rb did not render a url and sha256"
+            exit 1
+          fi
+          curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/dps.zip" "$url"
+          downloaded=$(sha256sum "$RUNNER_TEMP/dps.zip" | cut -d ' ' -f 1)
+          if [ "$downloaded" != "$SHA256" ]; then
+            echo "::error::$url has sha256 $downloaded, not the $SHA256 the release job built"
+            exit 1
+          fi
+          path=repos/chauduyphanvu/homebrew-dps/contents/Formula/dps.rb
+          args=(-f "message=dps $VERSION" -f "content=$(base64 -w 0 "$formula")")
+          if sha=$(gh api "$path" --jq .sha 2> /dev/null); then
+            args+=(-f "sha=$sha")
+          fi
+          gh api --method PUT "$path" "${args[@]}" --silent

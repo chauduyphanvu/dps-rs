@@ -1,9 +1,11 @@
+# The release workflow of chauduyphanvu/dps-rs writes this file to
+# chauduyphanvu/homebrew-dps as Formula/dps.rb, filling in the version and
+# the checksum of the release's zip.
 class Dps < Formula
   desc "Audio processing chain for files and live macOS system audio"
   homepage "https://github.com/chauduyphanvu/dps-rs"
-  url "https://github.com/chauduyphanvu/dps-rs/releases/download/v0.1.0/dps-0.1.0-macos-universal.zip"
-  # Placeholder: scripts/release.sh prints the real checksum.
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  url "https://github.com/chauduyphanvu/dps-rs/releases/download/v@VERSION@/dps-@VERSION@-macos-universal.zip"
+  sha256 "@SHA256@"
   license "MIT"
 
   depends_on macos: :sonoma
