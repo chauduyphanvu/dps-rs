@@ -33,6 +33,8 @@ pub struct Contour {
     target_treble_db: f64,
     bass_db: f64,
     treble_db: f64,
+    /// As last set, for a chain that takes over with other settings.
+    volume_db: Option<f32>,
     /// Frames since the last update, from 0 to `UPDATE_FRAMES` - 1.
     count: u32,
 }
@@ -53,6 +55,7 @@ impl Contour {
             target_treble_db: 0.0,
             bass_db: 0.0,
             treble_db: 0.0,
+            volume_db: None,
             count: 0,
         }
     }
@@ -74,6 +77,7 @@ impl Contour {
     /// The system volume in dB below maximum; `None` when unknown (files,
     /// devices without a volume control), which adds nothing. No allocation.
     pub fn set_volume_db(&mut self, volume_db: Option<f32>) {
+        self.volume_db = volume_db;
         let deficit = match volume_db {
             Some(v) if v.is_finite() => {
                 (f64::from(self.params.reference_db) - f64::from(v)).max(0.0)
@@ -86,11 +90,11 @@ impl Contour {
             (f64::from(p.treble_per_db) * deficit).min(f64::from(p.max_treble_db));
     }
 
-    /// Starts where `from` is: its targets, gains and filter state, so the
-    /// tone carries on without the volume being sent again. No allocation.
+    /// Starts where `from` is: its volume, gains and filter state, so the
+    /// tone carries on without the volume being sent again, and glides to
+    /// what this stage's own settings make of that volume. No allocation.
     pub fn adopt(&mut self, from: &Self) {
-        self.target_bass_db = from.target_bass_db;
-        self.target_treble_db = from.target_treble_db;
+        self.set_volume_db(from.volume_db);
         self.bass_db = from.bass_db;
         self.treble_db = from.treble_db;
         self.count = from.count;
@@ -344,6 +348,22 @@ mod tests {
         process(&mut a, &mut out_a, 2);
         process(&mut c, &mut out_c, 2);
         assert_eq!(out_a, out_c);
+    }
+
+    #[test]
+    fn adopt_aims_at_its_own_settings_for_the_volume_it_takes_over() {
+        let mut a = Contour::new(&ContourParams::default(), FS, 1);
+        a.set_volume_db(Some(-32.0));
+        let capped = ContourParams {
+            max_bass_db: 3.0,
+            ..ContourParams::default()
+        };
+        let mut b = Contour::new(&capped, FS, 1);
+        b.adopt(&a);
+        assert_eq!(b.target_bass_db, 3.0);
+        let mut alone = Contour::new(&capped, FS, 1);
+        alone.set_volume_db(Some(-32.0));
+        assert_eq!(b.target_treble_db, alone.target_treble_db);
     }
 
     #[test]
