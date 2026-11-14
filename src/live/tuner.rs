@@ -767,6 +767,16 @@ impl Tuner {
         self.bypass
     }
 
+    /// Turns bypass on or off as `b` would; false, changing nothing, during
+    /// a blind test, which keeps it off.
+    pub fn set_bypass(&mut self, on: bool) -> bool {
+        if self.blind.is_some() {
+            return false;
+        }
+        self.bypass = on;
+        true
+    }
+
     pub fn graph(&self) -> bool {
         self.graph
     }
@@ -1985,6 +1995,23 @@ mod tests {
         press(&mut t, Key::Char('a'));
         t.seed = seed;
         t
+    }
+
+    #[test]
+    fn bypass_can_be_set_from_outside_except_during_a_blind_test() {
+        let mut t = tuner();
+        assert!(t.set_bypass(true) && t.bypass());
+        assert!(t.set_bypass(true) && t.bypass());
+        assert_eq!(press(&mut t, Key::Char('b')), Effect::Bypass(false));
+        assert!(t.set_bypass(false) && !t.bypass());
+
+        let mut t = compared(7);
+        press(&mut t, Key::Char('x'));
+        assert!(t.trial().is_some());
+        assert!(!t.set_bypass(true));
+        assert!(!t.bypass());
+        press(&mut t, Key::Char('x'));
+        assert!(t.set_bypass(true) && t.bypass());
     }
 
     #[test]

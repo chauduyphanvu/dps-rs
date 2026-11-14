@@ -10,7 +10,8 @@
 //! When stdin and stderr are both terminals and the run is in the
 //! terminal's foreground, a keyboard tuner takes over the terminal once
 //! audio runs; otherwise messages are plain lines on stderr. A background
-//! run (`dps start`) also reports its progress for `dps status`.
+//! run (`dps start`) also reports its progress for `dps status`. Every run
+//! takes `dps bypass` and `dps use` on its control socket (`control`).
 
 mod calibrate;
 mod hal;
@@ -46,7 +47,9 @@ use objc2_core_audio_types::{
     kAudioFormatFlagIsPacked, kAudioFormatLinearPCM,
 };
 
-use crate::config::Config;
+use crate::config::{Config, create_default};
+use crate::control::{self, Request, Switch};
+use crate::presets;
 use hal::ObjectId;
 use mix::{Controls, Mixer};
 use render::{Buffers, BuffersMut, TapChannels};
@@ -137,9 +140,14 @@ pub struct Options {
     pub save_path: PathBuf,
     /// config.toml, watched for changes.
     pub config: Option<PathBuf>,
+    /// The settings file, which `dps use --settings` goes back to.
+    pub settings_file: Option<PathBuf>,
     /// Each output device plays with the profile config.toml assigns it, or
-    /// else with `save_path`, the settings file.
+    /// else with `settings_file`.
     pub follow_devices: bool,
+    /// Where to listen for `dps bypass` and `dps use`; the run holds the
+    /// live lock, so whatever is there is left over and is replaced.
+    pub control: Option<PathBuf>,
     /// Set for a background run, which has no terminal and reports here.
     pub background: Option<Arc<dyn Report>>,
 }
@@ -425,9 +433,12 @@ struct Live {
     save_path: PathBuf,
     profile_file: Option<ProfileFile>,
     config: Option<ConfigFile>,
-    /// The settings file, when each output device plays with the profile
-    /// config.toml assigns it and every other device with this one.
-    settings: Option<PathBuf>,
+    settings_file: Option<PathBuf>,
+    /// Each output device plays with the profile config.toml assigns it,
+    /// and every other device with the settings file.
+    follow_devices: bool,
+    /// Where `dps bypass` and `dps use` reach this run.
+    server: Option<control::Server>,
     /// The output device of the session: its UID and name.
     device: Option<(String, String)>,
     /// What the HAL reported for the session.
@@ -443,13 +454,16 @@ struct Live {
 impl Live {
     fn new(options: Options) -> Self {
         let (config, problem) = options.config.as_deref().map(ConfigFile::new).unzip();
+        let server = options.control.as_deref().map(control::Server::bind);
         let mut live = Self {
             tuner: Tuner::new(options.profile, options.save_path.display().to_string()),
             profile_file: options.watch.as_deref().map(ProfileFile::new),
             name: options.name,
-            settings: options.follow_devices.then(|| options.save_path.clone()),
             save_path: options.save_path,
             config,
+            settings_file: options.settings_file,
+            follow_devices: options.follow_devices,
+            server: None,
             device: None,
             latency: None,
             apps: Apps::default(),
@@ -461,6 +475,14 @@ impl Live {
             live.warn(format!(
                 "config.toml is ignored until it is fixed: {problem}"
             ));
+        }
+        // Audio does not need the socket, so a run goes on without it.
+        match server {
+            Some(Ok(server)) => live.server = Some(server),
+            Some(Err(e)) => live.warn(format!(
+                "{e}; `dps bypass` and `dps use` cannot reach this run"
+            )),
+            None => {}
         }
         live
     }
@@ -481,11 +503,13 @@ impl Live {
     /// cannot be used.
     fn follow(&mut self, uid: &str, device: &str, rate: Option<u32>) -> Option<String> {
         self.device = Some((uid.into(), device.into()));
-        let settings = self.settings.clone()?;
-        let config = self.config.as_ref()?;
+        if !self.follow_devices || self.config.is_none() {
+            return None;
+        }
+        let settings = self.settings_file.clone()?;
         let mut problem = None;
         let mut next = None;
-        if let Some(own) = config.config.profile_for(uid, config.dir()) {
+        if let Some(own) = self.own_profile() {
             if same_file(&own, &self.save_path) {
                 return None;
             }
@@ -524,21 +548,42 @@ impl Live {
         Some(note + &switched.unwrap_or_default())
     }
 
+    /// The profile file config.toml gives the session's output device, if
+    /// it gives it one.
+    fn own_profile(&self) -> Option<PathBuf> {
+        let (uid, _) = self.device.as_ref()?;
+        let config = self.config.as_ref()?;
+        config.config.profile_for(uid, config.dir())
+    }
+
     /// Plays, edits and saves `profile` from the file `path` from now on;
     /// returns what to add after "with <path>" in a message.
     fn switch(&mut self, path: PathBuf, profile: Profile) -> String {
+        self.switch_to(profile, path.display().to_string(), path, true)
+    }
+
+    /// Plays and edits `profile`, called `name`, from now on, saving it to
+    /// `save_path`, which is watched for saves if `watched`; returns what
+    /// to add after "with <name>" in a message.
+    fn switch_to(
+        &mut self,
+        profile: Profile,
+        name: String,
+        save_path: PathBuf,
+        watched: bool,
+    ) -> String {
         let asked = self.tuner.prompt().is_some();
         let dropped = self.tuner.reload(profile);
-        let old = mem::replace(&mut self.save_path, path);
-        self.name = self.save_path.display().to_string();
-        self.tuner.set_save_to(self.name.clone());
-        self.profile_file = Some(ProfileFile::new(&self.save_path));
+        let old = mem::replace(&mut self.name, name);
+        self.save_path = save_path;
+        self.tuner.set_save_to(self.save_path.display().to_string());
+        self.profile_file = watched.then(|| ProfileFile::new(&self.save_path));
         if let Some(report) = &self.background {
             report.reloaded();
         }
         let mut note = String::new();
         if dropped {
-            note += &format!("; unsaved changes to {} were dropped", old.display());
+            note += &format!("; unsaved changes to {old} were dropped");
         }
         if asked {
             note += ", so there is nothing to save; press q to quit";
@@ -751,6 +796,13 @@ impl Live {
         {
             return true;
         }
+        if let Some(call) = self.server.as_ref().and_then(control::Server::next) {
+            let answer = match &call.request {
+                Ok(request) => self.control(request, rate),
+                Err(e) => Err(e.clone()),
+            };
+            call.answer(answer);
+        }
         match self
             .profile_file
             .as_mut()
@@ -779,14 +831,7 @@ impl Live {
                     .clone()
                     .and_then(|(uid, name)| Some((self.follow(&uid, &name, Some(rate))?, name)));
                 if self.save_path != before {
-                    let chain = Processor::new(self.tuner.profile(), rate, 2);
-                    if let Some(latency) = &mut self.latency {
-                        latency.chain = chain.latency_frames();
-                    }
-                    let latency = self.latency.map(|l| l.describe());
-                    if let (Some(report), Some((_, device))) = (&self.background, &self.device) {
-                        report.running(device, rate, &self.name, latency.as_deref());
-                    }
+                    self.report_profile(rate);
                 }
                 match followed {
                     Some((note, device)) => self.say(format!("{device} now plays{note}")),
@@ -800,6 +845,121 @@ impl Live {
                 }
             }
         }
+    }
+
+    /// Brings the latency, and what a background run reports, up to date
+    /// with a change of profile.
+    fn report_profile(&mut self, rate: u32) {
+        let chain = Processor::new(self.tuner.profile(), rate, 2);
+        if let Some(latency) = &mut self.latency {
+            latency.chain = chain.latency_frames();
+        }
+        let latency = self.latency.map(|l| l.describe());
+        if let (Some(report), Some((_, device))) = (&self.background, &self.device) {
+            report.running(device, rate, &self.name, latency.as_deref());
+        }
+    }
+
+    /// Acts on a request from `dps bypass` or `dps use`, and returns what to
+    /// answer; done, it is said here too. What it changes reaches the audio
+    /// through `sync`.
+    fn control(&mut self, request: &Request, rate: u32) -> Result<String, String> {
+        let said = match request {
+            Request::Bypass(switch) => {
+                let was = self.tuner.bypass();
+                let on = match switch {
+                    Switch::On => true,
+                    Switch::Off => false,
+                    Switch::Toggle => !was,
+                };
+                if !self.tuner.set_bypass(on) {
+                    return Err(
+                        "the tuner is running a blind test, which keeps bypass off; end it \
+                         with x first"
+                            .into(),
+                    );
+                }
+                let state = if on { "on" } else { "off" };
+                if on == was {
+                    format!("bypass was already {state}")
+                } else {
+                    format!("bypass is {state}")
+                }
+            }
+            Request::Preset(name) => {
+                let preset =
+                    presets::find(name).ok_or_else(|| format!("there is no preset {name}"))?;
+                let name = format!("preset {}", preset.name);
+                let profile = preset.profile();
+                self.fits(&profile, &name, rate)?;
+                let save_path = self.settings_file.clone().ok_or(
+                    "cannot locate the settings file, where changes to a preset are saved",
+                )?;
+                let note = self.switch_to(profile, name, save_path, false);
+                self.follow_devices = false;
+                format!("now playing {} on every output device{note}", self.name)
+            }
+            Request::File(path) => {
+                let profile = super::load_profile(path)?;
+                let name = path.display().to_string();
+                self.fits(&profile, &name, rate)?;
+                let note = self.switch_to(profile, name, path.clone(), true);
+                self.follow_devices = false;
+                format!("now playing {} on every output device{note}", self.name)
+            }
+            Request::Settings => {
+                let settings = self
+                    .settings_file
+                    .clone()
+                    .ok_or("cannot locate the settings file")?;
+                let created = create_default(&settings)?;
+                let device = self
+                    .device
+                    .clone()
+                    .map(|(_, name)| name)
+                    .unwrap_or_default();
+                let mut own = None;
+                let mut problem = String::new();
+                if let Some(path) = self.own_profile() {
+                    match load_checked(&path, Some(rate)) {
+                        Ok(profile) => own = Some((path, profile)),
+                        Err(e) => problem = format!("; {device}'s own cannot be used: {e}"),
+                    }
+                }
+                let (path, profile, whose) = match own {
+                    Some((path, profile)) => (path, profile, format!("the profile of {device}")),
+                    None => {
+                        let profile = super::load_profile(&settings)?;
+                        self.fits(&profile, &settings.display().to_string(), rate)?;
+                        (settings.clone(), profile, "the settings file".into())
+                    }
+                };
+                let note = self.switch(path, profile);
+                self.follow_devices = true;
+                let mut said = format!(
+                    "now playing {}, {whose}, and following the output device",
+                    self.name
+                );
+                if created {
+                    said += &format!("; created {} with the default profile", settings.display());
+                }
+                said + &problem + &note
+            }
+        };
+        if !matches!(request, Request::Bypass(_)) {
+            self.report_profile(rate);
+        }
+        self.say(said.clone());
+        Ok(said)
+    }
+
+    /// Whether `profile`, called `name`, can play on the session's output at
+    /// `rate`.
+    fn fits(&self, profile: &Profile, name: &str, rate: u32) -> Result<(), String> {
+        let device = self.device.as_ref().map_or("the output", |(_, name)| name);
+        profile.validate(rate).map_err(|e| {
+            format!("{name} does not fit {device} at {rate} Hz: {e}; nothing was changed")
+        })
     }
 
     /// Acts on a key; true if the run should end. What it changes reaches
@@ -2577,16 +2737,27 @@ mod tests {
     fn live_in(dir: &Scratch, text: &str, background: Option<Arc<Reports>>) -> (Live, PathBuf) {
         let path = dir.0.join("settings.toml");
         stamp(&path, text, 0);
-        let options = Options {
-            profile: super::super::load_profile(&path).unwrap(),
+        (Live::new(options_in(&path, None, background)), path)
+    }
+
+    /// Options for a run on `path`, as `live_in` makes it, listening on
+    /// `control` if given.
+    fn options_in(
+        path: &Path,
+        control: Option<PathBuf>,
+        background: Option<Arc<Reports>>,
+    ) -> Options {
+        Options {
+            profile: super::super::load_profile(path).unwrap(),
             name: "settings.toml".into(),
-            watch: Some(path.clone()),
-            save_path: path.clone(),
+            watch: Some(path.to_owned()),
+            save_path: path.to_owned(),
             config: None,
+            settings_file: Some(path.to_owned()),
             follow_devices: false,
+            control,
             background: background.map(|r| r as Arc<dyn Report>),
-        };
-        (Live::new(options), path)
+        }
     }
 
     /// Writes `text` to `path`, dated `secs` after a fixed time, so every
@@ -2896,7 +3067,9 @@ mod tests {
             watch: Some(path.clone()),
             save_path: path.clone(),
             config: Some(config_path),
+            settings_file: Some(path.clone()),
             follow_devices: true,
+            control: None,
             background: background.map(|r| r as Arc<dyn Report>),
         };
         (Live::new(options), path)
@@ -3094,6 +3267,340 @@ mod tests {
         );
         assert_eq!(live.config.unwrap().config, Config::default());
         assert_eq!(live.save_path, settings);
+    }
+
+    fn bypass(live: &mut Live, switch: Switch) -> Result<String, String> {
+        live.control(&Request::Bypass(switch), 48_000)
+    }
+
+    #[test]
+    fn a_bypass_request_goes_through_the_tuner_to_the_audio_and_is_said() {
+        let dir = Scratch::new("ctl-bypass");
+        let (mut live, _) = live_in(&dir, "", None);
+        let (handoff, controls) = (Handoff::new(), Controls::default());
+        live.step(None, 48_000, &handoff, &controls);
+        assert_eq!(bypass(&mut live, Switch::On), Ok("bypass is on".into()));
+        assert!(live.tuner.bypass());
+        assert_eq!(live.tuner.message(), "bypass is on");
+        live.step(None, 48_000, &handoff, &controls);
+        assert!(controls.bypass.load(Relaxed));
+        assert!(handoff.take(0).is_none() && handoff.take(1).is_none());
+        assert_eq!(
+            bypass(&mut live, Switch::On),
+            Ok("bypass was already on".into())
+        );
+        assert_eq!(
+            bypass(&mut live, Switch::Toggle),
+            Ok("bypass is off".into())
+        );
+        live.step(None, 48_000, &handoff, &controls);
+        assert!(!controls.bypass.load(Relaxed));
+        assert_eq!(
+            bypass(&mut live, Switch::Off),
+            Ok("bypass was already off".into())
+        );
+        assert_eq!(bypass(&mut live, Switch::Toggle), Ok("bypass is on".into()));
+        // The tuner's b key and the request share one bypass.
+        live.step(Some(Key::Char('b')), 48_000, &handoff, &controls);
+        assert!(!controls.bypass.load(Relaxed));
+        assert_eq!(bypass(&mut live, Switch::Toggle), Ok("bypass is on".into()));
+    }
+
+    #[test]
+    fn a_bypass_request_is_refused_during_a_blind_test() {
+        let dir = Scratch::new("ctl-blind");
+        let (mut live, _) = live_in(&dir, "output_gain_db = -3.0\n", None);
+        let (handoff, controls) = (Handoff::new(), Controls::default());
+        live.step(Some(Key::Char('p')), 48_000, &handoff, &controls);
+        live.step(Some(Key::Char('x')), 48_000, &handoff, &controls);
+        assert!(live.tuner.trial().is_some());
+        let message = live.tuner.message().to_owned();
+        for switch in [Switch::On, Switch::Toggle] {
+            let e = bypass(&mut live, switch).unwrap_err();
+            assert_eq!(
+                e,
+                "the tuner is running a blind test, which keeps bypass off; end it with x first"
+            );
+        }
+        live.step(None, 48_000, &handoff, &controls);
+        assert!(!live.tuner.bypass() && !controls.bypass.load(Relaxed));
+        assert_eq!(live.tuner.message(), message);
+        live.step(Some(Key::Char('x')), 48_000, &handoff, &controls);
+        assert_eq!(bypass(&mut live, Switch::On), Ok("bypass is on".into()));
+    }
+
+    #[test]
+    fn use_plays_a_preset_on_every_device_and_saves_edits_to_the_settings_file() {
+        let dir = Scratch::new("ctl-preset");
+        stamp(&dir.0.join("phones.toml"), "output_gain_db = -6.0\n", 0);
+        let reports = Arc::new(Reports::default());
+        let (mut live, settings) = following(&dir, PHONES, Some(Arc::clone(&reports)));
+        let (handoff, controls) = (Handoff::new(), Controls::default());
+        assert_eq!(live.follow("spk", "Speakers", None), None);
+        live.latency = Some(speakers_latency());
+        live.step(None, 48_000, &handoff, &controls);
+
+        let said = live
+            .control(&Request::Preset("night".into()), 48_000)
+            .unwrap();
+        assert_eq!(said, "now playing preset night on every output device");
+        assert_eq!(live.tuner.message(), said);
+        let night = presets::find("night").unwrap().profile();
+        assert_eq!(live.tuner.profile(), &night);
+        assert_eq!(live.name, "preset night");
+        assert_eq!(live.save_path, settings);
+        assert!(live.profile_file.is_none());
+        // `dps status` shows it, with the chain's latency for the preset.
+        let latency = Latency {
+            chain: Processor::new(&night, 48_000, 2).latency_frames(),
+            ..speakers_latency()
+        };
+        assert_eq!(
+            reports.take(),
+            [
+                "reloaded".to_owned(),
+                format!(
+                    "running on Speakers at 48000 with preset night; {}",
+                    latency.describe()
+                )
+            ]
+        );
+        live.step(None, 48_000, &handoff, &controls);
+        assert!(plays(chain(handoff.take(0)).unwrap(), &night));
+
+        // It no longer follows the device, and the settings file is not
+        // watched, as in a --preset run.
+        assert_eq!(live.follow("phones", "Phones", None), None);
+        assert_eq!(live.tuner.profile(), &night);
+        stamp(&settings, "output_gain_db = -1.0\n", 3);
+        live.step(None, 48_000, &handoff, &controls);
+        assert_eq!(live.tuner.profile(), &night);
+        // Edits are saved to the settings file.
+        live.step(Some(Key::Right), 48_000, &handoff, &controls);
+        live.step(Some(Key::Char('s')), 48_000, &handoff, &controls);
+        assert_ne!(live.tuner.profile(), &night);
+        assert_eq!(
+            &super::super::load_profile(&settings).unwrap(),
+            live.tuner.profile()
+        );
+
+        assert_eq!(
+            live.control(&Request::Preset("loud".into()), 48_000),
+            Err("there is no preset loud".into())
+        );
+    }
+
+    #[test]
+    fn use_plays_a_file_on_every_device_and_watches_it() {
+        let dir = Scratch::new("ctl-file");
+        let (mut live, settings) = following(&dir, "", None);
+        let (handoff, controls) = (Handoff::new(), Controls::default());
+        let mine = dir.0.join("mine.toml");
+        stamp(&mine, "output_gain_db = -2.0\n", 0);
+        let said = live.control(&Request::File(mine.clone()), 48_000).unwrap();
+        assert_eq!(
+            said,
+            format!("now playing {} on every output device", mine.display())
+        );
+        assert_eq!(live.tuner.profile(), &gain(-2.0));
+        assert_eq!(live.name, mine.display().to_string());
+        assert_eq!(live.save_path, mine);
+        assert_eq!(live.profile_file.as_ref().unwrap().path, mine);
+        assert!(!live.follow_devices);
+        stamp(&mine, "output_gain_db = -4.0\n", 5);
+        live.step(None, 48_000, &handoff, &controls);
+        assert_eq!(live.tuner.profile(), &gain(-4.0));
+
+        // One that cannot be read changes nothing.
+        for (path, start) in [
+            (dir.0.join("gone.toml"), "cannot read profile "),
+            (settings.with_file_name("bad.toml"), ""),
+        ] {
+            stamp(&dir.0.join("bad.toml"), "output_gain_db = \"loud\"\n", 0);
+            let e = live
+                .control(&Request::File(path.clone()), 48_000)
+                .unwrap_err();
+            assert!(e.starts_with(start) && e.contains("toml"), "{e}");
+            assert_eq!(live.save_path, mine);
+            assert_eq!(live.tuner.profile(), &gain(-4.0));
+        }
+    }
+
+    #[test]
+    fn use_settings_goes_back_to_following_the_output_device() {
+        let dir = Scratch::new("ctl-settings");
+        let phones = dir.0.join("phones.toml");
+        stamp(&phones, "output_gain_db = -6.0\n", 0);
+        let (mut live, settings) = following(&dir, PHONES, None);
+        assert!(live.follow("phones", "Phones", None).is_some());
+        live.control(&Request::Preset("music".into()), 48_000)
+            .unwrap();
+        assert!(!live.follow_devices);
+
+        let said = live.control(&Request::Settings, 48_000).unwrap();
+        assert_eq!(
+            said,
+            format!(
+                "now playing {}, the profile of Phones, and following the output device",
+                phones.display()
+            )
+        );
+        assert_eq!(live.tuner.profile(), &gain(-6.0));
+        assert_eq!(live.save_path, phones);
+        assert_eq!(live.profile_file.as_ref().unwrap().path, phones);
+        assert!(live.follow_devices);
+        assert!(live.follow("spk", "Speakers", None).is_some());
+        assert_eq!(live.save_path, settings);
+        let said = live.control(&Request::Settings, 48_000).unwrap();
+        assert_eq!(
+            said,
+            format!(
+                "now playing {}, the settings file, and following the output device",
+                settings.display()
+            )
+        );
+
+        // A device's own profile that cannot be used gives way to the
+        // settings file, which is created if it is missing.
+        live.control(&Request::Preset("music".into()), 48_000)
+            .unwrap();
+        assert_eq!(live.follow("phones", "Phones", None), None);
+        stamp(&phones, "output_gain_db = \"x\"\n", 1);
+        fs::remove_file(&settings).unwrap();
+        let said = live.control(&Request::Settings, 48_000).unwrap();
+        assert!(
+            said.starts_with(&format!(
+                "now playing {}, the settings file, and following the output device; created {} \
+                 with the default profile; Phones's own cannot be used: {}:",
+                settings.display(),
+                settings.display(),
+                phones.display()
+            )),
+            "{said}"
+        );
+        assert_eq!(live.tuner.profile(), &Profile::default());
+        assert_eq!(
+            fs::read_to_string(&settings).unwrap(),
+            crate::config::default_toml()
+        );
+    }
+
+    #[test]
+    fn use_drops_unsaved_changes_and_a_question_about_them_and_says_so() {
+        let dir = Scratch::new("ctl-drop");
+        let (mut live, settings) = live_in(&dir, "output_gain_db = -3.0\n", None);
+        let (handoff, controls) = (Handoff::new(), Controls::default());
+        live.step(Some(Key::Right), 48_000, &handoff, &controls);
+        assert!(live.tuner.dirty());
+        let said = live
+            .control(&Request::Preset("night".into()), 48_000)
+            .unwrap();
+        assert_eq!(
+            said,
+            "now playing preset night on every output device; unsaved changes to settings.toml \
+             were dropped"
+        );
+        assert!(!live.tuner.dirty());
+
+        live.step(Some(Key::Right), 48_000, &handoff, &controls);
+        live.step(Some(Key::Char('q')), 48_000, &handoff, &controls);
+        assert!(live.tuner.prompt().is_some());
+        let said = live.control(&Request::Settings, 48_000).unwrap();
+        assert_eq!(
+            said,
+            format!(
+                "now playing {}, the settings file, and following the output device; unsaved \
+                 changes to preset night were dropped, so there is nothing to save; press q to \
+                 quit",
+                settings.display()
+            )
+        );
+        assert_eq!(live.tuner.prompt(), None);
+        assert_eq!(live.tuner.profile(), &gain(-3.0));
+    }
+
+    #[test]
+    fn a_profile_that_does_not_fit_the_rate_is_refused_and_nothing_changes() {
+        let dir = Scratch::new("ctl-rate");
+        let reports = Arc::new(Reports::default());
+        let (mut live, settings) =
+            live_in(&dir, "output_gain_db = -3.0\n", Some(Arc::clone(&reports)));
+        live.follow("spk", "Speakers", None);
+        let high = dir.0.join("high.toml");
+        stamp(&high, "shelf_corner_hz = 3000.0\n", 0);
+        let message = live.tuner.message().to_owned();
+        let e = live
+            .control(&Request::File(high.clone()), 8_000)
+            .unwrap_err();
+        assert!(
+            e.starts_with(&format!(
+                "{} does not fit Speakers at 8000 Hz: shelf_corner_hz = 3000 is outside",
+                high.display()
+            )),
+            "{e}"
+        );
+        assert!(e.ends_with("; nothing was changed"), "{e}");
+        stamp(&settings, "shelf_corner_hz = 3000.0\n", 0);
+        let e = live.control(&Request::Settings, 8_000).unwrap_err();
+        assert!(e.contains("does not fit Speakers at 8000 Hz"), "{e}");
+
+        assert_eq!(live.tuner.profile(), &gain(-3.0));
+        assert_eq!(live.name, "settings.toml");
+        assert_eq!(live.save_path, settings);
+        assert_eq!(live.profile_file.as_ref().unwrap().path, settings);
+        assert!(!live.follow_devices);
+        assert_eq!(live.tuner.message(), message);
+        assert!(reports.take().is_empty());
+    }
+
+    #[test]
+    fn a_request_on_the_socket_is_answered_from_the_main_loop() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        let dir = Scratch::new("ctl-sock");
+        let path = dir.0.join("settings.toml");
+        stamp(&path, "", 0);
+        let socket = dir.0.join("control.sock");
+        let mut live = Live::new(options_in(&path, Some(socket.clone()), None));
+        assert!(socket.exists());
+        let (handoff, controls) = (Handoff::new(), Controls::default());
+        let client = {
+            let socket = socket.clone();
+            thread::spawn(move || {
+                let mut stream = UnixStream::connect(&socket).unwrap();
+                stream.write_all(b"bypass on\n").unwrap();
+                let mut reply = String::new();
+                stream.read_to_string(&mut reply).unwrap();
+                reply
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !client.is_finished() {
+            assert!(Instant::now() < deadline, "no answer");
+            assert!(!live.step(None, 48_000, &handoff, &controls));
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(client.join().unwrap(), "ok bypass is on\n");
+        assert!(controls.bypass.load(Relaxed));
+        drop(live);
+        assert!(!socket.exists());
+
+        // Audio goes on without a socket, and says why it has none.
+        let nowhere = dir.0.join("missing/control.sock");
+        let live = Live::new(options_in(&path, Some(nowhere.clone()), None));
+        assert!(live.server.is_none());
+        assert!(
+            live.tuner
+                .message()
+                .starts_with(&format!("cannot listen on {}: ", nowhere.display())),
+            "{}",
+            live.tuner.message()
+        );
+        assert!(
+            live.tuner
+                .message()
+                .ends_with("; `dps bypass` and `dps use` cannot reach this run")
+        );
     }
 
     fn processes(list: &[(ObjectId, Option<&str>)]) -> Vec<(ObjectId, Option<String>)> {

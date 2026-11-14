@@ -4,14 +4,42 @@
 //! its key path, such as `eq.gains_db[3]`; a running dps picks a change up
 //! through its watch on the file. The paths are those of the profile's
 //! TOML, so there is no list of keys here to keep up to date.
+//!
+//! On macOS every live run also listens on `control.sock` in dps's own
+//! folder for what belongs to the run rather than to a file: `dps bypass`
+//! and `dps use`. A client connects, writes one request line and reads one
+//! reply line, both UTF-8 and ending in a newline; the run answers one
+//! request per connection and closes it. The requests:
+//!
+//! ```text
+//! bypass on | bypass off | bypass toggle
+//! use preset NAME
+//! use file /absolute/path.toml
+//! use settings
+//! ```
+//!
+//! The reply is `ok TEXT` or `error TEXT`, TEXT being what to tell the user.
+//! The run looks for a connection on each turn of its main loop without
+//! waiting, takes at most one per turn, and gives a client `READ_TIMEOUT`
+//! in all to send its line.
 
 use std::fs;
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::{
+    io::{self, Read, Write},
+    os::unix::fs::PermissionsExt,
+    os::unix::net::{UnixListener, UnixStream},
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use dps::Profile;
 use toml::Value;
 
 use crate::config::{Dirs, Source};
+#[cfg(target_os = "macos")]
+use crate::{config::load_profile, presets, service::Paths};
 
 /// A profile is checked at one rate, as `dps import` checks one; bands too
 /// high for another are skipped there, not refused.
@@ -307,6 +335,315 @@ pub fn set(key: &str, change: Edit, profile: Option<PathBuf>, dirs: &Dirs) -> Re
         said += "rewrote the file, so comments in it are not kept\n";
     }
     crate::write_stdout(&said)
+}
+
+/// How long a live run waits, in all, for a client's request line.
+#[cfg(target_os = "macos")]
+const READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// How long a client waits for the reply. The run's main loop can be held
+/// up for a while by a change of output device.
+#[cfg(target_os = "macos")]
+const REPLY_WAIT: Duration = Duration::from_secs(5);
+/// The longest request or reply line, in bytes.
+#[cfg(target_os = "macos")]
+const MAX_LINE: usize = 4096;
+
+#[cfg(target_os = "macos")]
+const NOT_RUNNING: &str = "dps is not running; start it with `dps` or `dps start`";
+
+/// What `dps bypass` asks for.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
+pub enum Switch {
+    On,
+    Off,
+    Toggle,
+}
+
+/// What a client asks a live run to do.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq)]
+pub enum Request {
+    Bypass(Switch),
+    /// Play the built-in preset of this name on every output device.
+    Preset(String),
+    /// Play the profile file at this absolute path on every output device.
+    File(PathBuf),
+    /// Play the settings file, or an output device's own profile.
+    Settings,
+}
+
+#[cfg(target_os = "macos")]
+impl Request {
+    pub fn parse(line: &str) -> Result<Self, String> {
+        let unknown = || Err(format!("unknown request {line:?}"));
+        let (verb, rest) = line.split_once(' ').unwrap_or((line, ""));
+        Ok(match (verb, rest) {
+            ("bypass", "on") => Self::Bypass(Switch::On),
+            ("bypass", "off") => Self::Bypass(Switch::Off),
+            ("bypass", "toggle") => Self::Bypass(Switch::Toggle),
+            ("use", "settings") => Self::Settings,
+            ("use", rest) => match rest.split_once(' ') {
+                Some(("preset", name)) if !name.is_empty() => Self::Preset(name.into()),
+                Some(("file", path)) if Path::new(path).is_absolute() => Self::File(path.into()),
+                _ => return unknown(),
+            },
+            _ => return unknown(),
+        })
+    }
+
+    /// The request line, without its newline. A path must be UTF-8 and
+    /// hold no line break.
+    pub fn line(&self) -> String {
+        match self {
+            Self::Bypass(Switch::On) => "bypass on".into(),
+            Self::Bypass(Switch::Off) => "bypass off".into(),
+            Self::Bypass(Switch::Toggle) => "bypass toggle".into(),
+            Self::Preset(name) => format!("use preset {name}"),
+            Self::File(path) => format!("use file {}", path.display()),
+            Self::Settings => "use settings".into(),
+        }
+    }
+}
+
+/// The reply line for `answer`.
+#[cfg(target_os = "macos")]
+fn reply_line(answer: &Result<String, String>) -> String {
+    let (word, text) = match answer {
+        Ok(text) => ("ok", text),
+        Err(text) => ("error", text),
+    };
+    format!("{word} {}\n", text.replace(['\r', '\n'], " "))
+}
+
+/// The answer a reply line gives.
+#[cfg(target_os = "macos")]
+fn parse_reply(line: &str) -> Result<String, String> {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let (word, text) = line.split_once(' ').unwrap_or((line, ""));
+    match word {
+        "ok" => Ok(text.into()),
+        "error" => Err(text.into()),
+        _ => Err(format!(
+            "the running dps answered {line:?}, which this dps does not understand; is it another \
+             version?"
+        )),
+    }
+}
+
+/// A live run's control socket, removed when dropped.
+#[cfg(target_os = "macos")]
+pub struct Server {
+    listener: UnixListener,
+    path: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl Server {
+    /// Listens at `path`, for this user alone. Whatever is there is
+    /// replaced: the caller holds the live lock, so a socket there is left
+    /// over from a run that crashed.
+    pub fn bind(path: &Path) -> Result<Self, String> {
+        let cannot = |e: io::Error| format!("cannot listen on {}: {e}", path.display());
+        match fs::remove_file(path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(cannot(e)),
+            _ => {}
+        }
+        let server = Self {
+            listener: UnixListener::bind(path).map_err(cannot)?,
+            path: path.to_owned(),
+        };
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(cannot)?;
+        server.listener.set_nonblocking(true).map_err(cannot)?;
+        Ok(server)
+    }
+
+    /// The next client's request, if one has connected, without waiting
+    /// for one; a client that is slow to send its line costs at most
+    /// `READ_TIMEOUT`.
+    pub fn next(&self) -> Option<Call> {
+        let (stream, _) = self.listener.accept().ok()?;
+        let request = read_request(&stream).and_then(|line| Request::parse(&line));
+        Some(Call { stream, request })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// A client's request, answered once.
+#[cfg(target_os = "macos")]
+pub struct Call {
+    stream: UnixStream,
+    /// The request, or why it cannot be read.
+    pub request: Result<Request, String>,
+}
+
+#[cfg(target_os = "macos")]
+impl Call {
+    /// Sends `answer` and hangs up; a client that has gone is not missed.
+    pub fn answer(mut self, answer: Result<String, String>) {
+        let _ = self.stream.write_all(reply_line(&answer).as_bytes());
+    }
+}
+
+/// The line a client sends, up to its newline or the end of what it sends,
+/// within `READ_TIMEOUT` of now.
+#[cfg(target_os = "macos")]
+fn read_request(mut stream: &UnixStream) -> Result<String, String> {
+    let cannot = |e: io::Error| format!("cannot read the request: {e}");
+    // On macOS an accepted socket inherits the listener's non-blocking mode.
+    stream.set_nonblocking(false).map_err(cannot)?;
+    stream
+        .set_write_timeout(Some(READ_TIMEOUT))
+        .map_err(cannot)?;
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let mut line = Vec::new();
+    let mut buf = [0; 512];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        // Each read gets only what is left, so a client sending a byte at a
+        // time cannot keep the run waiting.
+        stream.set_read_timeout(Some(left)).map_err(cannot)?;
+        match stream.read(&mut buf) {
+            Ok(0) => return String::from_utf8(line).map_err(|_| "the request is not UTF-8".into()),
+            Ok(n) => line.extend_from_slice(&buf[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(cannot(e)),
+        }
+        if let Some(end) = line.iter().position(|&b| b == b'\n') {
+            line.truncate(end);
+            return String::from_utf8(line).map_err(|_| "the request is not UTF-8".into());
+        }
+        if line.len() > MAX_LINE {
+            return Err(format!("the request is longer than {MAX_LINE} bytes"));
+        }
+    }
+    Err(format!(
+        "no request line came within {} ms",
+        READ_TIMEOUT.as_millis()
+    ))
+}
+
+/// Sends `request` to the live run listening at `path` and returns its
+/// answer; `start`, if given, is how to start dps doing it instead when
+/// none is running.
+#[cfg(target_os = "macos")]
+fn send(path: &Path, request: &Request, start: Option<&str>) -> Result<String, String> {
+    let not_running = || match start {
+        Some(start) => format!("{NOT_RUNNING} (`{start}` starts it that way)"),
+        None => NOT_RUNNING.into(),
+    };
+    if !path.exists() {
+        return Err(not_running());
+    }
+    let mut stream = match UnixStream::connect(path) {
+        Ok(stream) => stream,
+        // A socket left over from a run that crashed refuses.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Err(not_running());
+        }
+        Err(e) => {
+            return Err(format!(
+                "cannot reach the running dps at {}: {e}",
+                path.display()
+            ));
+        }
+    };
+    let cannot = |e: io::Error| {
+        if matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ) {
+            format!(
+                "the running dps did not answer within {} s; it may be restarting audio or \
+                 waiting for permission to record; try again",
+                REPLY_WAIT.as_secs()
+            )
+        } else {
+            format!("cannot talk to the running dps: {e}")
+        }
+    };
+    stream.set_read_timeout(Some(REPLY_WAIT)).map_err(cannot)?;
+    stream.set_write_timeout(Some(REPLY_WAIT)).map_err(cannot)?;
+    stream
+        .write_all(format!("{}\n", request.line()).as_bytes())
+        .map_err(cannot)?;
+    let mut reply = Vec::new();
+    stream
+        .take(MAX_LINE as u64)
+        .read_to_end(&mut reply)
+        .map_err(cannot)?;
+    parse_reply(&String::from_utf8_lossy(&reply))
+}
+
+/// Sends `request` to the live run and prints its answer.
+#[cfg(target_os = "macos")]
+fn ask(request: &Request, start: Option<&str>, dirs: &Dirs) -> Result<(), String> {
+    let path = Paths::from_dirs(dirs)?.control;
+    let text = send(&path, request, start)?;
+    crate::write_stdout(&format!("{text}\n"))
+}
+
+/// `dps bypass`.
+#[cfg(target_os = "macos")]
+pub fn bypass(switch: Switch, dirs: &Dirs) -> Result<(), String> {
+    ask(&Request::Bypass(switch), None, dirs)
+}
+
+/// `dps use`: plays the preset or profile file `target` names, or with no
+/// target the settings file, in the live run.
+#[cfg(target_os = "macos")]
+pub fn play(target: Option<PathBuf>, dirs: &Dirs) -> Result<(), String> {
+    let Some(target) = target else {
+        return ask(&Request::Settings, None, dirs);
+    };
+    if let Some(preset) = target.to_str().and_then(presets::find) {
+        let start = format!("dps start --preset {}", preset.name);
+        return ask(&Request::Preset(preset.name.into()), Some(&start), dirs);
+    }
+    let path = fs::canonicalize(&target).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            let names: Vec<String> = presets::PRESETS.iter().map(|p| p.name.into()).collect();
+            format!(
+                "{} is neither a preset ({}) nor a file",
+                target.display(),
+                joined(names.iter())
+            )
+        } else {
+            format!("cannot read profile {}: {e}", target.display())
+        }
+    })?;
+    load_profile(&path)?;
+    let Some(text) = path.to_str().filter(|p| !p.contains(['\n', '\r'])) else {
+        return Err(format!(
+            "{} cannot be sent to the running dps: only a UTF-8 path without line breaks can",
+            path.display()
+        ));
+    };
+    let start = format!("dps start --profile {text}");
+    ask(&Request::File(path), Some(&start), dirs)
 }
 
 #[cfg(test)]
@@ -650,5 +987,241 @@ mod tests {
         assert_eq!(finite("x"), Err("\"x\" is not a number".into()));
         assert_eq!(finite("NaN"), Err("NaN is not a finite number".into()));
         assert_eq!(finite("1e999"), Err("1e999 is not a finite number".into()));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod socket_tests {
+    use super::*;
+    use crate::config::tests::TestDir;
+    use std::os::unix::fs::FileTypeExt;
+    use std::thread;
+
+    #[test]
+    fn every_request_reads_back_from_its_line() {
+        for request in [
+            Request::Bypass(Switch::On),
+            Request::Bypass(Switch::Off),
+            Request::Bypass(Switch::Toggle),
+            Request::Preset("night".into()),
+            Request::File("/a b/my profile.toml".into()),
+            Request::Settings,
+        ] {
+            assert_eq!(
+                Request::parse(&request.line()),
+                Ok(request.clone()),
+                "{request:?}"
+            );
+        }
+        assert_eq!(Request::Bypass(Switch::Toggle).line(), "bypass toggle");
+        assert_eq!(
+            Request::File("/x/p.toml".into()).line(),
+            "use file /x/p.toml"
+        );
+    }
+
+    #[test]
+    fn a_malformed_request_is_named() {
+        for line in [
+            "",
+            "bypass",
+            "bypass maybe",
+            "bypass on now",
+            "Bypass on",
+            "use",
+            "use preset",
+            "use preset ",
+            "use file",
+            "use file relative/p.toml",
+            "use settings now",
+            "use night",
+            "status",
+        ] {
+            assert_eq!(
+                Request::parse(line),
+                Err(format!("unknown request {line:?}")),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replies_are_one_line_of_ok_or_error() {
+        assert_eq!(reply_line(&Ok("bypass is on".into())), "ok bypass is on\n");
+        assert_eq!(reply_line(&Err("no\nway".into())), "error no way\n");
+        for answer in [Ok("a b".to_owned()), Err("c".to_owned()), Ok(String::new())] {
+            assert_eq!(parse_reply(&reply_line(&answer)), answer);
+        }
+        let e = parse_reply("hello\n").unwrap_err();
+        assert!(e.contains("does not understand"), "{e}");
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn the_socket_is_this_users_alone_and_goes_when_dropped() {
+        let dir = TestDir::new("sock");
+        let path = dir.0.join("control.sock");
+        let server = Server::bind(&path).unwrap();
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+        assert_eq!(mode(&path), 0o600);
+        assert!(server.next().is_none(), "nobody has connected");
+        drop(server);
+        assert!(!path.exists());
+        assert!(Server::bind(&dir.0.join("missing/control.sock")).is_err());
+    }
+
+    /// Answers the first request that comes to `server` with `answer`,
+    /// waiting at most a few seconds for it.
+    fn answer_one(server: &Server, answer: impl FnOnce(&Request) -> Result<String, String>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(call) = server.next() {
+                let reply = call.request.clone().and_then(|r| answer(&r));
+                call.answer(reply);
+                return;
+            }
+            assert!(Instant::now() < deadline, "no request came");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_request_is_answered_and_a_stale_socket_is_replaced() {
+        let dir = TestDir::new("ask");
+        let path = dir.0.join("control.sock");
+        // A run that crashed leaves its socket, which refuses connections.
+        drop(UnixListener::bind(&path).unwrap());
+        assert!(path.exists());
+        assert_eq!(
+            send(&path, &Request::Settings, None),
+            Err(NOT_RUNNING.into())
+        );
+        let server = Server::bind(&path).unwrap();
+        let client = {
+            let path = path.clone();
+            thread::spawn(move || send(&path, &Request::Bypass(Switch::Toggle), None))
+        };
+        answer_one(&server, |request| {
+            assert_eq!(request, &Request::Bypass(Switch::Toggle));
+            Ok("bypass is on".into())
+        });
+        assert_eq!(client.join().unwrap(), Ok("bypass is on".into()));
+
+        let client = {
+            let path = path.clone();
+            thread::spawn(move || send(&path, &Request::Preset("night".into()), None))
+        };
+        answer_one(&server, |_| Err("a refusal".into()));
+        assert_eq!(client.join().unwrap(), Err("a refusal".into()));
+    }
+
+    #[test]
+    fn a_client_that_says_nothing_or_too_little_costs_only_the_timeout() {
+        let dir = TestDir::new("mute");
+        let path = dir.0.join("control.sock");
+        let server = Server::bind(&path).unwrap();
+        let mut silent = UnixStream::connect(&path).unwrap();
+        let started = Instant::now();
+        let call = server.next().expect("a connection");
+        let waited = started.elapsed();
+        assert!(
+            waited >= READ_TIMEOUT && waited < READ_TIMEOUT + Duration::from_millis(400),
+            "{waited:?}"
+        );
+        assert_eq!(
+            call.request,
+            Err("no request line came within 100 ms".into())
+        );
+        call.answer(Err("no request line came within 100 ms".into()));
+        let mut reply = String::new();
+        silent.read_to_string(&mut reply).unwrap();
+        assert_eq!(reply, "error no request line came within 100 ms\n");
+
+        // One byte at a time, slower than the timeout in all.
+        let dribble = {
+            let path = path.clone();
+            thread::spawn(move || {
+                let mut stream = UnixStream::connect(&path).unwrap();
+                for byte in b"bypass on\n" {
+                    if stream.write_all(&[*byte]).is_err() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(30));
+                }
+            })
+        };
+        let started = Instant::now();
+        let call = loop {
+            if let Some(call) = server.next() {
+                break call;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(call.request.is_err());
+        assert!(started.elapsed() < READ_TIMEOUT + Duration::from_millis(400));
+        drop(call);
+        dribble.join().unwrap();
+
+        // Neither held up the next client.
+        let client = {
+            let path = path.clone();
+            thread::spawn(move || send(&path, &Request::Bypass(Switch::Off), None))
+        };
+        answer_one(&server, |_| Ok("bypass is off".into()));
+        assert_eq!(client.join().unwrap(), Ok("bypass is off".into()));
+    }
+
+    #[test]
+    fn a_line_that_does_not_parse_or_ends_without_a_newline_is_still_read() {
+        let dir = TestDir::new("line");
+        let path = dir.0.join("control.sock");
+        let server = Server::bind(&path).unwrap();
+        for (sent, read) in [
+            (&b"bypass on"[..], Ok(Request::Bypass(Switch::On))),
+            (b"use settings\nmore\n", Ok(Request::Settings)),
+            (
+                b"frobnicate\n",
+                Err("unknown request \"frobnicate\"".to_owned()),
+            ),
+            (b"\xff\n", Err("the request is not UTF-8".to_owned())),
+        ] {
+            let mut stream = UnixStream::connect(&path).unwrap();
+            stream.write_all(sent).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let call = server.next().expect("a connection");
+            assert_eq!(call.request, read, "{sent:?}");
+        }
+        let mut stream = UnixStream::connect(&path).unwrap();
+        stream.write_all(&[b'x'; MAX_LINE + 600]).unwrap();
+        let call = server.next().expect("a connection");
+        assert_eq!(
+            call.request,
+            Err(format!("the request is longer than {MAX_LINE} bytes"))
+        );
+    }
+
+    #[test]
+    fn with_nothing_listening_the_client_says_how_to_start_dps() {
+        let dir = TestDir::new("none");
+        let path = dir.0.join("control.sock");
+        assert_eq!(
+            send(&path, &Request::Bypass(Switch::On), None),
+            Err("dps is not running; start it with `dps` or `dps start`".into())
+        );
+        assert_eq!(
+            send(
+                &path,
+                &Request::Preset("night".into()),
+                Some("dps start --preset night")
+            ),
+            Err(
+                "dps is not running; start it with `dps` or `dps start` (`dps start --preset \
+                 night` starts it that way)"
+                    .into()
+            )
+        );
     }
 }

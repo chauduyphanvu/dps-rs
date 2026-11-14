@@ -138,7 +138,7 @@ pub fn default_toml() -> String {
 
 /// Writes the default profile to `path` unless something is already there,
 /// and says whether it did.
-fn create_default(path: &Path) -> Result<bool, String> {
+pub(crate) fn create_default(path: &Path) -> Result<bool, String> {
     let cannot = |e: io::Error| format!("cannot create settings file {}: {e}", path.display());
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(cannot)?;

@@ -37,6 +37,8 @@ Examples:
   dps                       Process system audio live with your settings file
   dps live --preset music   The same with the built-in music preset
   dps start                 The same in the background (dps status, dps stop)
+  dps bypass                Toggle bypass in the running dps
+  dps use night             Play the night preset in the running dps from now on
   dps set eq.gains_db[3] --by +2
                             Raise the fourth EQ band 2 dB (dps get eq prints the EQ)
   dps doctor                Check that live mode can work here
@@ -129,6 +131,41 @@ enum Command {
     /// Say whether dps is processing in the background, and how.
     #[cfg(target_os = "macos")]
     Status,
+    /// Turn bypass on or off in the running dps.
+    ///
+    /// The bypass the tuner's b key toggles: the unprocessed signal, matched
+    /// to the processed level. Works on `dps live` and on `dps start`; the
+    /// tuner, if one is on screen, shows it. Refused while the tuner runs a
+    /// blind test, which keeps bypass off.
+    #[cfg(target_os = "macos")]
+    Bypass {
+        #[arg(value_enum, default_value_t = control::Switch::Toggle)]
+        state: control::Switch,
+    },
+    /// Play a preset or a profile file in the running dps from now on.
+    ///
+    /// The running dps (`dps live` or `dps start`) plays NAME_OR_FILE on
+    /// every output device, as if it had been started with --preset or
+    /// --profile: a built-in preset if NAME_OR_FILE names one, else a
+    /// profile file. --settings goes back to the settings file and each
+    /// output device's own profile, as a plain `dps` plays. Unsaved changes
+    /// in the tuner are dropped, and a profile that does not fit the
+    /// output's sample rate is refused. It lasts until that run ends: `dps
+    /// start` and start at login keep starting dps as they were told to.
+    #[cfg(target_os = "macos")]
+    Use {
+        /// A built-in preset, or else a profile file.
+        #[arg(
+            value_name = "NAME_OR_FILE",
+            required_unless_present = "settings",
+            conflicts_with = "settings"
+        )]
+        target: Option<PathBuf>,
+        /// Go back to the settings file, and to each output device's own
+        /// profile.
+        #[arg(long)]
+        settings: bool,
+    },
     /// Check what dps needs here and say how to fix what is missing.
     Doctor {
         #[command(flatten)]
@@ -287,6 +324,13 @@ fn main() -> ExitCode {
         Some(Command::Stop { login }) => service::stop(login, &dirs),
         #[cfg(target_os = "macos")]
         Some(Command::Status) => service::status(&dirs),
+        #[cfg(target_os = "macos")]
+        Some(Command::Bypass { state }) => control::bypass(state, &dirs),
+        #[cfg(target_os = "macos")]
+        Some(Command::Use {
+            target,
+            settings: _,
+        }) => control::play(target, &dirs),
         #[cfg(not(target_os = "macos"))]
         None => print_help(),
         Some(Command::Process {
@@ -649,12 +693,17 @@ fn run_live(args: SourceArgs, background: bool, dirs: &Dirs) -> Result<(), Strin
 /// A profile file, or else the settings file, is watched and saved to. A
 /// preset is not watched, and edits to it are saved to the settings file.
 /// Only the settings file gives way to an output device's own profile.
+/// `dps use` follows the same rules.
 #[cfg(target_os = "macos")]
 fn live_options(source: Source, dirs: &Dirs) -> Result<live::Options, String> {
     let profile = source.load()?;
     let name = source.name();
     let config = dirs.config_file().ok();
+    let settings_file = dirs.settings_file().ok();
     let follow_devices = matches!(source, Source::Settings(_));
+    let control = service::Paths::from_dirs(dirs)
+        .ok()
+        .map(|paths| paths.control);
     Ok(match source {
         Source::File(path) | Source::Settings(path) => live::Options {
             profile,
@@ -662,7 +711,9 @@ fn live_options(source: Source, dirs: &Dirs) -> Result<live::Options, String> {
             watch: Some(path.clone()),
             save_path: path,
             config,
+            settings_file,
             follow_devices,
+            control,
             background: None,
         },
         Source::Preset(_) => live::Options {
@@ -671,7 +722,9 @@ fn live_options(source: Source, dirs: &Dirs) -> Result<live::Options, String> {
             watch: None,
             save_path: dirs.settings_file()?,
             config,
+            settings_file,
             follow_devices,
+            control,
             background: None,
         },
     })
@@ -969,6 +1022,33 @@ mod live_tests {
     }
 
     #[test]
+    fn bypass_toggles_unless_told_and_use_takes_a_target_or_settings() {
+        use control::Switch;
+        let bypass = |args: &[&str]| match parse(args).unwrap().command {
+            Some(Command::Bypass { state }) => state,
+            _ => panic!("not bypass"),
+        };
+        assert_eq!(bypass(&["bypass"]), Switch::Toggle);
+        assert_eq!(bypass(&["bypass", "on"]), Switch::On);
+        assert_eq!(bypass(&["bypass", "off"]), Switch::Off);
+        assert!(parse(&["bypass", "maybe"]).is_err());
+
+        let target = |args: &[&str]| match parse(args).unwrap().command {
+            Some(Command::Use { target, settings }) => (target, settings),
+            _ => panic!("not use"),
+        };
+        assert_eq!(target(&["use", "night"]), (Some("night".into()), false));
+        assert_eq!(
+            target(&["use", "a b.toml"]),
+            (Some("a b.toml".into()), false)
+        );
+        assert_eq!(target(&["use", "--settings"]), (None, true));
+        for args in [&["use"][..], &["use", "night", "--settings"]] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
     fn live_watches_and_saves_the_profile_file_or_settings_file_but_only_saves_a_preset() {
         let dir = TestDir::new("live-options");
         let dirs = dir.dirs();
@@ -989,6 +1069,15 @@ mod live_tests {
         assert_eq!(o.name, mine.display().to_string());
         assert_eq!(o.profile.output_gain_db, -2.0);
         assert!(!o.follow_devices && o.config.as_ref() == Some(&config));
+        // `dps use --settings` can go back to the settings file from any run.
+        assert_eq!(o.settings_file.as_ref(), Some(&settings));
+        assert_eq!(
+            o.control,
+            Some(
+                dir.0
+                    .join("home/Library/Application Support/dps/control.sock")
+            )
+        );
         assert!(!settings.exists());
 
         let o = options(None, Some("music"));

@@ -46,6 +46,8 @@ pub struct Paths {
     pub log: PathBuf,
     pub lock: PathBuf,
     pub state: PathBuf,
+    /// Where every live run takes `dps bypass` and `dps use`.
+    pub control: PathBuf,
 }
 
 impl Paths {
@@ -57,6 +59,7 @@ impl Paths {
             log: home.join("Library/Logs/dps.log"),
             lock: own.join("live.lock"),
             state: own.join("live.state"),
+            control: own.join("control.sock"),
         }
     }
 
@@ -1160,6 +1163,10 @@ mod tests {
         assert_eq!(
             p.state,
             Path::new("/Users/a/Library/Application Support/dps/live.state")
+        );
+        assert_eq!(
+            p.control,
+            Path::new("/Users/a/Library/Application Support/dps/control.sock")
         );
     }
 

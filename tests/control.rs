@@ -1,7 +1,7 @@
-//! `dps get` and `dps set` through the built binary. Its home and config
-//! directories are in a per-test directory, and the output devices come
-//! from `DPS_TEST_DEVICES`, so no test touches the real settings or audio
-//! system.
+//! `dps get` and `dps set`, and on macOS `dps bypass` and `dps use` with no
+//! dps running, through the built binary. Its home and config directories
+//! are in a per-test directory, and the output devices come from
+//! `DPS_TEST_DEVICES`, so no test touches the real settings or audio system.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -274,4 +274,42 @@ fn set_writes_to_the_default_outputs_own_profile() {
         ok(dir.dps(&["get", "-p", settings.to_str().unwrap(), "output_gain_db"])),
         "3.0\n"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn bypass_and_use_with_nothing_running_say_how_to_start_dps() {
+    let dir = TempDir::new("not-running");
+    let not_running = "dps is not running; start it with `dps` or `dps start`";
+    for args in [
+        &["bypass"][..],
+        &["bypass", "on"],
+        &["bypass", "toggle"],
+        &["use", "--settings"],
+    ] {
+        fails(dir.dps(args), not_running);
+    }
+    fails(
+        dir.dps(&["use", "night"]),
+        &format!("{not_running} (`dps start --preset night` starts it that way)"),
+    );
+    let mine = dir.work("mine.toml", "output_gain_db = -2.0\n");
+    let canonical = fs::canonicalize(&mine).unwrap();
+    fails(
+        dir.dps(&["use", mine.to_str().unwrap()]),
+        &format!(
+            "{not_running} (`dps start --profile {}` starts it that way)",
+            canonical.display()
+        ),
+    );
+    fails(
+        dir.dps(&["use", "nite"]),
+        "nite is neither a preset (headphones, laptop-speakers, music, night and voice) nor a \
+         file",
+    );
+    let bad = dir.work("bad.toml", "output_gain_db = \"loud\"\n");
+    let out = dir.dps(&["use", bad.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("bad.toml:1:"), "{}", stderr(&out));
+    assert!(!dir.root.join("home/Library").exists());
 }
