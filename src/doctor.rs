@@ -52,6 +52,7 @@ pub fn run(source: Result<Source, String>, dirs: &Dirs) -> ExitCode {
             report(check);
         }
         report(macos::config_check(dirs, rate.unwrap_or(48_000)));
+        report(macos::apps_check(dirs));
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -246,6 +247,69 @@ mod macos {
         };
         check.needed = false;
         check
+    }
+
+    /// The apps playing audio now, by bundle ID, for config.toml's
+    /// `exclude`, and those it leaves alone. Live mode works without it.
+    pub fn apps_check(dirs: &Dirs) -> Check {
+        // Tests that stand in for the audio system with DPS_TEST_OUTPUT list
+        // the apps here, comma-separated, a `+` after each one playing; it
+        // is not meant for users.
+        let apps = match std::env::var_os("DPS_TEST_OUTPUT") {
+            Some(_) => Ok(std::env::var("DPS_TEST_APPS")
+                .unwrap_or_default()
+                .split(',')
+                .filter(|a| !a.is_empty())
+                .map(|a| match a.strip_suffix('+') {
+                    Some(bundle) => (bundle.to_owned(), true),
+                    None => (a.to_owned(), false),
+                })
+                .collect()),
+            None => live::audio_apps(),
+        };
+        let config = dirs
+            .config_file()
+            .and_then(|path| Config::load(&path))
+            .unwrap_or_default();
+        let mut check = apps_verdict(apps, &config);
+        check.needed = false;
+        check
+    }
+
+    /// What `apps_check` says of `apps`, each a bundle ID and whether it
+    /// plays.
+    pub fn apps_verdict(apps: Result<Vec<(String, bool)>, String>, config: &Config) -> Check {
+        let apps = match apps {
+            Ok(apps) => apps,
+            Err(e) => return Check::new("apps", false, format!("cannot list them: {e}")),
+        };
+        let listed = |mut ids: Vec<&str>| {
+            ids.sort_unstable();
+            ids.dedup();
+            ids.join(", ")
+        };
+        let playing = listed(
+            apps.iter()
+                .filter(|(_, playing)| *playing)
+                .map(|(bundle, _)| bundle.as_str())
+                .collect(),
+        );
+        let left_alone = listed(
+            apps.iter()
+                .filter_map(|(bundle, _)| config.exclusion(bundle))
+                .collect(),
+        );
+        let playing = if playing.is_empty() {
+            "none".into()
+        } else {
+            playing
+        };
+        let rest = match (config.exclude.is_empty(), left_alone.is_empty()) {
+            (true, _) => "; to leave one alone, add its bundle ID to exclude in config.toml".into(),
+            (false, true) => "; none that config.toml excludes is running".into(),
+            (false, false) => format!("; config.toml leaves alone: {left_alone}"),
+        };
+        Check::new("apps", true, format!("playing audio now: {playing}{rest}"))
     }
 
     /// What `config_check` says of the config at `path`, read as `config`;
@@ -719,6 +783,56 @@ mod tests {
             "{}",
             check.text
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_apps_check_lists_what_plays_and_what_is_left_alone() {
+        use crate::config::Config;
+        let apps = |list: &[(&str, bool)]| {
+            Ok(list
+                .iter()
+                .map(|&(bundle, playing)| (bundle.to_owned(), playing))
+                .collect())
+        };
+        let none = Config::default();
+        let check = macos::apps_verdict(apps(&[]), &none);
+        assert!(check.ok);
+        assert_eq!(
+            check.text,
+            "playing audio now: none; to leave one alone, add its bundle ID to exclude in \
+             config.toml"
+        );
+        let running = [
+            ("com.spotify.client", true),
+            ("us.zoom.xos", false),
+            ("com.google.Chrome.helper", true),
+            ("com.google.Chrome.helper", true),
+            ("com.apple.Music", false),
+        ];
+        let check = macos::apps_verdict(apps(&running), &none);
+        assert!(check.text.starts_with(
+            "playing audio now: com.google.Chrome.helper, com.spotify.client; to leave one alone"
+        ));
+        let config = Config {
+            exclude: vec!["us.zoom.xos".into(), "com.google.Chrome".into()],
+            ..Config::default()
+        };
+        let check = macos::apps_verdict(apps(&running), &config);
+        assert_eq!(
+            check.text,
+            "playing audio now: com.google.Chrome.helper, com.spotify.client; config.toml leaves \
+             alone: com.google.Chrome, us.zoom.xos"
+        );
+        let check = macos::apps_verdict(apps(&running[..1]), &config);
+        assert!(
+            check
+                .text
+                .ends_with("; none that config.toml excludes is running")
+        );
+        let check = macos::apps_verdict(Err("no HAL".into()), &config);
+        assert!(!check.ok);
+        assert_eq!(check.text, "cannot list them: no HAL");
     }
 
     #[cfg(target_os = "macos")]

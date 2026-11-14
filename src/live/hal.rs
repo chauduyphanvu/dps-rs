@@ -10,6 +10,7 @@ use std::mem::{MaybeUninit, size_of};
 use std::ptr::{self, NonNull};
 
 use objc2::AnyThread;
+use objc2::rc::Retained;
 use objc2_core_audio::{
     AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID, AudioDeviceIOProc, AudioDeviceIOProcID,
     AudioDeviceStart, AudioDeviceStop, AudioHardwareCreateAggregateDevice,
@@ -23,13 +24,13 @@ use objc2_core_audio::{
     kAudioAggregateDeviceSubDeviceListKey, kAudioAggregateDeviceTapListKey,
     kAudioAggregateDeviceUIDKey, kAudioDevicePropertyDeviceIsRunning,
     kAudioDevicePropertyDeviceUID, kAudioHardwareBadPropertySizeError,
-    kAudioHardwarePropertyDevices, kAudioHardwarePropertyProcessObjectList,
-    kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioHardwareUnspecifiedError,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectSystemObject, kAudioObjectUnknown, kAudioProcessPropertyIsRunningOutput,
+    kAudioHardwarePropertyDevices, kAudioHardwarePropertyTranslatePIDToProcessObject,
+    kAudioHardwareUnspecifiedError, kAudioObjectPropertyElementMain, kAudioObjectPropertyName,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioObjectUnknown,
+    kAudioProcessPropertyBundleID, kAudioProcessPropertyIsRunningOutput,
     kAudioStreamPropertyTerminalType, kAudioStreamPropertyVirtualFormat, kAudioSubDeviceUIDKey,
-    kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, kAudioTapPropertyFormat,
-    kAudioTapPropertyUID,
+    kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, kAudioTapPropertyDescription,
+    kAudioTapPropertyFormat, kAudioTapPropertyUID,
 };
 use objc2_core_audio_types::AudioStreamBasicDescription;
 use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType};
@@ -39,8 +40,9 @@ pub use objc2_core_audio::{
     kAudioDeviceProcessorOverload, kAudioDevicePropertyDeviceIsAlive,
     kAudioDevicePropertyIOStoppedAbnormally, kAudioDevicePropertyNominalSampleRate,
     kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyStreams,
-    kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeInput,
-    kAudioObjectPropertyScopeOutput, kAudioObjectPropertyScopeWildcard,
+    kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyProcessObjectList,
+    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput,
+    kAudioObjectPropertyScopeWildcard,
 };
 
 pub type ObjectId = AudioObjectID;
@@ -362,47 +364,74 @@ pub fn process_object(pid: i32) -> Result<Option<ObjectId>, Error> {
     Ok((id != kAudioObjectUnknown).then_some(id))
 }
 
-/// Whether any process other than `own` is currently running audio output.
-pub fn others_playing(own: ObjectId) -> Result<bool, Error> {
+/// Every process with a connection to the audio system.
+pub fn process_objects() -> Result<Vec<ObjectId>, Error> {
     // SAFETY: an array of AudioObjectIDs.
-    let processes: Vec<ObjectId> = unsafe {
+    unsafe {
         get_list(
             SYSTEM_OBJECT,
             kAudioHardwarePropertyProcessObjectList,
             GLOBAL,
             "list audio processes",
-        )?
+        )
+    }
+}
+
+/// Whether the process is running audio output. One that exits meanwhile
+/// reads as not.
+pub fn runs_output(process: ObjectId) -> bool {
+    // SAFETY: a UInt32 property.
+    let running: Result<u32, _> = unsafe {
+        get(
+            process,
+            kAudioProcessPropertyIsRunningOutput,
+            GLOBAL,
+            "read a process's output state",
+        )
     };
-    Ok(processes.into_iter().filter(|&p| p != own).any(|p| {
-        // SAFETY: a UInt32 property. A process that exits meanwhile just
-        // reads as not playing.
-        let running: Result<u32, _> = unsafe {
-            get(
-                p,
-                kAudioProcessPropertyIsRunningOutput,
-                GLOBAL,
-                "read a process's output state",
-            )
-        };
-        running.is_ok_and(|r| r != 0)
-    }))
+    running.is_ok_and(|r| r != 0)
+}
+
+/// The process's bundle ID; empty for a process without one.
+pub fn bundle_id(process: ObjectId) -> Result<String, Error> {
+    get_string(
+        process,
+        kAudioProcessPropertyBundleID,
+        "read a process's bundle ID",
+    )
+}
+
+/// Whether any process other than `own` is currently running audio output.
+pub fn others_playing(own: ObjectId) -> Result<bool, Error> {
+    Ok(process_objects()?
+        .into_iter()
+        .filter(|&p| p != own)
+        .any(runs_output))
 }
 
 /// A process tap, destroyed on drop.
 pub struct Tap {
     pub id: ObjectId,
+    /// What it was created from, changed to change what it taps.
+    description: Retained<CATapDescription>,
+}
+
+/// Process objects as the NSArray a CATapDescription takes.
+fn process_array(processes: &[ObjectId]) -> Retained<NSArray<NSNumber>> {
+    let numbers: Vec<_> = processes.iter().map(|&p| NSNumber::new_u32(p)).collect();
+    NSArray::from_retained_slice(&numbers)
 }
 
 impl Tap {
-    /// A private stereo mix of every process except `exclude`. If `muted`,
-    /// the tapped processes are muted on their own devices while the tap is
-    /// being read; otherwise they play on as before.
+    /// A private stereo mix of every process except those in `exclude`. If
+    /// `muted`, the tapped processes are muted on their own devices while
+    /// the tap is being read; otherwise they play on as before.
     pub fn global_stereo_excluding(
-        exclude: ObjectId,
+        exclude: &[ObjectId],
         name: &str,
         muted: bool,
     ) -> Result<Self, Error> {
-        let excluded = NSArray::from_retained_slice(&[NSNumber::new_u32(exclude)]);
+        let excluded = process_array(exclude);
         let mute = if muted {
             CATapMuteBehavior::MutedWhenTapped
         } else {
@@ -424,7 +453,29 @@ impl Tap {
         check("create the system audio tap", unsafe {
             AudioHardwareCreateProcessTap(Some(&description), &mut id)
         })?;
-        Ok(Self { id })
+        Ok(Self { id, description })
+    }
+
+    /// Leaves out the processes in `exclude` from now on, and no others.
+    /// The description keeps the tap's UUID, name, privacy and mute
+    /// behaviour; AudioHardware.h says setting it changes an existing tap.
+    pub fn exclude(&self, exclude: &[ObjectId]) -> Result<(), Error> {
+        // SAFETY: a setter on an object we own.
+        unsafe { self.description.setProcesses(&process_array(exclude)) };
+        let address = address(kAudioTapPropertyDescription, GLOBAL);
+        let description: *const CATapDescription = Retained::as_ptr(&self.description);
+        // SAFETY: a CATapDescription property, passed like CF properties as
+        // a pointer to the object pointer, which outlives the call.
+        check("change the apps the system audio tap leaves out", unsafe {
+            AudioObjectSetPropertyData(
+                self.id,
+                NonNull::from(&address),
+                0,
+                ptr::null(),
+                size_of_val(&description) as u32,
+                NonNull::from(&description).cast(),
+            )
+        })
     }
 
     pub fn uid(&self) -> Result<String, Error> {
@@ -616,6 +667,35 @@ impl Drop for Listener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Prints what this machine's HAL reports, reading only: no tap, no
+    /// aggregate device, no IO. Run by hand with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "reads the real audio system"]
+    fn read_only_facts_about_this_machine() {
+        let default = default_output_device().unwrap();
+        for device in devices().unwrap() {
+            let outputs = stream_ids(device, kAudioObjectPropertyScopeOutput).unwrap();
+            println!(
+                "device {device} {:?} uid {:?}: {} output streams{}",
+                name(device),
+                device_uid(device),
+                outputs.len(),
+                if Some(device) == default {
+                    " (default output)"
+                } else {
+                    ""
+                }
+            );
+        }
+        for process in process_objects().unwrap() {
+            println!(
+                "process {process}: bundle {:?}, running output {}",
+                bundle_id(process),
+                runs_output(process)
+            );
+        }
+    }
 
     #[test]
     fn errors_show_four_character_codes() {

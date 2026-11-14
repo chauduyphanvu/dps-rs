@@ -236,6 +236,18 @@ impl Config {
             .get(uid)
             .map(|entry| config_dir.join(&entry.profile))
     }
+
+    /// The `exclude` entry that covers the app with `bundle_id`: one that
+    /// is the same, or that the ID continues after a dot (`com.foo` covers
+    /// `com.foo.helper`, not `com.foobar`).
+    pub fn exclusion(&self, bundle_id: &str) -> Option<&str> {
+        self.exclude.iter().map(String::as_str).find(|entry| {
+            !entry.is_empty()
+                && bundle_id
+                    .strip_prefix(entry)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +454,40 @@ profile = "/elsewhere/airpods.toml"
         );
         assert_eq!(config.profile_for("builtinspeakerdevice", dir), None);
         assert_eq!(config.profile_for("", dir), None);
+    }
+
+    #[test]
+    fn an_exclude_entry_covers_its_bundle_id_and_those_continuing_it_after_a_dot() {
+        let config = Config {
+            exclude: vec!["com.google.Chrome".into(), "us.zoom.xos".into(), "".into()],
+            ..Config::default()
+        };
+        let covered = |id| config.exclusion(id);
+        assert_eq!(covered("com.google.Chrome"), Some("com.google.Chrome"));
+        assert_eq!(
+            covered("com.google.Chrome.helper"),
+            Some("com.google.Chrome")
+        );
+        assert_eq!(
+            covered("com.google.Chrome.helper.Renderer"),
+            Some("com.google.Chrome")
+        );
+        assert_eq!(covered("us.zoom.xos"), Some("us.zoom.xos"));
+        for not in [
+            "com.google.ChromeCanary",
+            "com.google",
+            "com.google.chrome",
+            "us.zoom.xosx",
+            "",
+        ] {
+            assert_eq!(covered(not), None, "{not}");
+        }
+        let foo = Config {
+            exclude: vec!["com.foo".into()],
+            ..Config::default()
+        };
+        assert_eq!(foo.exclusion("com.foobar"), None);
+        assert_eq!(foo.exclusion("com.foo.bar"), Some("com.foo"));
     }
 
     #[test]

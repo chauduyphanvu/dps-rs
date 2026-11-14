@@ -36,6 +36,11 @@ impl TempDir {
     }
 
     fn dps(&self, args: &[&str]) -> Output {
+        self.dps_with_apps(args, "")
+    }
+
+    /// `dps` with the audio apps `DPS_TEST_APPS` lists.
+    fn dps_with_apps(&self, args: &[&str], apps: &str) -> Output {
         Command::new(env!("CARGO_BIN_EXE_dps"))
             .args(args)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
@@ -44,6 +49,7 @@ impl TempDir {
             .env("DPS_TEST_DEVICES", DEVICES)
             .env("DPS_TEST_OUTPUT", "MacBook Pro Speakers@48000")
             .env("DPS_TEST_OTHERS_PLAYING", "0")
+            .env("DPS_TEST_APPS", apps)
             .output()
             .unwrap()
     }
@@ -459,4 +465,23 @@ fn doctor_names_the_profile_the_default_output_plays_with() {
     let line = config_line(out);
     assert!(line.starts_with("problem  config: "), "{line}");
     assert!(line.contains("nonsense"), "{line}");
+
+    // The apps playing, by bundle ID, and those config.toml leaves alone.
+    let apps_line = |out: Output| {
+        let text = stdout(&out);
+        text.lines().last().unwrap().to_owned()
+    };
+    let running = "com.spotify.client+,us.zoom.xos,com.apple.Music";
+    fs::write(dir.config(), "exclude = [\"us.zoom.xos\"]\n").unwrap();
+    assert_eq!(
+        apps_line(dir.dps_with_apps(&["doctor", "--preset", "music"], running)),
+        "ok       apps: playing audio now: com.spotify.client; config.toml leaves alone: \
+         us.zoom.xos"
+    );
+    fs::remove_file(dir.config()).unwrap();
+    assert_eq!(
+        apps_line(dir.dps_with_apps(&["doctor", "--preset", "music"], "")),
+        "ok       apps: playing audio now: none; to leave one alone, add its bundle ID to \
+         exclude in config.toml"
+    );
 }

@@ -2381,7 +2381,8 @@ fn doctor_reports_each_check_and_fails_only_on_what_live_mode_needs() {
             "ffmpeg",
             "service",
             "start at login",
-            "config"
+            "config",
+            "apps"
         ]
     );
     assert!(lines[0].starts_with("ok       macOS: "), "{report}");

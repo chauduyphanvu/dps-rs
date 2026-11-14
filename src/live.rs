@@ -21,7 +21,7 @@ mod tuner;
 
 pub use calibrate::run as calibrate;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_int, c_void};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -75,6 +75,13 @@ const REBUILD_WINDOW: Duration = Duration::from_secs(10);
 /// Starting IO normally takes milliseconds but blocks while macOS shows its
 /// permission prompt.
 const START_NOTICE: Duration = Duration::from_secs(1);
+/// Apps start and quit with bursts of process changes; wait this long after
+/// one before looking at which to leave alone.
+const APPS_SETTLE: Duration = Duration::from_millis(500);
+/// The least time between restarts made only because the tap could not be
+/// told which apps to leave alone, so that apps starting and quitting can
+/// restart it at most twice within `REBUILD_WINDOW`.
+const APPS_REBUILD_GAP: Duration = Duration::from_secs(5);
 
 pub const PERMISSION_HINT: &str = "allow your terminal app in System Settings > Privacy & Security > \
      Screen & System Audio Recording > System Audio Recording Only, then run dps live again";
@@ -95,6 +102,8 @@ static CHANGED: AtomicBool = AtomicBool::new(false);
 /// Set by the HAL when the session must be rebuilt: IO on the aggregate
 /// device stopped on its own, or its streams changed.
 static REBUILD: AtomicBool = AtomicBool::new(false);
+/// Set by the HAL when a process connects to or leaves the audio system.
+static PROCESSES: AtomicBool = AtomicBool::new(false);
 
 /// Counters the audio callback and HAL listeners update for the main thread.
 #[derive(Default)]
@@ -141,6 +150,9 @@ pub trait Report: Send + Sync {
     fn heard(&self);
     fn reload_failed(&self, message: &str);
     fn reloaded(&self);
+    /// The `exclude` entries of config.toml that cover a running app, whose
+    /// audio is left alone.
+    fn excluded(&self, apps: &[String]);
 }
 
 pub fn run(options: Options) -> Result<(), String> {
@@ -158,16 +170,26 @@ pub fn run(options: Options) -> Result<(), String> {
         .ok_or("cannot find this process's Core Audio object to exclude it from the tap")?;
     let stats = Arc::new(Stats::default());
     let controls = Arc::new(Controls::default());
-    // SAFETY: `on_change` only touches statics.
-    let _default_watch = unsafe {
-        hal::Listener::add(
-            hal::SYSTEM_OBJECT,
-            hal::kAudioHardwarePropertyDefaultOutputDevice,
-            hal::GLOBAL,
-            Some(on_change),
-            ptr::null_mut(),
-            "watch the default output device",
-        )?
+    // SAFETY: `on_change` and `on_processes` only touch statics.
+    let _system_watch = unsafe {
+        [
+            hal::Listener::add(
+                hal::SYSTEM_OBJECT,
+                hal::kAudioHardwarePropertyDefaultOutputDevice,
+                hal::GLOBAL,
+                Some(on_change),
+                ptr::null_mut(),
+                "watch the default output device",
+            )?,
+            hal::Listener::add(
+                hal::SYSTEM_OBJECT,
+                hal::kAudioHardwarePropertyProcessObjectList,
+                hal::GLOBAL,
+                Some(on_processes),
+                ptr::null_mut(),
+                "watch the audio processes",
+            )?,
+        ]
     };
 
     let started = Instant::now();
@@ -188,13 +210,14 @@ pub fn run(options: Options) -> Result<(), String> {
                 report.waiting_for_permission();
             }
         };
+        let exclude = live.session_exclusions(own)?;
         let profile = live.tuner.profile();
         let hint = live.permission_hint();
         let session = Session::start(
             &target,
             profile,
             rate,
-            own,
+            &exclude,
             &stats,
             &controls,
             hint,
@@ -369,6 +392,23 @@ fn same_file(a: &Path, b: &Path) -> bool {
     a == b || matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
 }
 
+/// Which apps the tap leaves out, kept across sessions.
+#[derive(Default)]
+struct Apps {
+    /// The processes the session's tap leaves out, as last set.
+    applied: Vec<ObjectId>,
+    /// The `exclude` entries that cover a running app.
+    shown: Vec<String>,
+    /// `shown` changed since it was last said.
+    unsaid: bool,
+    /// Bundle IDs by process, so each is read from the HAL once.
+    bundles: HashMap<ObjectId, String>,
+    /// When to look at the processes again.
+    due: Option<Instant>,
+    /// When the session last restarted to change them.
+    rebuilt: Option<Instant>,
+}
+
 /// What a run keeps across sessions: the settings being tuned, where they
 /// come from and go, and the tuner's screen once it is up.
 struct Live {
@@ -382,6 +422,7 @@ struct Live {
     settings: Option<PathBuf>,
     /// The output device of the session: its UID and name.
     device: Option<(String, String)>,
+    apps: Apps,
     /// Set in interactive runs once audio first runs.
     screen: Option<Screen>,
     background: Option<Arc<dyn Report>>,
@@ -400,6 +441,7 @@ impl Live {
             save_path: options.save_path,
             config,
             device: None,
+            apps: Apps::default(),
             screen: None,
             background: options.background,
             heard: false,
@@ -493,6 +535,104 @@ impl Live {
         note
     }
 
+    /// The processes the next session's tap leaves out: this one, `own`,
+    /// and those of the apps config.toml excludes.
+    fn session_exclusions(&mut self, own: ObjectId) -> Result<Vec<ObjectId>, String> {
+        let wanted = if self.excludes_nothing() {
+            vec![own]
+        } else {
+            let processes = audio_processes(&mut self.apps.bundles)?;
+            self.apps_now(own, &processes).0
+        };
+        self.apps.applied.clone_from(&wanted);
+        Ok(wanted)
+    }
+
+    fn excludes_nothing(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_none_or(|c| c.config.exclude.is_empty())
+    }
+
+    /// Takes in `processes`, each with its bundle ID if it has one: returns
+    /// what the tap should leave out, sorted, and whether that differs from
+    /// what it does among the processes that still exist.
+    fn apps_now(
+        &mut self,
+        own: ObjectId,
+        processes: &[(ObjectId, Option<String>)],
+    ) -> (Vec<ObjectId>, bool) {
+        let mut wanted = vec![own];
+        let mut shown = Vec::new();
+        if let Some(config) = &self.config {
+            for (process, bundle) in processes {
+                if let Some(entry) = bundle.as_deref().and_then(|b| config.config.exclusion(b)) {
+                    wanted.push(*process);
+                    shown.push(entry.to_owned());
+                }
+            }
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        shown.sort_unstable();
+        shown.dedup();
+        if shown != self.apps.shown {
+            self.apps.shown = shown;
+            self.apps.unsaid = true;
+        }
+        let exists = |p: &ObjectId| *p == own || processes.iter().any(|(q, _)| q == p);
+        let still: Vec<ObjectId> = self.apps.applied.iter().copied().filter(exists).collect();
+        let changed = still != wanted;
+        (wanted, changed)
+    }
+
+    /// Which apps are left alone, as a message, if that changed since it
+    /// was last said; reported to `dps status` too.
+    fn apps_note(&mut self) -> Option<String> {
+        if !mem::take(&mut self.apps.unsaid) {
+            return None;
+        }
+        if let Some(report) = &self.background {
+            report.excluded(&self.apps.shown);
+        }
+        let apps = match &self.apps.shown[..] {
+            [] => "none running".into(),
+            shown => shown.join(", "),
+        };
+        Some(format!("apps left alone: {apps}"))
+    }
+
+    /// Brings what `tap` leaves out up to date with the running processes
+    /// and config.toml; why the session must restart instead, if the tap
+    /// cannot be changed.
+    fn check_apps(&mut self, own: ObjectId, tap: &hal::Tap) -> Result<Option<String>, String> {
+        if self.excludes_nothing() && self.apps.applied == [own] && self.apps.shown.is_empty() {
+            return Ok(None);
+        }
+        let processes = audio_processes(&mut self.apps.bundles)?;
+        let (wanted, changed) = self.apps_now(own, &processes);
+        if let Some(note) = self.apps_note() {
+            self.say(note);
+        }
+        if !changed {
+            return Ok(None);
+        }
+        let Err(e) = tap.exclude(&wanted) else {
+            self.apps.applied = wanted;
+            return Ok(None);
+        };
+        let now = Instant::now();
+        if let Some(next) = next_apps_rebuild(self.apps.rebuilt, now) {
+            self.apps.due = Some(next);
+            return Ok(None);
+        }
+        self.apps.rebuilt = Some(now);
+        self.say(format!(
+            "{e}; restarting audio to leave the right apps alone"
+        ));
+        Ok(Some("the apps to leave alone changed".into()))
+    }
+
     fn permission_hint(&self) -> &'static str {
         if self.background.is_some() {
             BACKGROUND_PERMISSION_HINT
@@ -543,16 +683,19 @@ impl Live {
         if let Some(report) = &self.background {
             report.running(device, rate, &self.name);
         }
-        let switched = switched.unwrap_or_default();
+        let mut details = switched.unwrap_or_default();
+        if let Some(apps) = self.apps_note() {
+            details += &format!("; {apps}");
+        }
         if again {
-            self.say(format!("now on {device} at {rate} Hz{switched}"));
+            self.say(format!("now on {device} at {rate} Hz{details}"));
         } else if self.screen.is_some() || self.background.is_some() {
             self.say(format!(
-                "processing system audio on {device} at {rate} Hz{switched}"
+                "processing system audio on {device} at {rate} Hz{details}"
             ));
         } else {
             print_line(&format!(
-                "processing system audio on {device} at {rate} Hz{switched}; press Ctrl-C to stop"
+                "processing system audio on {device} at {rate} Hz{details}; press Ctrl-C to stop"
             ));
         }
     }
@@ -615,6 +758,7 @@ impl Live {
             None => {}
             Some(Err(e)) => self.warn(format!("config.toml not reloaded: {e}")),
             Some(Ok(())) => {
+                self.apps.due.get_or_insert_with(Instant::now);
                 let before = self.save_path.clone();
                 let followed = self
                     .device
@@ -835,6 +979,17 @@ fn watch(
                     .into(),
             );
         }
+        if PROCESSES.swap(false, Relaxed) {
+            live.apps
+                .due
+                .get_or_insert_with(|| Instant::now() + APPS_SETTLE);
+        }
+        if live.apps.due.is_some_and(|due| Instant::now() >= due) {
+            live.apps.due = None;
+            if let Some(reason) = live.check_apps(own, &session.tap)? {
+                return Ok(Next::Rebuild(Target::current()?, reason));
+            }
+        }
         let forced = REBUILD.swap(false, Relaxed);
         if forced || CHANGED.load(Relaxed) {
             let Some(now) = settle_and_read()? else {
@@ -925,6 +1080,36 @@ impl Rebuilds {
         self.0.push_back(now);
         self.0.len() <= REBUILD_LIMIT
     }
+}
+
+/// When the session may next restart to change the apps it leaves alone,
+/// if not yet at `now`: `APPS_REBUILD_GAP` after the last such restart.
+fn next_apps_rebuild(last: Option<Instant>, now: Instant) -> Option<Instant> {
+    last.map(|t| t + APPS_REBUILD_GAP)
+        .filter(|&next| next > now)
+}
+
+/// Every process connected to the audio system, with its bundle ID if it
+/// has one. IDs are read once per process and kept in `bundles`.
+fn audio_processes(
+    bundles: &mut HashMap<ObjectId, String>,
+) -> Result<Vec<(ObjectId, Option<String>)>, String> {
+    let processes = hal::process_objects()?;
+    bundles.retain(|p, _| processes.contains(p));
+    Ok(processes
+        .into_iter()
+        .map(|p| {
+            let bundle = match bundles.get(&p) {
+                Some(bundle) => Some(bundle.clone()),
+                // One without an ID now is asked again next time.
+                None => hal::bundle_id(p).ok().filter(|b| !b.is_empty()),
+            };
+            if let Some(bundle) = &bundle {
+                bundles.insert(p, bundle.clone());
+            }
+            (p, bundle)
+        })
+        .collect())
 }
 
 /// Watches for the sign of a missing permission: other processes keep
@@ -1033,13 +1218,13 @@ impl Session {
         target: &Target,
         profile: &Profile,
         rate: u32,
-        own: ObjectId,
+        exclude: &[ObjectId],
         stats: &Arc<Stats>,
         controls: &Arc<Controls>,
         hint: &str,
         on_slow_start: impl FnOnce() + Send,
     ) -> Result<Self, String> {
-        let tap = hal::Tap::global_stereo_excluding(own, "dps live", true)
+        let tap = hal::Tap::global_stereo_excluding(exclude, "dps live", true)
             .map_err(|e| format!("{e}; if this is a permission problem, {hint}"))?;
         let aggregate = hal::Aggregate::new(&target.uid, &tap.uid()?)?;
         let tap_channels = Layout::read(&aggregate, &tap, target)?.tap;
@@ -1342,7 +1527,7 @@ fn run_capture_check() -> Result<Capture, String> {
     let own = hal::process_object(std::process::id() as i32)?
         .ok_or("cannot find this process's Core Audio object to exclude it from the tap")?;
     let target = Target::current()?;
-    let tap = hal::Tap::global_stereo_excluding(own, "dps doctor", false)?;
+    let tap = hal::Tap::global_stereo_excluding(&[own], "dps doctor", false)?;
     let aggregate = hal::Aggregate::new(&target.uid, &tap.uid()?)?;
     let tap_channels = Layout::read(&aggregate, &tap, &target)?.tap;
     let stats = Arc::new(Stats::default());
@@ -1401,6 +1586,18 @@ pub fn output_devices() -> Result<Vec<OutputDevice>, String> {
                 name: hal::name(device).ok()?,
                 default: Some(device) == default,
             })
+        })
+        .collect())
+}
+
+/// The bundle ID of each process connected to the audio system that has
+/// one, and whether it is running audio output.
+pub fn audio_apps() -> Result<Vec<(String, bool)>, String> {
+    Ok(hal::process_objects()?
+        .into_iter()
+        .filter_map(|p| {
+            let bundle = hal::bundle_id(p).ok().filter(|b| !b.is_empty())?;
+            Some((bundle, hal::runs_output(p)))
         })
         .collect())
 }
@@ -1556,6 +1753,16 @@ unsafe extern "C-unwind" fn on_change(
     _client: *mut c_void,
 ) -> i32 {
     CHANGED.store(true, Relaxed);
+    0
+}
+
+unsafe extern "C-unwind" fn on_processes(
+    _object: ObjectId,
+    _count: u32,
+    _addresses: NonNull<hal::PropertyAddress>,
+    _client: *mut c_void,
+) -> i32 {
+    PROCESSES.store(true, Relaxed);
     0
 }
 
@@ -2079,6 +2286,9 @@ mod tests {
         fn reloaded(&self) {
             self.push("reloaded".into());
         }
+        fn excluded(&self, apps: &[String]) {
+            self.push(format!("excluded [{}]", apps.join(", ")));
+        }
     }
 
     /// A run watching and saving to `settings.toml` in `dir`, without audio:
@@ -2513,6 +2723,122 @@ mod tests {
         );
         assert_eq!(live.config.unwrap().config, Config::default());
         assert_eq!(live.save_path, settings);
+    }
+
+    fn processes(list: &[(ObjectId, Option<&str>)]) -> Vec<(ObjectId, Option<String>)> {
+        list.iter()
+            .map(|&(p, bundle)| (p, bundle.map(String::from)))
+            .collect()
+    }
+
+    #[test]
+    fn the_tap_leaves_out_this_process_and_the_apps_config_toml_excludes() {
+        let dir = Scratch::new("apps");
+        let reports = Arc::new(Reports::default());
+        let config = "exclude = [\"us.zoom.xos\", \"com.google.Chrome\"]\n";
+        let (mut live, _) = following(&dir, config, Some(Arc::clone(&reports)));
+        let own = 10;
+        let mut running = processes(&[
+            (11, Some("com.spotify.client")),
+            (12, Some("us.zoom.xos")),
+            (13, Some("com.google.Chrome.helper")),
+            (14, None),
+            (15, Some("com.google.ChromeCanary")),
+        ]);
+        assert!(!live.excludes_nothing());
+        assert_eq!(live.apps_now(own, &running), (vec![10, 12, 13], true));
+        live.apps.applied = vec![10, 12, 13];
+        assert_eq!(
+            live.apps_note().as_deref(),
+            Some("apps left alone: com.google.Chrome, us.zoom.xos")
+        );
+        assert_eq!(
+            reports.take(),
+            ["excluded [com.google.Chrome, us.zoom.xos]"]
+        );
+        // Nothing new: nothing to change or say.
+        assert_eq!(live.apps_now(own, &running), (vec![10, 12, 13], false));
+        assert_eq!(live.apps_note(), None);
+
+        // An app that quits needs no change to the tap, only a message.
+        running.retain(|(p, _)| *p != 12);
+        assert_eq!(live.apps_now(own, &running), (vec![10, 13], false));
+        assert_eq!(
+            live.apps_note().as_deref(),
+            Some("apps left alone: com.google.Chrome")
+        );
+        // One that starts does change it.
+        running.push((16, Some("com.google.Chrome.helper.GPU".into())));
+        assert_eq!(live.apps_now(own, &running), (vec![10, 13, 16], true));
+        assert_eq!(live.apps_note(), None);
+        live.apps.applied = vec![10, 13, 16];
+
+        // A config.toml that stops excluding them puts them back in the tap.
+        stamp(&dir.0.join("config.toml"), "exclude = []\n", 1);
+        let (handoff, controls) = (Handoff::new(), Controls::default());
+        live.step(None, 48_000, &handoff, &controls);
+        assert!(live.apps.due.is_some());
+        assert!(live.excludes_nothing());
+        assert_eq!(live.apps_now(own, &running), (vec![10], true));
+        assert_eq!(
+            live.apps_note().as_deref(),
+            Some("apps left alone: none running")
+        );
+    }
+
+    #[test]
+    fn without_excludes_only_this_process_is_left_out() {
+        let dir = Scratch::new("apps-none");
+        let (mut live, _) = live_in(&dir, "", None);
+        assert!(live.excludes_nothing());
+        let running = processes(&[(11, Some("us.zoom.xos")), (12, None)]);
+        assert_eq!(live.apps_now(10, &running), (vec![10], true));
+        assert_eq!(live.apps_note(), None);
+        // A preset or --profile run follows config.toml's excludes too.
+        let config = dir.0.join("config.toml");
+        stamp(&config, "exclude = [\"us.zoom.xos\"]\n", 0);
+        live.config = Some(ConfigFile::new(&config).0);
+        assert_eq!(live.apps_now(10, &running), (vec![10, 11], true));
+    }
+
+    #[test]
+    fn the_first_announcement_names_the_apps_left_alone() {
+        let dir = Scratch::new("apps-announce");
+        let reports = Some(Arc::new(Reports::default()));
+        let (mut live, _) = following(&dir, "exclude = [\"us.zoom.xos\"]\n", reports);
+        live.apps_now(10, &processes(&[(12, Some("us.zoom.xos"))]));
+        live.announce("Speakers", 48_000, false, Some(" with x.toml".into()));
+        assert_eq!(
+            live.tuner.message(),
+            "processing system audio on Speakers at 48000 Hz with x.toml; apps left alone: \
+             us.zoom.xos"
+        );
+        live.announce("Speakers", 48_000, true, None);
+        assert_eq!(live.tuner.message(), "now on Speakers at 48000 Hz");
+    }
+
+    #[test]
+    fn apps_starting_and_quitting_cannot_restart_audio_often_enough_to_stop_it() {
+        let t0 = Instant::now();
+        assert_eq!(next_apps_rebuild(None, t0), None);
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        assert_eq!(next_apps_rebuild(Some(t0), at(1_000)), Some(at(5_000)));
+        assert_eq!(next_apps_rebuild(Some(t0), at(5_000)), None);
+        // An update that fails every 100 ms for a minute restarts the
+        // session only as often as allowed, and that never adds up to more
+        // than the limit, with room left for device changes.
+        let mut rebuilds = Rebuilds::default();
+        let mut last = None;
+        let mut count = 0;
+        for ms in (0..60_000).step_by(100) {
+            if next_apps_rebuild(last, at(ms)).is_none() {
+                last = Some(at(ms));
+                count += 1;
+                assert!(rebuilds.record(at(ms)));
+                assert!(rebuilds.0.len() <= REBUILD_LIMIT - 3, "{ms} ms");
+            }
+        }
+        assert_eq!(count, 12);
     }
 
     unsafe extern "C" {

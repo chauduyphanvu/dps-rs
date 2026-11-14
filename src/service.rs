@@ -343,6 +343,9 @@ pub struct State {
     /// The tap has delivered sound.
     #[serde(default)]
     pub heard: bool,
+    /// The `exclude` entries of config.toml that cover a running app.
+    #[serde(default)]
+    pub excluded: Vec<String>,
     /// The last warning or error.
     pub problem: Option<String>,
 }
@@ -434,6 +437,10 @@ impl live::Report for StateFile {
                 *reload_problem = false;
             }
         });
+    }
+
+    fn excluded(&self, apps: &[String]) {
+        self.update(|state, _| state.excluded = apps.to_vec());
     }
 }
 
@@ -564,6 +571,7 @@ pub fn serve(
             rate: None,
             profile: None,
             heard: false,
+            excluded: Vec::new(),
             problem: None,
         },
     ));
@@ -746,11 +754,18 @@ impl Snapshot {
         })
     }
 
-    /// What `dps status` prints: a line, and another for any warning.
+    /// What `dps status` prints: a line, one for the apps a running service
+    /// leaves alone, and another for any warning.
     pub fn status(&self, log: &Path) -> String {
         let (_, service) = self.service(log);
         let (_, login) = self.login();
         let mut out = format!("dps is {service}; start at login is {login}\n");
+        if let Some(state) = self
+            .current_state()
+            .filter(|s| s.phase == Phase::Running && !s.excluded.is_empty())
+        {
+            out += &format!("apps left alone: {}\n", state.excluded.join(", "));
+        }
         let mut notes = Vec::new();
         if let Some(problem) = self
             .current_state()
@@ -1338,6 +1353,7 @@ mod tests {
             rate: Some(48_000),
             profile: None,
             heard: false,
+            excluded: Vec::new(),
             problem: None,
         }
     }
@@ -1369,6 +1385,8 @@ mod tests {
         assert_eq!(s.profile(), "/c/devices/airpods.toml");
         file.running("Headphones", 44_100, "preset music");
         assert_eq!(State::read(&path).unwrap().profile, None);
+        file.excluded(&["us.zoom.xos".into()]);
+        assert_eq!(State::read(&path).unwrap().excluded, ["us.zoom.xos"]);
 
         file.reload_failed("profile not reloaded: bad");
         assert_eq!(
@@ -1543,6 +1561,24 @@ mod tests {
         let text = status(snapshot(Some(loaded(true, Some(9), None)), Some(own), None));
         assert!(
             text.contains("(pid 9) with /c/devices/speakers.toml on Speakers at 48000 Hz;"),
+            "{text}"
+        );
+
+        let leaving = State {
+            excluded: vec!["com.google.Chrome".into(), "us.zoom.xos".into()],
+            problem: Some("profile not reloaded: x".into()),
+            ..running.clone()
+        };
+        let text = status(snapshot(
+            Some(loaded(true, Some(9), None)),
+            Some(leaving),
+            None,
+        ));
+        assert!(
+            text.ends_with(
+                "; start at login is off\napps left alone: com.google.Chrome, us.zoom.xos\nlast \
+                 warning: profile not reloaded: x\n"
+            ),
             "{text}"
         );
 
