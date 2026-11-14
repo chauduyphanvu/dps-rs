@@ -5,6 +5,8 @@
 //! the stability limit (w0 = 2 pi fc / fs), which f32 cannot resolve for low
 //! bands at high sample rates: a 5 Hz band at 192 kHz goes unstable.
 
+use crate::biquad::Coefs;
+
 pub struct Bell {
     b0: f64,
     b1: f64,
@@ -52,6 +54,20 @@ impl Bell {
         // listing's `yv[1] = *output` (the bell output) is unstable.
         self.y1 = ap;
         (self.wet * ap + self.dry * x) as f32
+    }
+
+    /// |H| in dB at `freq_hz`: the gain a steady sine there gets.
+    pub fn magnitude_db(&self, freq_hz: f64, sample_rate: f64) -> f64 {
+        // dry + wet A(z), with the allpass A(z) = (b0 + b1 z^-1 + z^-2) /
+        // (1 + b1 z^-1 + b0 z^-2), over A's denominator.
+        Coefs {
+            b0: self.dry + self.wet * self.b0,
+            b1: (self.dry + self.wet) * self.b1,
+            b2: self.dry * self.b0 + self.wet,
+            a1: self.b1,
+            a2: self.b0,
+        }
+        .magnitude_db(freq_hz, sample_rate)
     }
 }
 
@@ -143,6 +159,38 @@ pub(crate) mod tests {
             assert!(h.iter().all(|v| v.is_finite()), "{fc} Hz diverged");
             let (db, _) = response_at(&h, fc, fs);
             assert!((db - gain_db).abs() < 1e-3, "{fc} Hz: {db} dB at fc");
+        }
+    }
+
+    #[test]
+    fn magnitude_is_what_a_steady_sine_gets() {
+        use crate::stereo::tests::amplitude;
+        use std::f64::consts::PI;
+        // A boost and a cut, a low band at a high rate and a wide one, each
+        // measured on whole-cycle sines over the second after the first.
+        for (fc, q, gain_db, fs) in [
+            (1000.0, 2.0, 9.0, FS),
+            (200.0, 0.7, -12.0, FS),
+            (40.0, 1.5, 6.0, 96_000.0),
+            (8000.0, 0.8, 4.5, 44_100.0),
+        ] {
+            let bell = Bell::new(fc, q, gain_db, fs);
+            for f in [
+                25.0, 40.0, 100.0, 200.0, 997.0, 1000.0, 3000.0, 8000.0, 15_000.0,
+            ] {
+                let mut ticking = Bell::new(fc, q, gain_db, fs);
+                let n = fs as usize;
+                let out: Vec<f32> = (0..2 * n)
+                    .map(|i| ticking.tick((0.5 * (2.0 * PI * f * i as f64 / fs).sin()) as f32))
+                    .collect();
+                let measured = 20.0 * (amplitude(&out[n..], f, fs) / 0.5).log10();
+                let want = bell.magnitude_db(f, fs);
+                assert!(
+                    (measured - want).abs() < 0.005,
+                    "{fc} Hz bell at {f} Hz: measured {measured} dB, magnitude {want} dB"
+                );
+            }
+            assert!((bell.magnitude_db(fc, fs) - gain_db).abs() < 1e-9);
         }
     }
 

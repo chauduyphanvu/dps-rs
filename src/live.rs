@@ -742,8 +742,12 @@ impl Live {
         handoff: &Handoff<Processor>,
         controls: &Controls,
     ) -> bool {
+        // A new session's audio started with the heard slot's chain alone.
+        if handoff.first_sync() {
+            self.tuner.restarted();
+        }
         if let Some(key) = key
-            && self.key(key, rate, handoff, controls)
+            && self.key(key, rate)
         {
             return true;
         }
@@ -752,23 +756,18 @@ impl Live {
             .as_mut()
             .and_then(|file| file.changed(rate))
         {
-            Some(Ok(new)) => {
-                // The same settings again would only restart the chain.
-                if new != *self.tuner.profile() {
-                    handoff.post(Processor::new(&new, rate, 2));
-                }
-                self.reloaded(new);
-            }
+            Some(Ok(new)) => self.reloaded(new),
             Some(Err(e)) => self.warn(format!("profile not reloaded: {e}")),
             None => {}
         }
-        self.reload_config(rate, handoff);
+        self.reload_config(rate);
+        self.sync(rate, handoff, controls);
         false
     }
 
     /// Takes in a save of config.toml, switching to the profile it now
     /// assigns the output device, if that changed.
-    fn reload_config(&mut self, rate: u32, handoff: &Handoff<Processor>) {
+    fn reload_config(&mut self, rate: u32) {
         match self.config.as_mut().and_then(ConfigFile::changed) {
             None => {}
             Some(Err(e)) => self.warn(format!("config.toml not reloaded: {e}")),
@@ -784,7 +783,6 @@ impl Live {
                     if let Some(latency) = &mut self.latency {
                         latency.chain = chain.latency_frames();
                     }
-                    handoff.post(chain);
                     let latency = self.latency.map(|l| l.describe());
                     if let (Some(report), Some((_, device))) = (&self.background, &self.device) {
                         report.running(device, rate, &self.name, latency.as_deref());
@@ -804,24 +802,15 @@ impl Live {
         }
     }
 
-    /// Acts on a key; true if the run should end.
-    fn key(
-        &mut self,
-        key: Key,
-        rate: u32,
-        handoff: &Handoff<Processor>,
-        controls: &Controls,
-    ) -> bool {
+    /// Acts on a key; true if the run should end. What it changes reaches
+    /// the audio through `sync`.
+    fn key(&mut self, key: Key, rate: u32) -> bool {
         match self.tuner.key(key, rate) {
-            Effect::None => false,
-            Effect::Apply => {
-                handoff.post(Processor::new(self.tuner.profile(), rate, 2));
-                false
-            }
-            Effect::Bypass(on) => {
-                controls.bypass.store(on, Relaxed);
-                false
-            }
+            Effect::None
+            | Effect::Apply
+            | Effect::Bypass(_)
+            | Effect::Listen
+            | Effect::Matching(_) => false,
             Effect::Save => {
                 self.save();
                 false
@@ -829,6 +818,20 @@ impl Live {
             Effect::SaveAndQuit => self.save(),
             Effect::Quit => true,
         }
+    }
+
+    /// Brings the audio in line with the tuner: a chain for each slot that
+    /// needs a new one, the slot heard, bypass and level matching.
+    fn sync(&mut self, rate: u32, handoff: &Handoff<Processor>, controls: &Controls) {
+        for (slot, profile) in self.tuner.chains(rate) {
+            match profile {
+                Some(profile) => handoff.post(slot, Processor::new(&profile, rate, 2)),
+                None => handoff.clear(slot),
+            }
+        }
+        controls.set_slot(self.tuner.slot());
+        controls.set_matching(self.tuner.matching());
+        controls.bypass.store(self.tuner.bypass(), Relaxed);
     }
 
     /// Saves the profile; false, with the reason on screen, if that failed.
@@ -886,6 +889,8 @@ impl Live {
             clamped: stats.clamped.load(Relaxed),
             dry_gain: controls.dry_gain(),
             contour: contour.as_deref(),
+            meters: controls.readings(),
+            trim: controls.trim_db(),
         };
         match screen.draw(&view) {
             Ok(()) => Ok(()),
@@ -895,65 +900,117 @@ impl Live {
     }
 }
 
-/// Passes a new chain to the audio callback, which may not lock, allocate or
-/// free: the callback takes it and later hands the old one back to be freed
-/// here.
+/// Passes new chains to the audio callback, which may not lock, allocate or
+/// free, in one lane for each of the tuner's two slots: the callback takes a
+/// slot's new chain, or word that the slot is to play the other slot's
+/// chain, and later hands the chain it replaced back to be freed here.
 struct Handoff<C> {
+    lanes: [Lane<C>; 2],
+    /// Main thread: set once it has brought this session in line with the
+    /// tuner.
+    synced: AtomicBool,
+}
+
+struct Lane<C> {
     pending: AtomicPtr<C>,
     retired: AtomicPtr<C>,
 }
 
+/// What the callback takes for a slot.
+enum Offer<C> {
+    Chain(Box<C>),
+    /// Play the other slot's chain.
+    Empty,
+}
+
+/// Its address stands for `Offer::Empty` in a lane; no chain is ever there.
+static EMPTY: u8 = 0;
+
 impl<C> Handoff<C> {
     fn new() -> Self {
-        Self {
+        let lane = || Lane {
             pending: AtomicPtr::new(ptr::null_mut()),
             retired: AtomicPtr::new(ptr::null_mut()),
+        };
+        Self {
+            lanes: [lane(), lane()],
+            synced: AtomicBool::new(false),
         }
     }
 
+    fn empty() -> *mut C {
+        (&raw const EMPTY).cast::<C>().cast_mut()
+    }
+
     fn free(chain: *mut C) {
-        if !chain.is_null() {
-            // SAFETY: every pointer stored here came from `Box::into_raw` in
-            // `post`, and the swap that produced `chain` took it out.
+        if !chain.is_null() && chain != Self::empty() {
+            // SAFETY: every other pointer stored here came from
+            // `Box::into_raw` in `post`, and the swap that produced `chain`
+            // took it out.
             drop(unsafe { Box::from_raw(chain) });
         }
     }
 
-    /// Main thread: offers `chain`, replacing one the callback has not taken.
-    fn post(&self, chain: C) {
-        Self::free(self.pending.swap(Box::into_raw(Box::new(chain)), AcqRel));
+    /// Main thread: offers `chain` for `slot`, replacing an offer for it the
+    /// callback has not taken.
+    fn post(&self, slot: usize, chain: C) {
+        self.offer(slot, Box::into_raw(Box::new(chain)));
     }
 
-    /// Main thread: frees the chain the callback handed back.
+    /// Main thread: asks `slot` to play the other slot's chain, replacing an
+    /// offer for it the callback has not taken.
+    fn clear(&self, slot: usize) {
+        self.offer(slot, Self::empty());
+    }
+
+    fn offer(&self, slot: usize, offer: *mut C) {
+        Self::free(self.lanes[slot].pending.swap(offer, AcqRel));
+    }
+
+    /// Main thread: frees the chains the callback handed back.
     fn collect(&self) {
-        Self::free(self.retired.swap(ptr::null_mut(), AcqRel));
+        for lane in &self.lanes {
+            Self::free(lane.retired.swap(ptr::null_mut(), AcqRel));
+        }
     }
 
-    /// Callback: takes the offered chain, if any. Each chain taken must be
-    /// followed by one `retire` before the next `take`.
-    fn take(&self) -> Option<Box<C>> {
+    /// Main thread: true the first time it is asked, as a new session's
+    /// handoff is.
+    fn first_sync(&self) -> bool {
+        !self.synced.swap(true, Relaxed)
+    }
+
+    /// Callback: takes the offer for `slot`, if any. Each offer taken may be
+    /// followed by one `retire` to that slot before its next `take`.
+    fn take(&self, slot: usize) -> Option<Offer<C>> {
+        let lane = &self.lanes[slot];
         // Wait while the last one handed back is uncollected, so the single
         // return slot is never overwritten.
-        if !self.retired.load(Acquire).is_null() {
+        if !lane.retired.load(Acquire).is_null() {
             return None;
         }
-        let offered = NonNull::new(self.pending.swap(ptr::null_mut(), AcqRel))?;
+        let offered = NonNull::new(lane.pending.swap(ptr::null_mut(), AcqRel))?;
+        if offered.as_ptr() == Self::empty() {
+            return Some(Offer::Empty);
+        }
         // SAFETY: from `Box::into_raw` in `post`, and the swap made this
         // thread its only holder.
-        Some(unsafe { Box::from_raw(offered.as_ptr()) })
+        Some(Offer::Chain(unsafe { Box::from_raw(offered.as_ptr()) }))
     }
 
-    /// Callback: hands a chain back for `collect` to free.
-    fn retire(&self, chain: Box<C>) {
-        let previous = self.retired.swap(Box::into_raw(chain), AcqRel);
+    /// Callback: hands `slot`'s old chain back for `collect` to free.
+    fn retire(&self, slot: usize, chain: Box<C>) {
+        let previous = self.lanes[slot].retired.swap(Box::into_raw(chain), AcqRel);
         debug_assert!(previous.is_null(), "a chain handed back was overwritten");
     }
 }
 
 impl<C> Drop for Handoff<C> {
     fn drop(&mut self) {
-        Self::free(*self.pending.get_mut());
-        Self::free(*self.retired.get_mut());
+        for lane in &mut self.lanes {
+            Self::free(*lane.pending.get_mut());
+            Self::free(*lane.retired.get_mut());
+        }
     }
 }
 
@@ -1648,6 +1705,11 @@ trait Chain {
     /// The system volume in dB below maximum, `None` when unknown. Called
     /// on the callback, so it may not allocate or free.
     fn set_volume_db(&mut self, _volume_db: Option<f32>) {}
+    /// The largest gain reductions since the last call, which starts them
+    /// over, and the leveler's gain now. No allocation.
+    fn meters(&mut self) -> dps::Meters {
+        dps::Meters::default()
+    }
 }
 
 impl Chain for Processor {
@@ -1665,6 +1727,10 @@ impl Chain for Processor {
 
     fn set_volume_db(&mut self, volume_db: Option<f32>) {
         Processor::set_volume_db(self, volume_db);
+    }
+
+    fn meters(&mut self) -> dps::Meters {
+        Processor::meters(self)
     }
 }
 
@@ -2275,20 +2341,20 @@ mod tests {
 
         let mut quieter = flat();
         quieter.output_gain_db = -20.0;
-        handoff.post(Processor::new(&quieter, 48_000, 2));
+        handoff.post(0, Processor::new(&quieter, 48_000, 2));
         let (first, last) = run(&mut engine);
         // The first frame is almost all the old chain, the last all the new.
         assert!((first - (0.5 - 0.45 / 1440.0)).abs() < 1e-6, "{first}");
         assert!((last - 0.05).abs() < 1e-6, "{last}");
-        assert!(handoff.pending.load(Relaxed).is_null());
-        assert!(!handoff.retired.load(Relaxed).is_null());
+        assert!(handoff.lanes[0].pending.load(Relaxed).is_null());
+        assert!(!handoff.lanes[0].retired.load(Relaxed).is_null());
 
         // Until the old chain is collected the next one waits.
-        handoff.post(Processor::new(&flat(), 48_000, 2));
+        handoff.post(0, Processor::new(&flat(), 48_000, 2));
         let (first, last) = run(&mut engine);
         assert!((first - 0.05).abs() < 1e-6 && (last - 0.05).abs() < 1e-6);
         handoff.collect();
-        assert!(handoff.retired.load(Relaxed).is_null());
+        assert!(handoff.lanes[0].retired.load(Relaxed).is_null());
         let (first, last) = run(&mut engine);
         assert!((first - (0.05 + 0.45 / 1440.0)).abs() < 1e-6, "{first}");
         assert_eq!(last, 0.5);
@@ -2342,25 +2408,37 @@ mod tests {
         let handoff = Handoff::new();
         let mut current = Box::new(chain());
         let mut swap_in = |handoff: &Handoff<Counted>| {
-            let taken = handoff.take().unwrap();
-            handoff.retire(std::mem::replace(&mut current, taken));
+            let Some(Offer::Chain(taken)) = handoff.take(0) else {
+                panic!("no chain offered");
+            };
+            handoff.retire(0, std::mem::replace(&mut current, taken));
         };
 
-        handoff.post(chain());
-        handoff.post(chain()); // replaces the untaken one
+        handoff.post(0, chain());
+        handoff.post(0, chain()); // replaces the untaken one
         assert_eq!(drops.load(Relaxed), 1);
         swap_in(&handoff);
         handoff.collect();
         assert_eq!(drops.load(Relaxed), 2);
-        handoff.post(chain());
+        handoff.post(0, chain());
         swap_in(&handoff);
-        handoff.post(chain());
+        handoff.post(0, chain());
         // Nothing more is taken until the one handed back is collected.
-        assert!(handoff.take().is_none());
-        drop(handoff); // one pending, one handed back
-        assert_eq!(drops.load(Relaxed), 4);
+        assert!(handoff.take(0).is_none());
+        // The other lane is its own: a chain posted there, then replaced by
+        // word to play the other's chain, which frees it; and asking twice
+        // frees nothing.
+        handoff.post(1, chain());
+        handoff.clear(1);
+        assert_eq!(drops.load(Relaxed), 3);
+        assert!(matches!(handoff.take(1), Some(Offer::Empty)));
+        handoff.clear(1);
+        handoff.clear(1);
+        handoff.post(1, chain());
+        drop(handoff); // one pending in each lane, one handed back
+        assert_eq!(drops.load(Relaxed), 6);
         drop(current);
-        assert_eq!(drops.load(Relaxed), 5);
+        assert_eq!(drops.load(Relaxed), 7);
     }
 
     #[test]
@@ -2524,6 +2602,14 @@ mod tests {
             .unwrap();
     }
 
+    /// The chain in what the callback would take, if it is one.
+    fn chain(offer: Option<Offer<Processor>>) -> Option<Processor> {
+        match offer? {
+            Offer::Chain(chain) => Some(*chain),
+            Offer::Empty => panic!("asked to play the other slot's chain"),
+        }
+    }
+
     /// Whether `chain` processes like a new chain for `profile`.
     fn plays(mut chain: Processor, profile: &Profile) -> bool {
         let input: Vec<f32> = (0..4000).map(|i| (i as f32 * 0.013).sin() * 0.7).collect();
@@ -2542,7 +2628,7 @@ mod tests {
         for _ in 0..6 {
             assert!(!live.step(Some(Key::Down), 48_000, &handoff, &controls));
         }
-        assert!(handoff.take().is_none());
+        assert!(handoff.take(0).is_none() && handoff.take(1).is_none());
         assert!(!live.step(Some(Key::Right), 48_000, &handoff, &controls));
         let want = Profile {
             input_gain_db: 0.5,
@@ -2550,11 +2636,18 @@ mod tests {
             ..Profile::default()
         };
         assert_eq!(live.tuner.profile(), &want);
-        assert!(plays(*handoff.take().unwrap(), &want));
+        assert!(plays(chain(handoff.take(0)).unwrap(), &want));
+        // B, still as saved, now differs from A, so it gets its own chain
+        // to be compared with.
+        let saved = Profile {
+            output_gain_db: -3.0,
+            ..Profile::default()
+        };
+        assert!(plays(chain(handoff.take(1)).unwrap(), &saved));
         // Bypass goes to the callback's controls, with no new chain.
         assert!(!live.step(Some(Key::Char('b')), 48_000, &handoff, &controls));
         assert!(controls.bypass.load(Relaxed));
-        assert!(handoff.take().is_none());
+        assert!(handoff.take(0).is_none() && handoff.take(1).is_none());
         // Saving writes the file and takes that save as seen, so it is not
         // reloaded as if someone else had written it.
         assert!(!live.step(Some(Key::Char('s')), 48_000, &handoff, &controls));
@@ -2562,7 +2655,7 @@ mod tests {
         let saved = live.tuner.message().to_owned();
         assert!(saved.starts_with("saved: rewrote "), "{saved}");
         assert!(!live.step(None, 48_000, &handoff, &controls));
-        assert!(handoff.take().is_none());
+        assert!(handoff.take(0).is_none() && handoff.take(1).is_none());
         assert_eq!(live.tuner.message(), saved);
         // Nothing unsaved: q quits.
         assert!(live.step(Some(Key::Char('q')), 48_000, &handoff, &controls));
@@ -2577,7 +2670,7 @@ mod tests {
         let (handoff, controls) = (Handoff::new(), Controls::default());
         let press = |live: &mut Live, key| {
             assert!(!live.step(Some(key), 48_000, &handoff, &controls));
-            handoff.take()
+            handoff.take(0)
         };
         // Down to the fourth band, then Tab to its frequency: no new chain.
         for _ in 0..22 {
@@ -2585,18 +2678,21 @@ mod tests {
         }
         assert!(press(&mut live, Key::Tab).is_none());
         // 199 Hz a sixth of an octave up is 223 Hz.
-        let chain = press(&mut live, Key::Right).expect("a new chain");
+        let new = chain(press(&mut live, Key::Right)).expect("a new chain");
         let mut want = original.clone();
         want.eq.freqs_hz[3] = 223.0;
         assert_eq!(live.tuner.profile(), &want);
-        assert!(plays(*chain, &want));
+        assert!(plays(new, &want));
         assert!(!plays(Processor::new(&original, 48_000, 2), &want));
-        // Nothing more is posted until the next change.
+        // B keeps the saved settings, on a chain of its own.
+        assert!(plays(chain(handoff.take(1)).unwrap(), &original));
+        // Nothing more is posted until the next change, and only for A.
         assert!(press(&mut live, Key::Tab).is_none());
-        let chain = press(&mut live, Key::ShiftLeft).expect("a new chain");
+        let new = chain(press(&mut live, Key::ShiftLeft)).expect("a new chain");
         want.eq.q[3] = 1.48;
         assert_eq!(live.tuner.profile(), &want);
-        assert!(plays(*chain, &want));
+        assert!(plays(new, &want));
+        assert!(handoff.take(1).is_none());
         // A refused step posts nothing: Q cannot go above 20.
         for _ in 0..30 {
             press(&mut live, Key::Right);
@@ -2608,20 +2704,91 @@ mod tests {
             press(&mut live, Key::Left);
         }
         assert_eq!(live.tuner.profile().eq.q[3], 0.111);
-        let chain = press(&mut live, Key::Char('r')).expect("the saved settings again");
-        assert!(plays(*chain, &original));
+        // Back to the saved settings, which B's chain has played all along:
+        // A plays that one rather than a new one.
+        let reverted = press(&mut live, Key::Char('r'));
+        assert!(matches!(reverted, Some(Offer::Empty)));
+        assert!(handoff.take(1).is_none());
         assert_eq!(live.tuner.profile(), &original);
         // Saved, the file reads back as the edited profile.
         assert!(press(&mut live, Key::BackTab).is_none());
-        let chain = press(&mut live, Key::ShiftRight).expect("a new chain");
+        let new = chain(press(&mut live, Key::ShiftRight)).expect("a new chain");
         let mut want = original.clone();
         want.eq.freqs_hz[3] = 201.0;
-        assert!(plays(*chain, &want));
+        assert!(plays(new, &want));
         assert!(press(&mut live, Key::Char('s')).is_none());
         assert_eq!(super::super::load_profile(&path).unwrap(), want);
         assert!(fs::read_to_string(&path).unwrap().contains(
             "freqs_hz = [30.0, 56.4, 106.0, 201.0, 375.0, 705.0, 1327.0, 2497.0, 4698.0, 8839.0, 16000.0]"
         ));
+    }
+
+    #[test]
+    fn a_b_keys_reach_the_slots_lanes_and_the_callbacks_controls() {
+        let dir = Scratch::new("ab");
+        let (mut live, _) = live_in(&dir, "output_gain_db = -3.0\n", None);
+        let saved = live.tuner.profile().clone();
+        let (handoff, controls) = (Handoff::new(), Controls::default());
+        let press = |live: &mut Live, key, handoff: &Handoff<Processor>, controls: &Controls| {
+            assert!(!live.step(Some(key), 48_000, handoff, controls));
+        };
+        let quiet =
+            |handoff: &Handoff<Processor>| handoff.take(0).is_none() && handoff.take(1).is_none();
+        // p loads a preset into A, the slot heard; B keeps the saved
+        // settings, now on a chain of its own.
+        press(&mut live, Key::Char('p'), &handoff, &controls);
+        let preset = crate::presets::PRESETS[0].profile();
+        assert_eq!(live.tuner.profile(), &preset);
+        assert!(plays(chain(handoff.take(0)).unwrap(), &preset));
+        assert!(plays(chain(handoff.take(1)).unwrap(), &saved));
+        assert_eq!(controls.slot(), 0);
+        // a switches the callback to B, with no new chain.
+        press(&mut live, Key::Char('a'), &handoff, &controls);
+        assert_eq!(controls.slot(), 1);
+        assert!(quiet(&handoff));
+        // An edit in B goes to B's lane alone.
+        for _ in 0..6 {
+            press(&mut live, Key::Down, &handoff, &controls);
+        }
+        press(&mut live, Key::Right, &handoff, &controls);
+        let edited = Profile {
+            input_gain_db: 0.5,
+            ..saved.clone()
+        };
+        assert!(plays(chain(handoff.take(1)).unwrap(), &edited));
+        assert!(handoff.take(0).is_none());
+        // m turns matching off; a blind test turns it back on and bypass
+        // off, and its draws pick the slot heard.
+        assert!(controls.matching());
+        press(&mut live, Key::Char('m'), &handoff, &controls);
+        assert!(!controls.matching());
+        press(&mut live, Key::Char('b'), &handoff, &controls);
+        press(&mut live, Key::Char('x'), &handoff, &controls);
+        assert!(controls.matching() && !controls.bypass.load(Relaxed));
+        for vote in ['1', '2', '1', '2', '1', '2'] {
+            press(&mut live, Key::Char(vote), &handoff, &controls);
+            assert_eq!(controls.slot(), live.tuner.slot());
+        }
+        press(&mut live, Key::Char('x'), &handoff, &controls);
+        assert!(!controls.matching());
+        assert_eq!(controls.slot(), 1);
+        assert!(quiet(&handoff));
+        // A new session starts with the heard slot's chain alone: A's comes
+        // through the new handoff.
+        let (handoff, controls) = (Handoff::new(), Controls::default());
+        live.step(None, 48_000, &handoff, &controls);
+        assert!(plays(chain(handoff.take(0)).unwrap(), &preset));
+        assert!(handoff.take(1).is_none());
+        assert_eq!(controls.slot(), 1);
+        assert!(!controls.matching());
+        // c copies B to A, which then plays B's chain.
+        press(&mut live, Key::Char('c'), &handoff, &controls);
+        assert_eq!(live.tuner.message(), "copied B to A");
+        assert!(matches!(handoff.take(0), Some(Offer::Empty)));
+        assert!(handoff.take(1).is_none());
+        press(&mut live, Key::Char('a'), &handoff, &controls);
+        assert_eq!(controls.slot(), 0);
+        assert!(quiet(&handoff));
     }
 
     #[test]
@@ -2636,19 +2803,19 @@ mod tests {
             output_gain_db: -6.0,
             ..Profile::default()
         };
-        assert!(plays(*handoff.take().unwrap(), &six_down));
+        assert!(plays(chain(handoff.take(0)).unwrap(), &six_down));
         assert_eq!(live.tuner.message(), "reloaded settings.toml");
         assert_eq!(reports.take(), ["reloaded"]);
         // The same settings saved again: said, but the chain is left alone.
         stamp(&path, "output_gain_db = -6.0 # again\n", 2);
         live.tuner.set_message(String::new());
         live.step(None, 48_000, &handoff, &controls);
-        assert!(handoff.take().is_none());
+        assert!(handoff.take(0).is_none() && handoff.take(1).is_none());
         assert_eq!(live.tuner.message(), "reloaded settings.toml");
         // A save that does not load is said and changes nothing.
         stamp(&path, "output_gain_db = \"loud\"\n", 3);
         live.step(None, 48_000, &handoff, &controls);
-        assert!(handoff.take().is_none());
+        assert!(handoff.take(0).is_none() && handoff.take(1).is_none());
         let message = live.tuner.message().to_owned();
         assert!(message.starts_with("profile not reloaded: "), "{message}");
         assert_eq!(
@@ -2659,7 +2826,7 @@ mod tests {
         // An empty file, as an editor leaves it mid-save, is not reloaded.
         stamp(&path, "", 4);
         live.step(None, 48_000, &handoff, &controls);
-        assert!(handoff.take().is_none());
+        assert!(handoff.take(0).is_none() && handoff.take(1).is_none());
         assert_eq!(live.tuner.profile(), &six_down);
         assert!(reports.take().is_empty());
     }
@@ -2772,9 +2939,10 @@ mod tests {
         assert_ne!(edited, gain(-6.0));
         assert_eq!(super::super::load_profile(&settings).unwrap(), gain(-3.0));
         stamp(&phones, "output_gain_db = -9.0\n", 5);
-        handoff.take();
+        handoff.take(0);
+        handoff.take(1);
         live.step(None, 48_000, &handoff, &controls);
-        assert!(plays(*handoff.take().unwrap(), &gain(-9.0)));
+        assert!(plays(chain(handoff.take(0)).unwrap(), &gain(-9.0)));
 
         // Back on the speakers, with an unsaved edit to the phones' profile.
         live.step(Some(Key::Right), 48_000, &handoff, &controls);
@@ -2854,11 +3022,11 @@ mod tests {
         let (handoff, controls) = (Handoff::new(), Controls::default());
         assert_eq!(live.follow("phones", "Phones", None), None);
         live.step(None, 48_000, &handoff, &controls);
-        assert!(handoff.take().is_none());
+        assert!(handoff.take(0).is_none());
 
         stamp(&config, PHONES, 1);
         live.step(None, 48_000, &handoff, &controls);
-        assert!(plays(*handoff.take().unwrap(), &gain(-6.0)));
+        assert!(plays(chain(handoff.take(0)).unwrap(), &gain(-6.0)));
         assert_eq!(
             live.tuner.message(),
             format!("Phones now plays with {}", phones.display())
@@ -2880,7 +3048,7 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("profil"), "{message}");
-        assert!(handoff.take().is_none());
+        assert!(handoff.take(0).is_none());
         live.tuner.set_message(String::new());
         live.step(None, 48_000, &handoff, &controls);
         assert_eq!(live.tuner.message(), "");
@@ -2890,11 +3058,11 @@ mod tests {
         // the device alone is only said.
         stamp(&config, "exclude = []\n", 3);
         live.step(None, 48_000, &handoff, &controls);
-        assert!(plays(*handoff.take().unwrap(), &gain(-3.0)));
+        assert!(plays(chain(handoff.take(0)).unwrap(), &gain(-3.0)));
         assert_eq!(live.save_path, settings);
         stamp(&config, "exclude = [\"x\"]\n", 4);
         live.step(None, 48_000, &handoff, &controls);
-        assert!(handoff.take().is_none());
+        assert!(handoff.take(0).is_none());
         assert_eq!(
             live.tuner.message(),
             format!("reloaded {}", config.display())

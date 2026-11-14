@@ -1,15 +1,23 @@
-//! The keyboard tuner's model: the settings it lists, what each key does to
-//! the profile, and whether the profile differs from what was last saved or
-//! loaded. Nothing here touches the terminal; `save` is the only I/O.
+//! The keyboard tuner's model: the settings it lists, its two slots of
+//! settings, A and B, what each key does to them, whether each differs from
+//! what was last saved or loaded, the blind test between them, and which
+//! chains the audio needs to play them. Nothing here touches the terminal;
+//! `save` is the only I/O.
 
 use std::ffi::OsString;
 use std::fs::{self, File};
+use std::hash::{BuildHasher, RandomState};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use dps::Profile;
 use dps::profile::EQ_BANDS;
+
+use crate::presets::PRESETS;
+
+/// The slots' names, by index.
+pub const SLOTS: [char; 2] = ['A', 'B'];
 
 /// Which compressor a dynamics setting belongs to.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -571,6 +579,21 @@ pub enum Action {
     PreviousField,
     Toggle,
     Bypass,
+    /// Show or hide the response curve.
+    Graph,
+    /// Hear and edit the other slot; in a blind test, hear the other of X
+    /// and Y.
+    Switch,
+    /// Copy the slot into the other.
+    Copy,
+    /// Load the next built-in preset into the slot.
+    Preset,
+    /// Turn level matching on or off.
+    Matching,
+    /// Start or end a blind test.
+    Blind,
+    /// In a blind test, prefer X (0) or Y (1).
+    Vote(usize),
     Save,
     Revert,
     Quit,
@@ -584,9 +607,12 @@ pub enum Action {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Effect {
     None,
-    /// Play the changed profile.
+    /// Play the changed profiles.
     Apply,
     Bypass(bool),
+    /// Hear another slot, with bypass and matching as `Tuner` has them.
+    Listen,
+    Matching(bool),
     Save,
     SaveAndQuit,
     Quit,
@@ -622,8 +648,30 @@ impl Row {
     }
 }
 
+/// A blind test under way.
+struct Blind {
+    /// The slot named X; Y is the other.
+    x: usize,
+    /// The slot heard before the test, heard again after it.
+    was: usize,
+    /// The votes for A and for B.
+    votes: [u32; 2],
+}
+
+/// What a blind test shows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Trial {
+    /// 'X' or 'Y'.
+    pub playing: char,
+    /// From 1.
+    pub number: u32,
+}
+
 pub struct Tuner {
-    profile: Profile,
+    /// The profiles of slots A and B.
+    slots: [Profile; 2],
+    /// The slot heard, and outside a blind test the one edited.
+    current: usize,
     /// What was last saved or loaded.
     saved: Profile,
     settings: Vec<Setting>,
@@ -631,6 +679,8 @@ pub struct Tuner {
     /// The field of whichever EQ band is selected that Left and Right change.
     field: Field,
     bypass: bool,
+    /// The response curve is shown.
+    graph: bool,
     /// Asking whether to save before quitting; the question is drawn from
     /// this, not kept in `message`.
     quitting: bool,
@@ -640,17 +690,34 @@ pub struct Tuner {
     transient: bool,
     /// Where `s` saves, as shown to the user.
     save_to: String,
+    /// The louder slot is turned down to the quieter one's loudness.
+    matching: bool,
+    /// The next preset `p` loads, counting on through `PRESETS`.
+    preset: usize,
+    blind: Option<Blind>,
+    /// The state of the generator that draws a blind test's order.
+    seed: u64,
+    /// The profile each slot's chain in the audio was last built from;
+    /// `None` for a slot playing the other slot's chain.
+    given: [Option<Profile>; 2],
 }
 
 impl Tuner {
     pub fn new(profile: Profile, save_to: String) -> Self {
         Self {
             saved: profile.clone(),
-            profile,
+            given: [Some(profile.clone()), None],
+            slots: [profile.clone(), profile],
+            current: 0,
+            matching: true,
+            preset: 0,
+            blind: None,
+            seed: RandomState::new().hash_one(0u8) | 1,
             settings: Setting::all(),
             selected: 0,
             field: Field::Gain,
             bypass: false,
+            graph: false,
             quitting: false,
             message: String::new(),
             transient: false,
@@ -658,16 +725,58 @@ impl Tuner {
         }
     }
 
+    /// The heard slot's profile.
     pub fn profile(&self) -> &Profile {
-        &self.profile
+        &self.slots[self.current]
     }
 
+    /// Whether the heard slot differs from what was last saved or loaded.
     pub fn dirty(&self) -> bool {
-        self.profile != self.saved
+        self.differs(self.current)
+    }
+
+    /// Whether slot `slot` differs from what was last saved or loaded.
+    pub fn differs(&self, slot: usize) -> bool {
+        self.slots[slot] != self.saved
+    }
+
+    /// The slot heard: 0 for A, 1 for B.
+    pub fn slot(&self) -> usize {
+        self.current
+    }
+
+    /// Whether the slots hold different profiles.
+    pub fn compared(&self) -> bool {
+        self.slots[0] != self.slots[1]
+    }
+
+    /// Whether the louder slot is turned down; always during a blind test.
+    pub fn matching(&self) -> bool {
+        self.matching || self.blind.is_some()
+    }
+
+    /// The blind test under way, if one is.
+    pub fn trial(&self) -> Option<Trial> {
+        self.blind.as_ref().map(|b| Trial {
+            playing: if self.current == b.x { 'X' } else { 'Y' },
+            number: b.votes.iter().sum::<u32>() + 1,
+        })
     }
 
     pub fn bypass(&self) -> bool {
         self.bypass
+    }
+
+    pub fn graph(&self) -> bool {
+        self.graph
+    }
+
+    /// The EQ band selected, if one is.
+    pub fn selected_band(&self) -> Option<usize> {
+        match self.settings[self.selected] {
+            Setting::Band(i) => Some(i),
+            _ => None,
+        }
     }
 
     pub fn message(&self) -> &str {
@@ -676,8 +785,12 @@ impl Tuner {
 
     /// The question awaiting an answer, if any.
     pub fn prompt(&self) -> Option<String> {
-        self.quitting
-            .then(|| format!("save changes to {}? y/n (Esc cancels)", self.save_to))
+        self.quitting.then(|| {
+            format!(
+                "save changes in {} to {}? y/n (Esc cancels)",
+                SLOTS[self.current], self.save_to
+            )
+        })
     }
 
     pub fn set_message(&mut self, message: String) {
@@ -690,30 +803,88 @@ impl Tuner {
         self.save_to = save_to;
     }
 
-    /// Records that the profile was saved.
+    /// Records that the heard slot's profile was saved.
     pub fn saved(&mut self) {
-        self.saved = self.profile.clone();
+        self.saved = self.profile().clone();
         self.set_message(format!(
             "saved: rewrote {} (comments are not kept)",
             self.save_to
         ));
     }
 
-    /// Replaces the profile with one loaded from disk; true if that threw
-    /// away unsaved changes. With nothing left to save, a question about
-    /// saving them is dropped.
+    /// Takes `profile` as the saved one, loaded from disk, and puts it in
+    /// both slots, ending a blind test; true if that threw away unsaved
+    /// changes. With nothing left to save, a question about saving them is
+    /// dropped.
     pub fn reload(&mut self, profile: Profile) -> bool {
-        let edited = self.dirty();
+        let edited = self.differs(0) || self.differs(1);
         self.saved = profile.clone();
-        self.profile = profile;
+        self.slots = [profile.clone(), profile];
+        if let Some(blind) = self.blind.take() {
+            self.current = blind.was;
+        }
         self.quitting = false;
         edited
     }
 
+    /// Takes it that the audio restarted with one chain, in the heard slot,
+    /// built from its profile.
+    pub fn restarted(&mut self) {
+        self.given = [None, None];
+        self.given[self.current] = Some(self.profile().clone());
+    }
+
+    /// What the audio needs to play the slots as they are, at `rate`: for
+    /// each slot whose chain must change, the profile to build its new one
+    /// from, or `None` to have it play the other slot's chain. Takes them
+    /// as given.
+    ///
+    /// While the slots are the same, one chain plays both, kept in a slot
+    /// already playing it where there is one. A slot that does not fit
+    /// `rate`, as can happen after a change of device, takes the heard
+    /// one's profile instead.
+    pub fn chains(&mut self, rate: u32) -> Vec<(usize, Option<Profile>)> {
+        let other = 1 - self.current;
+        if let Err(e) = self.slots[other].validate(rate) {
+            self.slots[other] = self.profile().clone();
+            self.set_message(format!(
+                "{} does not fit {rate} Hz ({e}), so it now holds {}'s settings",
+                SLOTS[other], SLOTS[self.current]
+            ));
+        }
+        let mut changes = Vec::new();
+        if self.compared() {
+            for s in 0..2 {
+                if self.given[s].as_ref() != Some(&self.slots[s]) {
+                    changes.push((s, Some(self.slots[s].clone())));
+                }
+            }
+        } else {
+            let profile = &self.slots[0];
+            let order = [self.current, other];
+            let keep = order
+                .into_iter()
+                .find(|&s| self.given[s].as_ref() == Some(profile))
+                .or_else(|| order.into_iter().find(|&s| self.given[s].is_some()))
+                .unwrap_or(self.current);
+            if self.given[keep].as_ref() != Some(profile) {
+                changes.push((keep, Some(profile.clone())));
+            }
+            // After the chain it is to play, so that one is never missing.
+            if self.given[1 - keep].is_some() {
+                changes.push((1 - keep, None));
+            }
+        }
+        for (s, profile) in &changes {
+            self.given[*s] = profile.clone();
+        }
+        changes
+    }
+
     /// The settings list, with the EQ bands the chain skips at `rate` marked.
     pub fn rows(&self, rate: u32) -> Vec<Row> {
-        let mut scratch = self.profile.clone();
-        let skipped = self.profile.skipped_eq_bands(rate);
+        let mut scratch = self.profile().clone();
+        let skipped = self.profile().skipped_eq_bands(rate);
         let mut rows = Vec::new();
         let mut group = "";
         for (i, &setting) in self.settings.iter().enumerate() {
@@ -765,6 +936,18 @@ impl Tuner {
                 _ => None,
             };
         }
+        // A blind test takes only its own keys: nothing it could reveal
+        // the slots by, and no editing.
+        if self.blind.is_some() {
+            return match key {
+                Key::CtrlC | Key::Char('q') => Some(Action::Quit),
+                Key::Char('a') | Key::Tab => Some(Action::Switch),
+                Key::Char('1') => Some(Action::Vote(0)),
+                Key::Char('2') => Some(Action::Vote(1)),
+                Key::Char('x') | Key::Esc => Some(Action::Blind),
+                _ => None,
+            };
+        }
         let step = |up, fine| Action::Step { up, fine };
         Some(match key {
             Key::CtrlC | Key::Char('q') => Action::Quit,
@@ -778,6 +961,12 @@ impl Tuner {
             Key::BackTab => Action::PreviousField,
             Key::Char(' ') => Action::Toggle,
             Key::Char('b') => Action::Bypass,
+            Key::Char('g') => Action::Graph,
+            Key::Char('a') => Action::Switch,
+            Key::Char('c') => Action::Copy,
+            Key::Char('p') => Action::Preset,
+            Key::Char('m') => Action::Matching,
+            Key::Char('x') => Action::Blind,
             Key::Char('s') => Action::Save,
             Key::Char('r') => Action::Revert,
             _ => return None,
@@ -796,7 +985,7 @@ impl Tuner {
                 Effect::None
             }
             Action::Step { up, fine } => {
-                let mut candidate = self.profile.clone();
+                let mut candidate = self.profile().clone();
                 if let Some(on) = setting.switch(&mut candidate) {
                     *on = !*on;
                 } else if let Some(value) = setting.number(self.field, &mut candidate) {
@@ -814,7 +1003,7 @@ impl Tuner {
                 let effect = self.offer(candidate, rate);
                 if let Setting::Band(i) = setting
                     && effect == Effect::Apply
-                    && self.profile.skipped_eq_bands(rate).contains(&i)
+                    && self.profile().skipped_eq_bands(rate).contains(&i)
                 {
                     self.message = format!(
                         "this band is skipped at {rate} Hz: a band's centre and bandwidth \
@@ -832,7 +1021,7 @@ impl Tuner {
                 Effect::None
             }
             Action::Toggle => {
-                let mut candidate = self.profile.clone();
+                let mut candidate = self.profile().clone();
                 match setting.switch(&mut candidate) {
                     Some(on) => {
                         *on = !*on;
@@ -844,6 +1033,90 @@ impl Tuner {
             Action::Bypass => {
                 self.bypass = !self.bypass;
                 Effect::Bypass(self.bypass)
+            }
+            Action::Graph => {
+                self.graph = !self.graph;
+                Effect::None
+            }
+            Action::Switch => {
+                self.current = 1 - self.current;
+                Effect::Listen
+            }
+            Action::Copy => {
+                let (from, to) = (self.current, 1 - self.current);
+                let names = (SLOTS[from], SLOTS[to]);
+                if !self.compared() {
+                    self.set_message(format!("{} and {} are already the same", names.0, names.1));
+                    return Effect::None;
+                }
+                self.slots[to] = self.slots[from].clone();
+                self.set_message(format!("copied {} to {}", names.0, names.1));
+                Effect::Apply
+            }
+            Action::Preset => {
+                let preset = &PRESETS[self.preset % PRESETS.len()];
+                self.preset += 1;
+                let (name, slot) = (preset.name, SLOTS[self.current]);
+                let candidate = preset.profile();
+                if candidate == *self.profile() {
+                    self.set_message(format!("{slot} already holds preset {name}"));
+                    return Effect::None;
+                }
+                let effect = self.offer(candidate, rate);
+                if effect == Effect::Apply {
+                    self.set_message(format!("preset {name} in {slot}, not saved"));
+                }
+                effect
+            }
+            Action::Matching => {
+                self.matching = !self.matching;
+                let on = if self.matching { "on" } else { "off" };
+                self.set_message(format!("level matching {on}"));
+                Effect::Matching(self.matching)
+            }
+            Action::Blind if self.blind.is_some() => {
+                self.end_blind();
+                Effect::Listen
+            }
+            Action::Blind if !self.compared() => {
+                self.set_message(
+                    "A and B are the same: change one, or load a preset into one with p, to \
+                     compare them blind"
+                        .into(),
+                );
+                Effect::None
+            }
+            Action::Blind => {
+                let x = self.draw();
+                self.blind = Some(Blind {
+                    x,
+                    was: self.current,
+                    votes: [0; 2],
+                });
+                self.current = x;
+                self.bypass = false;
+                self.set_message(
+                    "blind test: X and Y are A and B in a hidden order, level matched; \
+                     listen to both, then vote for the one you prefer"
+                        .into(),
+                );
+                Effect::Listen
+            }
+            Action::Vote(choice) => {
+                let x = self.draw();
+                let Some(blind) = &mut self.blind else {
+                    return Effect::None;
+                };
+                let preferred = if choice == 0 { blind.x } else { 1 - blind.x };
+                blind.votes[preferred] += 1;
+                blind.x = x;
+                self.current = x;
+                let trial = blind.votes.iter().sum::<u32>() + 1;
+                let name = ['X', 'Y'][choice.min(1)];
+                self.set_message(format!(
+                    "voted for {name}; trial {trial}: X and Y drawn again"
+                ));
+                Effect::Listen
             }
             Action::Save => Effect::Save,
             Action::Revert if !self.dirty() => {
@@ -857,12 +1130,22 @@ impl Tuner {
                 }
                 effect
             }
-            Action::Quit if self.dirty() => {
+            Action::Quit => {
+                // A blind test ends first, and its tally stays up above the
+                // question.
+                let blind = self.blind.is_some();
+                self.end_blind();
+                if !self.dirty() {
+                    return Effect::Quit;
+                }
                 self.quitting = true;
+                if blind {
+                    return Effect::Listen;
+                }
                 self.set_message(String::new());
                 Effect::None
             }
-            Action::Quit | Action::No => Effect::Quit,
+            Action::No => Effect::Quit,
             Action::Yes => {
                 self.quitting = false;
                 Effect::SaveAndQuit
@@ -879,7 +1162,7 @@ impl Tuner {
     fn offer(&mut self, candidate: Profile, rate: u32) -> Effect {
         match candidate.validate(rate) {
             Ok(()) => {
-                self.profile = candidate;
+                self.slots[self.current] = candidate;
                 if self.transient {
                     self.set_message(String::new());
                 }
@@ -894,6 +1177,71 @@ impl Tuner {
         self.transient = true;
         Effect::None
     }
+
+    /// A slot drawn at random (xorshift64*).
+    fn draw(&mut self) -> usize {
+        self.seed ^= self.seed >> 12;
+        self.seed ^= self.seed << 25;
+        self.seed ^= self.seed >> 27;
+        (self.seed.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 63) as usize
+    }
+
+    /// Ends a blind test, if one is under way, going back to the slot heard
+    /// before it and saying how the votes fell.
+    fn end_blind(&mut self) {
+        if let Some(blind) = self.blind.take() {
+            self.current = blind.was;
+            self.set_message(tally(blind.votes));
+        }
+    }
+}
+
+/// How a blind test's votes for A and B fell, and whether a split like it
+/// could come from chance alone.
+fn tally([a, b]: [u32; 2]) -> String {
+    let n = a + b;
+    if n == 0 {
+        return "blind test ended with no votes".into();
+    }
+    if a == b {
+        return format!(
+            "blind: A and B preferred {a} times each in {n} trials — no preference shown"
+        );
+    }
+    let (winner, k, loser) = if a > b { ('A', a, 'B') } else { ('B', b, 'A') };
+    let chance = lopsided(k, n);
+    let verdict = if chance > 0.1 {
+        "could be chance"
+    } else {
+        "likely a real preference"
+    };
+    let percent = 100.0 * chance;
+    let percent = if percent >= 10.0 {
+        format!("{percent:.0} %")
+    } else {
+        format!("{percent:.1} %")
+    };
+    format!(
+        "blind: {winner} preferred {k} of {n}, {loser} {} — {verdict}: with no preference, a \
+         split at least this lopsided comes up {percent} of the time",
+        n - k
+    )
+}
+
+/// The chance that `n` fair coin tosses split at least as unevenly as `k`
+/// to `n - k`, either way round (`k` at least half of `n`).
+fn lopsided(k: u32, n: u32) -> f64 {
+    // C(n, i) from i = 0 up, multiplied before it is divided so that it
+    // stays a whole number, exact as far as f64 holds one.
+    let mut ways = 1.0;
+    let mut tail = 0.0;
+    for i in 0..=n {
+        if i >= k {
+            tail += ways;
+        }
+        ways = ways * f64::from(n - i) / f64::from(i + 1);
+    }
+    (2.0 * tail / 2f64.powi(n as i32)).min(1.0)
 }
 
 /// Writes `profile` to `path` as TOML, replacing the whole file.
@@ -1408,6 +1756,376 @@ mod tests {
     }
 
     #[test]
+    fn g_shows_and_hides_the_curve_and_the_selected_band_is_known() {
+        let mut t = tuner();
+        assert!(!t.graph());
+        assert_eq!(press(&mut t, Key::Char('g')), Effect::None);
+        assert!(t.graph());
+        assert_eq!(t.selected_band(), None);
+        select(&mut t, Setting::Band(3));
+        assert_eq!(t.selected_band(), Some(3));
+        press(&mut t, Key::Down);
+        assert_eq!(t.selected_band(), Some(4));
+        assert_eq!(press(&mut t, Key::Char('g')), Effect::None);
+        assert!(!t.graph());
+        assert!(!t.dirty());
+    }
+
+    /// A profile 1 dB louder than `tuner()`'s.
+    fn louder() -> Profile {
+        Profile {
+            output_gain_db: Profile::default().output_gain_db + 1.0,
+            ..Profile::default()
+        }
+    }
+
+    #[test]
+    fn a_switches_the_slot_heard_and_edited() {
+        let mut t = tuner();
+        select(&mut t, Setting::InputGain);
+        assert_eq!(t.slot(), 0);
+        assert!(!t.compared());
+        press(&mut t, Key::Right);
+        assert!(t.compared() && t.differs(0) && !t.differs(1));
+        // B is still the saved profile, and the keys now edit it.
+        assert_eq!(press(&mut t, Key::Char('a')), Effect::Listen);
+        assert_eq!(t.slot(), 1);
+        assert_eq!(t.profile(), &Profile::default());
+        assert!(!t.dirty());
+        press(&mut t, Key::Left);
+        assert_eq!(t.profile().input_gain_db, -0.5);
+        assert!(t.dirty());
+        assert_eq!(press(&mut t, Key::Char('a')), Effect::Listen);
+        assert_eq!(t.profile().input_gain_db, 0.5);
+        // The selection and the band field are the tuner's, not a slot's.
+        assert_eq!(selected(&t).0, "input gain");
+    }
+
+    #[test]
+    fn c_copies_the_slot_into_the_other() {
+        let mut t = tuner();
+        assert_eq!(press(&mut t, Key::Char('c')), Effect::None);
+        assert_eq!(t.message(), "A and B are already the same");
+        select(&mut t, Setting::OutputGain);
+        press(&mut t, Key::Right);
+        assert_eq!(press(&mut t, Key::Char('c')), Effect::Apply);
+        assert_eq!(t.message(), "copied A to B");
+        assert!(!t.compared());
+        press(&mut t, Key::Char('a'));
+        let copied = Profile {
+            output_gain_db: 7.5,
+            ..Profile::default()
+        };
+        assert_eq!(t.profile(), &copied);
+        // Both differ from what was saved; B's copy can go back to it.
+        assert!(t.differs(0) && t.differs(1));
+        press(&mut t, Key::Char('r'));
+        assert!(t.differs(0) && !t.differs(1));
+        assert_eq!(press(&mut t, Key::Char('c')), Effect::Apply);
+        assert_eq!(t.message(), "copied B to A");
+        assert!(!t.differs(0));
+    }
+
+    #[test]
+    fn p_loads_each_preset_in_turn_as_an_unsaved_edit() {
+        let mut t = tuner();
+        let names: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
+        for round in 0..2 {
+            for preset in &PRESETS {
+                assert_eq!(press(&mut t, Key::Char('p')), Effect::Apply, "{round}");
+                assert_eq!(t.profile(), &preset.profile());
+                assert_eq!(
+                    t.message(),
+                    format!("preset {} in A, not saved", preset.name)
+                );
+                assert!(t.dirty());
+            }
+        }
+        assert_eq!(
+            names,
+            ["headphones", "laptop-speakers", "music", "night", "voice"]
+        );
+        // Into B, B alone.
+        press(&mut t, Key::Char('a'));
+        assert_eq!(press(&mut t, Key::Char('p')), Effect::Apply);
+        assert_eq!(t.message(), "preset headphones in B, not saved");
+        press(&mut t, Key::Char('a'));
+        assert_eq!(t.profile(), &PRESETS[4].profile());
+        // The preset a slot already holds changes nothing, and the next
+        // press moves on.
+        let mut t = tuner();
+        t.slots[0] = PRESETS[0].profile();
+        assert_eq!(press(&mut t, Key::Char('p')), Effect::None);
+        assert_eq!(t.message(), "A already holds preset headphones");
+        assert_eq!(press(&mut t, Key::Char('p')), Effect::Apply);
+        assert_eq!(t.profile(), &PRESETS[1].profile());
+    }
+
+    #[test]
+    fn s_and_r_act_on_the_slot_heard() {
+        let mut t = tuner();
+        select(&mut t, Setting::InputGain);
+        press(&mut t, Key::Right); // A: input gain 0.5
+        press(&mut t, Key::Char('a'));
+        press(&mut t, Key::Left); // B: input gain -0.5
+        assert_eq!(press(&mut t, Key::Char('s')), Effect::Save);
+        t.saved();
+        // B is what was saved now, so A differs from it.
+        assert!(!t.differs(1) && t.differs(0));
+        press(&mut t, Key::Char('a'));
+        assert_eq!(press(&mut t, Key::Char('r')), Effect::Apply);
+        assert_eq!(t.profile().input_gain_db, -0.5);
+        assert!(!t.compared());
+        assert_eq!(press(&mut t, Key::Char('r')), Effect::None);
+        assert_eq!(t.message(), "no unsaved changes to revert");
+    }
+
+    #[test]
+    fn quitting_asks_only_about_the_slot_heard() {
+        let mut t = tuner();
+        press(&mut t, Key::Char('a'));
+        press(&mut t, Key::Char('p'));
+        // B is edited and heard: q asks about B.
+        assert_eq!(press(&mut t, Key::Char('q')), Effect::None);
+        assert_eq!(
+            t.prompt().as_deref(),
+            Some("save changes in B to test.toml? y/n (Esc cancels)")
+        );
+        assert_eq!(press(&mut t, Key::Esc), Effect::None);
+        // On A, which is as saved, q quits at once.
+        press(&mut t, Key::Char('a'));
+        assert_eq!(press(&mut t, Key::Char('q')), Effect::Quit);
+    }
+
+    #[test]
+    fn reload_puts_the_profile_in_both_slots_and_ends_a_blind_test() {
+        let mut t = tuner();
+        press(&mut t, Key::Char('a'));
+        assert!(!t.reload(louder()), "nothing unsaved");
+        assert_eq!(t.profile(), &louder());
+        press(&mut t, Key::Char('p'));
+        press(&mut t, Key::Char('x'));
+        assert!(t.trial().is_some());
+        assert!(t.reload(Profile::default()), "B's preset was thrown away");
+        assert_eq!(t.trial(), None);
+        assert_eq!(t.slot(), 1, "back on the slot heard before the test");
+        assert!(!t.compared() && !t.dirty() && !t.differs(0));
+        assert_eq!(t.profile(), &Profile::default());
+    }
+
+    #[test]
+    fn the_audio_gets_a_chain_per_slot_while_they_differ_and_one_while_not() {
+        let mut t = tuner();
+        let rate = RATE;
+        assert_eq!(t.chains(rate), []);
+        select(&mut t, Setting::OutputGain);
+        // Edited, A gets a new chain and B, still as saved, its own.
+        press(&mut t, Key::Right);
+        let a1 = t.profile().clone();
+        assert_eq!(
+            t.chains(rate),
+            [(0, Some(a1.clone())), (1, Some(Profile::default()))]
+        );
+        assert_eq!(t.chains(rate), []);
+        press(&mut t, Key::Right);
+        let a2 = t.profile().clone();
+        assert_eq!(t.chains(rate), [(0, Some(a2.clone()))]);
+        // Switching needs no chain; editing B gives B one.
+        press(&mut t, Key::Char('a'));
+        assert_eq!(t.chains(rate), []);
+        press(&mut t, Key::Left);
+        let b1 = t.profile().clone();
+        assert_eq!(t.chains(rate), [(1, Some(b1))]);
+        // B copied into A: B's chain plays both, and A's goes.
+        press(&mut t, Key::Char('c'));
+        assert_eq!(t.chains(rate), [(0, None)]);
+        // B edited away from A again: A needs its own chain back.
+        press(&mut t, Key::Right);
+        let b2 = t.profile().clone();
+        let a = t.slots[0].clone();
+        assert_eq!(t.chains(rate), [(0, Some(a.clone())), (1, Some(b2))]);
+        // Both set to a third profile: the heard slot's chain is replaced
+        // and the other plays it.
+        t.reload(louder());
+        assert_eq!(t.chains(rate), [(1, Some(louder())), (0, None)]);
+        // A restart leaves one chain, in the heard slot.
+        press(&mut t, Key::Char('a'));
+        press(&mut t, Key::Char('p'));
+        t.chains(rate);
+        t.restarted();
+        assert_eq!(t.chains(rate), [(1, Some(louder()))]);
+        assert_eq!(a2.output_gain_db, a1.output_gain_db + 0.5);
+    }
+
+    #[test]
+    fn a_slot_that_does_not_fit_a_new_rate_takes_the_heard_ones_settings() {
+        // B's shelf corner is legal at 48 kHz and past a quarter of 8 kHz,
+        // as after a change of device.
+        let mut t = tuner();
+        t.slots[1].shelf_corner_hz = 3000.0;
+        let b = t.slots[1].clone();
+        assert_eq!(t.chains(RATE), [(1, Some(b))]);
+        assert_eq!(t.profile().validate(8_000), Ok(()));
+        assert!(t.slots[1].validate(8_000).is_err());
+        assert_eq!(t.chains(8_000), [(1, None)]);
+        assert!(!t.compared());
+        assert!(
+            t.message().starts_with("B does not fit 8000 Hz ("),
+            "{}",
+            t.message()
+        );
+        assert!(t.message().ends_with("so it now holds A's settings"));
+    }
+
+    /// A tuner whose slots differ, with its blind draws seeded.
+    fn compared(seed: u64) -> Tuner {
+        let mut t = tuner();
+        press(&mut t, Key::Char('a'));
+        press(&mut t, Key::Char('p'));
+        press(&mut t, Key::Char('a'));
+        t.seed = seed;
+        t
+    }
+
+    #[test]
+    fn blind_needs_two_different_slots() {
+        let mut t = tuner();
+        assert_eq!(press(&mut t, Key::Char('x')), Effect::None);
+        assert_eq!(t.trial(), None);
+        assert!(
+            t.message().starts_with("A and B are the same"),
+            "{}",
+            t.message()
+        );
+    }
+
+    #[test]
+    fn a_blind_test_hides_the_slots_and_counts_votes_for_the_right_ones() {
+        let mut t = compared(0x9e37_79b9_7f4a_7c15);
+        t.matching = false;
+        t.bypass = true;
+        assert_eq!(press(&mut t, Key::Char('x')), Effect::Listen);
+        // Matched, out of bypass, on X.
+        assert!(t.matching() && !t.bypass());
+        let x = t.blind.as_ref().unwrap().x;
+        assert_eq!(t.slot(), x);
+        assert_eq!(
+            t.trial(),
+            Some(Trial {
+                playing: 'X',
+                number: 1
+            })
+        );
+        // a and Tab go between X and Y.
+        assert_eq!(press(&mut t, Key::Char('a')), Effect::Listen);
+        assert_eq!((t.slot(), t.trial().unwrap().playing), (1 - x, 'Y'));
+        assert_eq!(press(&mut t, Key::Tab), Effect::Listen);
+        assert_eq!((t.slot(), t.trial().unwrap().playing), (x, 'X'));
+        // Ten votes, each for the slot its key named at the time, and each
+        // trial drawn afresh.
+        let mut want = [0, 0];
+        let mut drawn = [0, 0];
+        for (i, key) in "1121112212".chars().enumerate() {
+            let x = t.blind.as_ref().unwrap().x;
+            drawn[x] += 1;
+            let preferred = if key == '1' { x } else { 1 - x };
+            want[preferred] += 1;
+            assert_eq!(press(&mut t, Key::Char(key)), Effect::Listen);
+            let trial = t.trial().unwrap();
+            assert_eq!((trial.playing, trial.number), ('X', i as u32 + 2));
+            assert_eq!(t.slot(), t.blind.as_ref().unwrap().x);
+        }
+        assert_eq!(t.blind.as_ref().unwrap().votes, want);
+        assert!(drawn[0] > 0 && drawn[1] > 0, "{drawn:?}");
+        // x ends it, back on A, with the tally.
+        assert_eq!(press(&mut t, Key::Char('x')), Effect::Listen);
+        assert_eq!((t.trial(), t.slot()), (None, 0));
+        assert_eq!(t.message(), tally(want));
+        assert!(!t.matching(), "matching back as it was");
+    }
+
+    #[test]
+    fn a_blind_test_ignores_editing_and_ends_on_esc_or_quit() {
+        let mut t = compared(7);
+        let before = t.slots.clone();
+        press(&mut t, Key::Char('x'));
+        for key in [
+            Key::Right,
+            Key::Left,
+            Key::ShiftRight,
+            Key::Up,
+            Key::Down,
+            Key::BackTab,
+            Key::Char(' '),
+            Key::Char('b'),
+            Key::Char('s'),
+            Key::Char('r'),
+            Key::Char('c'),
+            Key::Char('p'),
+            Key::Char('m'),
+            Key::Char('g'),
+        ] {
+            assert_eq!(press(&mut t, key), Effect::None, "{key:?}");
+        }
+        assert_eq!(t.slots, before);
+        assert_eq!(t.position().0, 0);
+        assert!(!t.bypass() && !t.graph());
+        assert_eq!(press(&mut t, Key::Esc), Effect::Listen);
+        assert_eq!(t.trial(), None);
+        assert_eq!(t.message(), "blind test ended with no votes");
+        // q ends the test and quits as usual: A is as saved, B is not
+        // heard, so it quits at once.
+        press(&mut t, Key::Char('x'));
+        press(&mut t, Key::Char('1'));
+        assert_eq!(press(&mut t, Key::Char('q')), Effect::Quit);
+        // Heard and edited before the test, B makes q ask, with the tally
+        // above the question.
+        let mut t = compared(7);
+        press(&mut t, Key::Char('a'));
+        press(&mut t, Key::Char('x'));
+        press(&mut t, Key::Char('2'));
+        assert_eq!(press(&mut t, Key::CtrlC), Effect::Listen);
+        assert!(t.message().starts_with("blind: "), "{}", t.message());
+        assert_eq!(
+            t.prompt().as_deref(),
+            Some("save changes in B to test.toml? y/n (Esc cancels)")
+        );
+    }
+
+    #[test]
+    fn the_tally_says_how_likely_a_split_is_by_chance() {
+        assert_eq!(lopsided(5, 10), 1.0);
+        assert_eq!(lopsided(7, 10), 0.34375);
+        assert_eq!(lopsided(8, 10), 0.109375);
+        assert_eq!(lopsided(9, 10), 0.021484375);
+        assert_eq!(lopsided(10, 10), 0.001953125);
+        assert_eq!(lopsided(1, 1), 1.0);
+        assert_eq!(lopsided(2, 3), 1.0);
+        assert_eq!(
+            tally([5, 5]),
+            "blind: A and B preferred 5 times each in 10 trials — no preference shown"
+        );
+        assert_eq!(
+            tally([7, 3]),
+            "blind: A preferred 7 of 10, B 3 — could be chance: with no preference, a split \
+             at least this lopsided comes up 34 % of the time"
+        );
+        assert_eq!(
+            tally([1, 9]),
+            "blind: B preferred 9 of 10, A 1 — likely a real preference: with no preference, \
+             a split at least this lopsided comes up 2.1 % of the time"
+        );
+        assert_eq!(
+            tally([10, 0]),
+            "blind: A preferred 10 of 10, B 0 — likely a real preference: with no \
+             preference, a split at least this lopsided comes up 0.2 % of the time"
+        );
+        // Just over the line.
+        assert!(tally([2, 8]).contains("could be chance") && tally([2, 8]).contains("11 %"));
+        assert_eq!(tally([0, 0]), "blind test ended with no votes");
+    }
+
+    #[test]
     fn quitting_with_unsaved_changes_asks_first() {
         let mut t = tuner();
         select(&mut t, Setting::InputGain);
@@ -1415,7 +2133,7 @@ mod tests {
         assert_eq!(press(&mut t, Key::Char('q')), Effect::None);
         assert_eq!(
             t.prompt().as_deref(),
-            Some("save changes to test.toml? y/n (Esc cancels)")
+            Some("save changes in A to test.toml? y/n (Esc cancels)")
         );
         // While asking, other keys do nothing.
         assert_eq!(press(&mut t, Key::Right), Effect::None);

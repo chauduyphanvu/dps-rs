@@ -12,7 +12,7 @@ use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Mutex, Once, OnceLock, PoisonError};
 use std::thread::{self, ThreadId};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, MoveTo};
 use crossterm::style::{Attribute, Print, SetAttribute};
@@ -22,7 +22,10 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 
-use super::tuner::{Field, Key, Row, Tuner};
+use dps::response::response_db;
+
+use super::mix::Readings;
+use super::tuner::{Field, Key, Row, SLOTS, Tuner};
 use super::{SIG_ERR, signal};
 
 /// Set while the terminal is in the tuner's state; cleared once it is back.
@@ -84,13 +87,50 @@ const RESTORE: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l";
 /// ends partway through one.
 const SEQUENCE_WAIT: Duration = Duration::from_millis(50);
 
-const LEGEND: [&str; 2] = [
+const LEGEND: [&str; 3] = [
     "j/k Up/Down select   h/l Left/Right change   H/L or Shift: fine   Tab EQ field",
-    "Space on/off   b bypass (A/B, L+R level matched)   s save   r revert   q quit",
+    "Space on/off   b bypass (level matched)   g graph   s save   r revert   q quit",
+    "a A/B (* unsaved)   c copy to other   p next preset   m match levels   x blind",
+];
+/// As many lines as `LEGEND`, so a notice lands on the message line in a
+/// blind test too.
+const BLIND_LEGEND: [&str; 3] = [
+    "a or Tab switch between X and Y   1 prefer X   2 prefer Y",
+    "x or Esc end the test and show the tally   q quit",
+    "",
 ];
 const MAX_MESSAGE_LINES: usize = 6;
 
+/// Loudness below this shows as "--": BS.1770's absolute gate.
+const QUIET_LUFS: f32 = -70.0;
+/// How long a gain reduction's peak stays on screen.
+const HOLD: Duration = Duration::from_secs(1);
+/// A reduction's bar: this many cells of this many dB each.
+const BAR_CELLS: usize = 8;
+const BAR_CELL_DB: f32 = 1.5;
+
+/// Rows of the response curve, with a row for its frequency scale under it.
+const GRAPH_ROWS: usize = 7;
+/// The narrowest curve drawn, in columns.
+const MIN_GRAPH_COLUMNS: usize = 20;
+/// The settings list keeps at least this many rows; with fewer the curve
+/// gives way.
+const MIN_LIST_ROWS: usize = 5;
+/// The curve spans 20 Hz to 20 kHz, in the smallest of these ranges, ± dB,
+/// that holds it.
+const GRAPH_HZ: (f64, f64) = (20.0, 20_000.0);
+const GRAPH_RANGES_DB: [f64; 3] = [6.0, 12.0, 24.0];
+/// The frequencies the scale names.
+const GRAPH_TICKS: [(f64, &str); 5] = [
+    (20.0, "20"),
+    (100.0, "100"),
+    (1000.0, "1k"),
+    (10_000.0, "10k"),
+    (20_000.0, "20k"),
+];
+
 /// What the screen shows.
+#[derive(Clone, Copy)]
 pub struct View<'a> {
     pub tuner: &'a Tuner,
     pub name: &'a str,
@@ -100,6 +140,9 @@ pub struct View<'a> {
     pub dry_gain: f32,
     /// The system volume and what the loudness contour does at it.
     pub contour: Option<&'a str>,
+    pub meters: Readings,
+    /// The gain level matching puts on A and on B, in dB.
+    pub trim: [f32; 2],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -127,39 +170,6 @@ pub fn layout(view: &View, width: u16, height: u16, top: &mut usize) -> Vec<Line
     };
     let tuner = view.tuner;
 
-    let mut status = String::from("dps live  ");
-    if tuner.bypass() {
-        status += &format!(
-            "BYPASS (dry {:+.1} dB, L+R level matched)",
-            20.0 * view.dry_gain.log10()
-        );
-    } else {
-        status += "PROCESSED";
-    }
-    if tuner.dirty() {
-        status += "  UNSAVED";
-    }
-    if view.clamped > 0 {
-        status += &format!("  clamped {}", view.clamped);
-    }
-    match tuner.profile().skipped_eq_bands(view.rate).len() {
-        0 => {}
-        1 => status += "  1 EQ band skipped",
-        n => status += &format!("  {n} EQ bands skipped"),
-    }
-    let (at, count) = tuner.position();
-    let contour = view.contour.map(|c| format!(", {c}")).unwrap_or_default();
-    let output = format!("{} at {} Hz{contour}   ", view.device, view.rate);
-    let room = width.saturating_sub(output.chars().count());
-    let mut lines = vec![
-        line(status, Style::Bold),
-        line(output + &tail(view.name, room), Style::Plain),
-        line(
-            format!("{:-<width$}", format!("-- {}/{count} ", at + 1)),
-            Style::Plain,
-        ),
-    ];
-
     // The question, when there is one, is always shown, under the message.
     let prompt = tuner
         .prompt()
@@ -174,67 +184,383 @@ pub fn layout(view: &View, width: u16, height: u16, top: &mut usize) -> Vec<Line
     if message.is_empty() {
         message.push((String::new(), Style::Plain));
     }
-    let fixed = lines.len() + 1 + message.len() + LEGEND.len();
-    let list = height.saturating_sub(fixed).max(1);
-    let rows = tuner.rows(view.rate);
-    scroll(&rows, list, top);
-    for i in *top..*top + list {
-        let Some(row) = rows.get(i) else {
-            lines.push(line(String::new(), Style::Plain));
-            continue;
-        };
-        let (marker, style) = if row.selected() {
-            ('>', Style::Reverse)
-        } else {
-            (' ', Style::Plain)
-        };
-        lines.push(match row {
-            Row::Group(name) => line(format!(" {name}"), Style::Bold),
-            Row::Setting { label, value, .. } => {
-                line(format!("{marker}   {label:<20}{value:>12} "), style)
-            }
-            Row::Band {
-                freq,
-                q,
-                gain,
-                active,
-                skipped,
-                ..
-            } => {
-                // Every field keeps a column on each side for the brackets,
-                // so the columns stay put as the active field moves, and
-                // the gain lines up with the other settings' values.
-                let cell = |field, text: &str| {
-                    if *active == Some(field) {
-                        format!("[{text}]")
-                    } else {
-                        format!(" {text} ")
-                    }
-                };
-                let (freq, q, gain) = (
-                    cell(Field::Freq, freq),
-                    cell(Field::Q, q),
-                    cell(Field::Gain, gain),
-                );
-                let skipped = if *skipped { " skipped" } else { "" };
+
+    let (mut lines, legend) = match tuner.trial() {
+        // Nothing that would tell the slots apart: no settings, meters,
+        // curve, slot names or matching gain.
+        Some(trial) => (
+            vec![
                 line(
-                    format!("{marker} {freq:>12}{q:<10}{gain:>13}{skipped}"),
-                    style,
-                )
+                    format!("dps live  BLIND  playing {}", trial.playing),
+                    Style::Bold,
+                ),
+                line(format!("trial {}", trial.number), Style::Plain),
+            ],
+            BLIND_LEGEND,
+        ),
+        None => {
+            let contour = view.contour.map(|c| format!(", {c}")).unwrap_or_default();
+            let output = format!("{} at {} Hz{contour}   ", view.device, view.rate);
+            let room = width.saturating_sub(output.chars().count());
+            let mut lines = vec![
+                line(status(view), Style::Bold),
+                line(output + &tail(view.name, room), Style::Plain),
+            ];
+            let leveler = tuner.profile().leveler.enabled;
+            for meters in meter_lines(&view.meters, leveler, width) {
+                lines.push(line(meters, Style::Plain));
             }
-        });
+            // The list's heading, the rule under it, the message and the
+            // legend.
+            let mut fixed = lines.len() + 2 + message.len() + LEGEND.len();
+            if tuner.graph() && height >= fixed + GRAPH_ROWS + 1 + MIN_LIST_ROWS {
+                let marker = tuner
+                    .selected_band()
+                    .map(|i| f64::from(tuner.profile().eq.freqs_hz[i]));
+                let graph = graph_lines(
+                    |f| response_db(tuner.profile(), f, view.rate),
+                    marker,
+                    width,
+                );
+                fixed += graph.len();
+                lines.extend(graph.into_iter().map(|g| line(g, Style::Plain)));
+            }
+            let (at, count) = tuner.position();
+            lines.push(line(
+                format!("{:-<width$}", format!("-- {}/{count} ", at + 1)),
+                Style::Plain,
+            ));
+            let list = height.saturating_sub(fixed).max(1);
+            let rows = tuner.rows(view.rate);
+            scroll(&rows, list, top);
+            for i in *top..*top + list {
+                lines.push(match rows.get(i) {
+                    Some(row) => {
+                        let (text, style) = list_line(row);
+                        line(text, style)
+                    }
+                    None => line(String::new(), Style::Plain),
+                });
+            }
+            (lines, LEGEND)
+        }
+    };
+    let blank = Line {
+        text: String::new(),
+        style: Style::Plain,
+    };
+    let body = height.saturating_sub(1 + message.len() + legend.len());
+    if lines.len() < body {
+        lines.resize(body, blank.clone());
     }
     lines.push(line("-".repeat(width), Style::Plain));
     lines.extend(message.into_iter().map(|(m, style)| line(m, style)));
-    lines.extend(LEGEND.iter().map(|l| line((*l).into(), Style::Plain)));
-    lines.resize(
-        height,
-        Line {
-            text: String::new(),
-            style: Style::Plain,
-        },
-    );
+    lines.extend(legend.iter().map(|l| line((*l).into(), Style::Plain)));
+    lines.resize(height, blank);
     lines
+}
+
+/// The top line: the slots, the heard one in brackets and each marked `*`
+/// while it differs from what was saved, whether bypass is on, the matching
+/// gain while the slots differ, and what else is worth knowing.
+fn status(view: &View) -> String {
+    let tuner = view.tuner;
+    let slots: Vec<String> = SLOTS
+        .iter()
+        .enumerate()
+        .map(|(s, name)| {
+            let star = if tuner.differs(s) { "*" } else { "" };
+            if s == tuner.slot() {
+                format!("[{name}{star}]")
+            } else {
+                format!("{name}{star}")
+            }
+        })
+        .collect();
+    let mut status = format!("dps live  {}  ", slots.join(" "));
+    if tuner.bypass() {
+        status += &format!("BYPASS (dry {:+.1} dB)", 20.0 * view.dry_gain.log10());
+    } else {
+        status += "PROCESSED";
+    }
+    if tuner.compared() {
+        status += &if !tuner.matching() {
+            "  match off".into()
+        } else {
+            match (0..2).find(|&s| view.trim[s] <= -0.05) {
+                Some(s) => format!("  trim {} {:.1} dB", SLOTS[s], view.trim[s]),
+                None => "  trim 0.0 dB".into(),
+            }
+        };
+    }
+    if view.clamped > 0 {
+        status += &format!("  clamped {}", view.clamped);
+    }
+    match tuner.profile().skipped_eq_bands(view.rate).len() {
+        0 => {}
+        1 => status += "  1 EQ band skipped",
+        n => status += &format!("  {n} EQ bands skipped"),
+    }
+    status
+}
+
+/// One row of the settings list, and how to show it.
+fn list_line(row: &Row) -> (String, Style) {
+    let (marker, style) = if row.selected() {
+        ('>', Style::Reverse)
+    } else {
+        (' ', Style::Plain)
+    };
+    match row {
+        Row::Group(name) => (format!(" {name}"), Style::Bold),
+        Row::Setting { label, value, .. } => (format!("{marker}   {label:<20}{value:>12} "), style),
+        Row::Band {
+            freq,
+            q,
+            gain,
+            active,
+            skipped,
+            ..
+        } => {
+            // Every field keeps a column on each side for the brackets, so
+            // the columns stay put as the active field moves, and the gain
+            // lines up with the other settings' values.
+            let cell = |field, text: &str| {
+                if *active == Some(field) {
+                    format!("[{text}]")
+                } else {
+                    format!(" {text} ")
+                }
+            };
+            let (freq, q, gain) = (
+                cell(Field::Freq, freq),
+                cell(Field::Q, q),
+                cell(Field::Gain, gain),
+            );
+            let skipped = if *skipped { " skipped" } else { "" };
+            (
+                format!("{marker} {freq:>12}{q:<10}{gain:>13}{skipped}"),
+                style,
+            )
+        }
+    }
+}
+
+/// The curve of `response` (dB at a frequency) from 20 Hz to 20 kHz on a
+/// log axis, in braille dots two across and four down a character, with
+/// the range on the left, a dashed 0 dB line, a dotted line up at `marker`
+/// Hz, and a frequency scale under it; nothing if `width` is too narrow.
+fn graph_lines(response: impl Fn(f64) -> f64, marker: Option<f64>, width: usize) -> Vec<String> {
+    const LABEL: usize = 4;
+    let Some(columns) = width.checked_sub(LABEL).filter(|&c| c >= MIN_GRAPH_COLUMNS) else {
+        return Vec::new();
+    };
+    let (low, high) = GRAPH_HZ;
+    let xs = 2 * columns;
+    let x_of = |f: f64| ((xs - 1) as f64 * (f / low).ln() / (high / low).ln()).round();
+    let dbs: Vec<f64> = (0..xs)
+        .map(|x| response(low * (high / low).powf(x as f64 / (xs - 1) as f64)))
+        .collect();
+    let peak = dbs.iter().fold(0.0f64, |m, d| m.max(d.abs()));
+    let range = GRAPH_RANGES_DB
+        .into_iter()
+        .find(|&r| peak <= r + 0.05)
+        .unwrap_or(GRAPH_RANGES_DB[2]);
+    // One dot row fewer than the cells hold, so 0 dB has a row of its own,
+    // in the middle.
+    let last = 4 * GRAPH_ROWS - 2;
+    let zero = last / 2;
+    let y_of = |db: f64| {
+        ((range - db) / (2.0 * range) * last as f64)
+            .round()
+            .clamp(0.0, last as f64) as usize
+    };
+    let mut dots = vec![[false; 2 * 4 * GRAPH_ROWS]; columns];
+    let mut set = |x: usize, y: usize| dots[x / 2][2 * y + x % 2] = true;
+    for x in (0..xs).step_by(2) {
+        set(x, zero);
+    }
+    if let Some(f) = marker.filter(|f| (low..=high).contains(f)) {
+        let x = x_of(f) as usize;
+        for y in (0..=last).step_by(2) {
+            set(x, y);
+        }
+    }
+    let mut previous = y_of(dbs[0]);
+    for (x, &db) in dbs.iter().enumerate() {
+        // Down to the dot beside the last one, so a steep stretch is one line.
+        let y = y_of(db);
+        let span = if previous < y {
+            previous + 1..=y
+        } else {
+            y..=previous.saturating_sub(1).max(y)
+        };
+        for y in span {
+            set(x, y);
+        }
+        previous = y;
+    }
+    // Braille dot bits by row within a character, left column then right.
+    const BITS: [[u32; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+    let label = |row: usize| {
+        let rows = |y: usize| y / 4;
+        let db = if row == rows(0) {
+            range
+        } else if row == rows(zero) {
+            0.0
+        } else if row == rows(last) {
+            -range
+        } else {
+            return " ".repeat(LABEL);
+        };
+        format!(
+            "{:>3} ",
+            if db == 0.0 {
+                "0".into()
+            } else {
+                format!("{db:+}")
+            }
+        )
+    };
+    let mut lines: Vec<String> = (0..GRAPH_ROWS)
+        .map(|row| {
+            let cells = dots.iter().map(|cell| {
+                let mut bits = 0;
+                for (r, pair) in BITS.iter().enumerate() {
+                    for (c, bit) in pair.iter().enumerate() {
+                        if cell[2 * (4 * row + r) + c] {
+                            bits |= bit;
+                        }
+                    }
+                }
+                if bits == 0 {
+                    ' '
+                } else {
+                    char::from_u32(0x2800 + bits).expect("braille patterns are chars")
+                }
+            });
+            label(row) + &cells.collect::<String>()
+        })
+        .collect();
+    let mut scale = vec![' '; columns];
+    let mut free = 0;
+    for (f, name) in GRAPH_TICKS {
+        let len = name.len();
+        let centre = x_of(f) as usize / 2;
+        let start = centre.saturating_sub(len / 2).min(columns - len);
+        if start < free {
+            continue;
+        }
+        scale[start..start + len]
+            .iter_mut()
+            .zip(name.chars())
+            .for_each(|(s, c)| *s = c);
+        free = start + len + 1;
+    }
+    lines.push(" ".repeat(LABEL) + scale.iter().collect::<String>().trim_end());
+    lines
+}
+
+/// The meters in one line if it fits `width`, else two: the loudness and
+/// the leveler, then the gain reductions, with bars if they fit.
+fn meter_lines(meters: &Readings, leveler: bool, width: usize) -> Vec<String> {
+    let lufs = |v: f32| {
+        if v > QUIET_LUFS {
+            format!("{v:.1}")
+        } else {
+            "--".into()
+        }
+    };
+    let loudness = format!(
+        "in {:>5}  out {:>5} LUFS",
+        lufs(meters.input_lufs),
+        lufs(meters.output_lufs)
+    );
+    let gain = if leveler {
+        // Rounded first, and + 0.0, so a gain just under 0 shows as +0.0.
+        format!(
+            "{:+.1}",
+            (meters.chain.leveler_db * 10.0).round() / 10.0 + 0.0
+        )
+    } else {
+        "off".into()
+    };
+    let unit = if leveler { " dB" } else { "" };
+    let c = &meters.chain;
+    let reductions = [
+        ("c1", c.compressor1_db),
+        ("c2", c.compressor2_db),
+        ("lim", c.limiter_db),
+    ];
+    let barred = reductions
+        .map(|(name, db)| format!("{name:<3} {:>5} {}", reduction(db), bar(db)))
+        .join("   ")
+        + " dB";
+    let one = format!("{loudness}   leveler {gain}{unit}   {barred}");
+    if one.chars().count() <= width {
+        return vec![one];
+    }
+    if barred.chars().count() <= width {
+        return vec![format!("{loudness}   leveler {gain}{unit}"), barred];
+    }
+    let plain = reductions
+        .map(|(name, db)| format!("{name} {}", reduction(db)))
+        .join("  ")
+        + " dB";
+    vec![format!("{loudness}  lev {gain}"), plain]
+}
+
+/// A gain reduction as the change it makes, e.g. "-4.2".
+fn reduction(db: f32) -> String {
+    if db >= 0.05 {
+        format!("-{db:.1}")
+    } else {
+        "0.0".into()
+    }
+}
+
+/// A gain reduction as a bar of `BAR_CELLS` cells, in eighths of a cell.
+fn bar(db: f32) -> String {
+    const PARTS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    let eighths = (db / BAR_CELL_DB * 8.0)
+        .round()
+        .clamp(0.0, (8 * BAR_CELLS) as f32) as usize;
+    let (full, part) = (eighths / 8, eighths % 8);
+    let mut bar = "█".repeat(full);
+    if part > 0 {
+        bar.push(PARTS[part]);
+    }
+    let drawn = full + usize::from(part > 0);
+    bar + &"·".repeat(BAR_CELLS - drawn)
+}
+
+/// Holds each gain reduction's peak on screen for `HOLD`, so it can be read.
+#[derive(Default)]
+struct Hold {
+    /// Each peak and when it was reached.
+    peaks: [(f32, Option<Instant>); 3],
+}
+
+impl Hold {
+    /// `readings` with each reduction replaced by its held peak.
+    fn apply(&mut self, mut readings: Readings, now: Instant) -> Readings {
+        let c = &mut readings.chain;
+        for (value, (peak, since)) in [
+            &mut c.compressor1_db,
+            &mut c.compressor2_db,
+            &mut c.limiter_db,
+        ]
+        .into_iter()
+        .zip(&mut self.peaks)
+        {
+            let expired = since.is_none_or(|t| now.saturating_duration_since(t) >= HOLD);
+            if *value >= *peak || expired {
+                (*peak, *since) = (*value, Some(now));
+            }
+            *value = *peak;
+        }
+        readings
+    }
 }
 
 /// Moves `top` so the selected row is among the `height` rows shown, with
@@ -408,6 +734,7 @@ pub struct Screen {
     size: (u16, u16),
     top: usize,
     clear: bool,
+    hold: Hold,
 }
 
 impl Screen {
@@ -427,6 +754,7 @@ impl Screen {
             size: (80, 24),
             top: 0,
             clear: true,
+            hold: Hold::default(),
         };
         extern "C" fn on_resize(_: c_int) {
             RESIZED.store(true, Relaxed);
@@ -499,7 +827,11 @@ impl Screen {
     }
 
     pub fn draw(&mut self, view: &View) -> io::Result<()> {
-        let lines = layout(view, self.size.0, self.size.1, &mut self.top);
+        let view = View {
+            meters: self.hold.apply(view.meters, Instant::now()),
+            ..*view
+        };
+        let lines = layout(&view, self.size.0, self.size.1, &mut self.top);
         let mut frame = Vec::new();
         queue!(frame, BeginSynchronizedUpdate)?;
         let empty = frame.len();
@@ -726,6 +1058,8 @@ mod tests {
             clamped: 0,
             dry_gain: 1.0,
             contour: None,
+            meters: Readings::default(),
+            trim: [0.0; 2],
         }
     }
 
@@ -749,18 +1083,254 @@ mod tests {
         let text = texts(&lines);
         assert_eq!(lines.len(), 24);
         assert!(text.iter().all(|t| t.chars().count() <= 79), "{text:#?}");
-        assert_eq!(text[0], "dps live  PROCESSED");
+        assert_eq!(text[0], "dps live  [A] B  PROCESSED");
         assert_eq!(
             text[1],
             "MacBook Pro Speakers at 48000 Hz   presets/music.toml"
         );
-        assert!(text[2].starts_with("-- 1/57 ---"));
-        assert_eq!(text[3], " Leveler");
+        assert_eq!(text[2], "in    --  out    -- LUFS   leveler off");
+        assert_eq!(
+            text[3],
+            "c1    0.0 ········   c2    0.0 ········   lim   0.0 ········ dB"
+        );
+        assert!(text[4].starts_with("-- 1/57 ---"));
+        assert_eq!(text[5], " Leveler");
         assert_eq!(selected(&lines), [">   enabled                      off "]);
-        assert_eq!(&text[22..], LEGEND);
+        assert_eq!(&text[24 - LEGEND.len()..], LEGEND);
         // The selection is marked in the text, not only by the highlight.
-        assert!(text[4].starts_with('>'));
-        assert!(text[5].starts_with(' '));
+        assert!(text[6].starts_with('>'));
+        assert!(text[7].starts_with(' '));
+    }
+
+    fn readings() -> Readings {
+        Readings {
+            input_lufs: -18.24,
+            output_lufs: -14.06,
+            chain: dps::Meters {
+                leveler_db: 3.52,
+                compressor1_db: 4.2,
+                compressor2_db: 1.0,
+                limiter_db: 0.3,
+            },
+        }
+    }
+
+    /// The meter lines laid out at `width` with the leveler on.
+    fn meters_at(meters: Readings, width: u16) -> Vec<String> {
+        let mut profile = Profile::default();
+        profile.leveler.enabled = true;
+        let tuner = Tuner::new(profile, String::new());
+        let mut top = 0;
+        let view = View {
+            meters,
+            ..view(&tuner)
+        };
+        let lines = layout(&view, width, 30, &mut top);
+        let rule = lines.iter().position(|l| l.text.starts_with("--")).unwrap();
+        lines[2..rule].iter().map(|l| l.text.clone()).collect()
+    }
+
+    #[test]
+    fn meters_show_under_the_status_lines_in_two_lines_at_80_columns() {
+        assert_eq!(
+            meters_at(readings(), 80),
+            [
+                "in -18.2  out -14.1 LUFS   leveler +3.5 dB",
+                "c1   -4.2 ██▊·····   c2   -1.0 ▋·······   lim  -0.3 ▎······· dB",
+            ]
+        );
+        // Wide enough, one line.
+        let wide = meters_at(readings(), 120);
+        assert_eq!(wide.len(), 1);
+        assert_eq!(wide[0], meters_at(readings(), 80).join("   "));
+        // Silence, no reduction, the leveler off.
+        let tuner = Tuner::new(Profile::default(), String::new());
+        let mut top = 0;
+        let lines = layout(&view(&tuner), 80, 24, &mut top);
+        assert_eq!(
+            texts(&lines)[2..4],
+            [
+                "in    --  out    -- LUFS   leveler off",
+                "c1    0.0 ········   c2    0.0 ········   lim   0.0 ········ dB",
+            ]
+        );
+    }
+
+    #[test]
+    fn meters_drop_their_bars_at_40_columns_and_are_cut_below() {
+        assert_eq!(
+            meters_at(readings(), 40),
+            [
+                "in -18.2  out -14.1 LUFS  lev +3.5",
+                "c1 -4.2  c2 -1.0  lim -0.3 dB"
+            ]
+        );
+        let narrow = meters_at(readings(), 20);
+        assert_eq!(narrow, ["in -18.2  out -14.1", "c1 -4.2  c2 -1.0  l"]);
+        // Bars fill an eighth of a cell per 0.1875 dB, up to 12 dB.
+        assert_eq!(bar(0.0), "········");
+        assert_eq!(bar(0.05), "········");
+        assert_eq!(bar(0.1), "▏·······");
+        assert_eq!(bar(0.3), "▎·······");
+        assert_eq!(bar(1.5), "█·······");
+        assert_eq!(bar(12.0), "████████");
+        assert_eq!(bar(30.0), "████████");
+        assert_eq!(reduction(0.04), "0.0");
+        assert_eq!(reduction(12.34), "-12.3");
+    }
+
+    #[test]
+    fn a_reductions_peak_holds_for_a_second() {
+        let mut hold = Hold::default();
+        let start = Instant::now();
+        let mut at = |c1: f32, lim: f32, ms: u64| {
+            let mut r = Readings::default();
+            (r.chain.compressor1_db, r.chain.limiter_db) = (c1, lim);
+            let shown = hold.apply(r, start + Duration::from_millis(ms));
+            (shown.chain.compressor1_db, shown.chain.limiter_db)
+        };
+        assert_eq!(at(6.0, 0.0, 0), (6.0, 0.0));
+        assert_eq!(at(1.0, 0.5, 500), (6.0, 0.5));
+        assert_eq!(at(2.0, 0.1, 999), (6.0, 0.5));
+        // A second after its peak, each shows what it reads now.
+        assert_eq!(at(2.0, 0.1, 1000), (2.0, 0.5));
+        assert_eq!(at(0.0, 0.0, 1500), (2.0, 0.0));
+        // A higher peak shows at once.
+        assert_eq!(at(7.0, 3.0, 1600), (7.0, 3.0));
+    }
+
+    /// The braille dots set in character `column` of `line`, as a bit mask.
+    fn dots(line: &str, column: usize) -> u32 {
+        match line.chars().nth(column) {
+            Some(c @ '\u{2800}'..='\u{28ff}') => c as u32 - 0x2800,
+            _ => 0,
+        }
+    }
+
+    /// A tuner on the default profile with one band changed, the curve on.
+    fn graphed(band: usize, freq: f32, gain: f32) -> Tuner {
+        let mut p = Profile::default();
+        p.eq.freqs_hz[band] = freq;
+        p.eq.gains_db[band] = gain;
+        let mut tuner = Tuner::new(p, String::new());
+        tuner.apply(Action::Graph, 48_000);
+        tuner
+    }
+
+    /// The laid-out lines from the meters to the list's heading.
+    fn graph_of(tuner: &Tuner, width: u16, height: u16) -> Vec<String> {
+        let mut top = 0;
+        let lines = layout(&view(tuner), width, height, &mut top);
+        let heading = lines
+            .iter()
+            .position(|l| l.text.starts_with("-- "))
+            .unwrap();
+        lines[4..heading].iter().map(|l| l.text.clone()).collect()
+    }
+
+    #[test]
+    fn one_band_up_12_db_peaks_in_its_column_on_the_top_row() {
+        // 80 columns leave 75 for the curve, 150 dots across: 1 kHz is dot
+        // 149 log(1000 / 20) / log(1000) = 84.4 from the left, in the 43rd
+        // character after the 4 of the labels.
+        let tuner = graphed(6, 1000.0, 12.0);
+        let graph = graph_of(&tuner, 80, 24);
+        assert_eq!(graph.len(), 8, "{graph:#?}");
+        assert!(graph[0].starts_with("+12 "), "{graph:#?}");
+        assert!(graph[3].starts_with("  0 "), "{graph:#?}");
+        assert!(graph[6].starts_with("-12 "), "{graph:#?}");
+        // The top row of dots (bits 0x01 and 0x08) is set only around 1 kHz.
+        let top: Vec<usize> = (0..80)
+            .filter(|&c| dots(&graph[0], c) & 0x09 != 0)
+            .collect();
+        assert!(
+            !top.is_empty() && top.iter().all(|&c| c.abs_diff(46) <= 1),
+            "{top:?}"
+        );
+        // Away from the band the curve is on the 0 dB row, and nothing is
+        // drawn below it: a boost never dips.
+        assert_eq!(dots(&graph[3], 6), 0x12, "{}", graph[3]);
+        for row in &graph[4..7] {
+            assert!(row[4..].trim().is_empty(), "{graph:#?}");
+        }
+        assert_eq!(
+            graph[7],
+            "    20              100                      1k                       10k   20k"
+        );
+        // Every character the curve uses gets through to the terminal.
+        for row in &graph {
+            assert_eq!(&printable(row), row);
+        }
+    }
+
+    #[test]
+    fn the_curve_picks_the_smallest_range_that_holds_it() {
+        for (gain, range) in [(5.0, " +6"), (6.0, " +6"), (12.0, "+12"), (-18.0, "+24")] {
+            let graph = graph_of(&graphed(5, 705.0, gain), 80, 30);
+            assert!(graph[0].starts_with(range), "{gain} dB: {graph:#?}");
+        }
+        // Past 24 dB the curve is cut at the edge: two bands at +24 dB
+        // overlap to more than that.
+        let mut p = Profile::default();
+        p.eq.gains_db[5] = 24.0;
+        p.eq.gains_db[6] = 24.0;
+        let mut tuner = Tuner::new(p, String::new());
+        tuner.apply(Action::Graph, 48_000);
+        let graph = graph_of(&tuner, 80, 30);
+        assert!(graph[0].starts_with("+24"));
+        assert!(graph[0][4..].chars().any(|c| c != ' '));
+    }
+
+    #[test]
+    fn the_selected_band_is_marked_and_the_curve_follows_changes() {
+        // On band 7 (2497 Hz), a dotted line goes down the curve's column
+        // for it: 149 log(2497 / 20) / log(1000) = 104.2 dots, the 53rd
+        // character after the labels, in rows the curve leaves empty.
+        let mut tuner = Tuner::new(Profile::default(), String::new());
+        tuner.apply(Action::Graph, 48_000);
+        let unmarked = graph_of(&tuner, 80, 24);
+        for _ in 0..19 + 7 {
+            tuner.apply(Action::Down, 48_000);
+        }
+        let marked = graph_of(&tuner, 80, 24);
+        for row in [0, 1, 5, 6] {
+            assert_eq!(dots(&marked[row], 4 + 52), 0x05, "{marked:#?}");
+            assert_eq!(dots(&unmarked[row], 4 + 52), 0, "{unmarked:#?}");
+        }
+        // Turning the band up changes the curve with the next draw.
+        let up = Action::Step {
+            up: true,
+            fine: false,
+        };
+        for _ in 0..12 {
+            tuner.apply(up, 48_000);
+        }
+        let boosted = graph_of(&tuner, 80, 24);
+        assert_ne!(boosted, marked);
+        assert!(boosted[0].starts_with(" +6"), "{boosted:#?}");
+        assert!(dots(&boosted[0], 4 + 52) & 0x09 != 0, "{boosted:#?}");
+    }
+
+    #[test]
+    fn the_curve_gives_way_to_the_list_on_a_short_or_narrow_terminal() {
+        let tuner = graphed(6, 1000.0, 12.0);
+        // At 80 by 24 the list keeps 6 rows; at 23 it keeps the 5 it needs.
+        for (width, height, shown) in [
+            (80, 24, true),
+            (80, 23, true),
+            (80, 22, false),
+            (24, 40, false),
+            (25, 40, true),
+        ] {
+            let mut top = 0;
+            let lines = layout(&view(&tuner), width, height, &mut top);
+            assert_eq!(lines.len(), usize::from(height));
+            let has = lines.iter().any(|l| l.text.starts_with("+12 "));
+            assert_eq!(has, shown, "{width}x{height}: {:#?}", texts(&lines));
+            assert_eq!(selected(&lines).len(), 1, "{width}x{height}");
+            let limit = usize::from(width) - 1;
+            assert!(lines.iter().all(|l| l.text.chars().count() <= limit));
+        }
     }
 
     #[test]
@@ -774,7 +1344,7 @@ mod tests {
         }
         let lines = layout(&view(&tuner), 80, 24, &mut top);
         assert!(selected(&lines)[0].contains("true peak"));
-        assert!(texts(&lines)[2].starts_with("-- 57/57 "));
+        assert!(texts(&lines)[4].starts_with("-- 57/57 "));
         assert!(texts(&lines).contains(&" Limiter"), "{:#?}", texts(&lines));
         assert!(top > 0);
         // Back up to compressor 2's first setting: its heading shows too.
@@ -785,7 +1355,7 @@ mod tests {
         let lines = layout(&view(&tuner), 80, 24, &mut top);
         let text = texts(&lines);
         assert!(selected(&lines)[0].contains("threshold"));
-        assert_eq!(text[3], " Compressor 2");
+        assert_eq!(text[5], " Compressor 2");
     }
 
     #[test]
@@ -812,7 +1382,7 @@ mod tests {
         );
         assert_eq!(
             lines[0].text,
-            "dps live  BYPASS (dry -6.0 dB, L+R level matched)  UNSAVED  clamped 1234"
+            "dps live  [A*] B  BYPASS (dry -6.0 dB)  trim 0.0 dB  clamped 1234"
         );
     }
 
@@ -828,9 +1398,10 @@ mod tests {
         let lines = layout(&view(&tuner), 80, 24, &mut top);
         let text = texts(&lines);
         assert_eq!(lines.len(), 24);
-        assert_eq!(&text[22..], LEGEND);
+        let legend = 24 - LEGEND.len();
+        assert_eq!(&text[legend..], LEGEND);
         let rule = text.iter().rposition(|t| t.starts_with("-----")).unwrap();
-        let message = &text[rule + 1..22];
+        let message = &text[rule + 1..legend];
         assert!(message.len() > 1, "{message:?}");
         assert_eq!(message.join(" "), warning);
         assert!(message.iter().all(|m| m.chars().count() <= 79));
@@ -948,8 +1519,137 @@ mod tests {
     #[test]
     fn the_legend_names_tab_and_fits_80_columns() {
         assert!(LEGEND[0].contains("Tab EQ field"));
-        for line in LEGEND {
+        assert!(LEGEND[1].contains("g graph"));
+        for key in ["a A/B", "c copy", "p next preset", "m match", "x blind"] {
+            assert!(LEGEND[2].contains(key), "{key}");
+        }
+        for key in ["a or Tab", "1 prefer X", "2 prefer Y", "x or Esc"] {
+            assert!(BLIND_LEGEND.iter().any(|l| l.contains(key)), "{key}");
+        }
+        for line in LEGEND.iter().chain(&BLIND_LEGEND) {
             assert!(line.chars().count() <= 79, "{line}");
+        }
+    }
+
+    /// A tuner with B holding a preset, A heard.
+    fn compared() -> Tuner {
+        let mut tuner = Tuner::new(Profile::default(), "music.toml".into());
+        tuner.apply(Action::Switch, 48_000);
+        tuner.apply(Action::Preset, 48_000);
+        tuner.apply(Action::Switch, 48_000);
+        tuner
+    }
+
+    #[test]
+    fn the_status_line_shows_the_slots_and_the_matching_gain() {
+        let mut tuner = compared();
+        let status = |tuner: &Tuner, trim: [f32; 2]| {
+            let mut top = 0;
+            let view = View {
+                trim,
+                ..view(tuner)
+            };
+            layout(&view, 80, 24, &mut top)[0].text.clone()
+        };
+        assert_eq!(
+            status(&tuner, [0.0, -1.34]),
+            "dps live  [A] B*  PROCESSED  trim B -1.3 dB"
+        );
+        assert_eq!(
+            status(&tuner, [-0.02, 0.0]),
+            "dps live  [A] B*  PROCESSED  trim 0.0 dB"
+        );
+        tuner.apply(Action::Switch, 48_000);
+        assert_eq!(
+            status(&tuner, [-2.0, 0.0]),
+            "dps live  A [B*]  PROCESSED  trim A -2.0 dB"
+        );
+        tuner.apply(Action::Matching, 48_000);
+        assert_eq!(
+            status(&tuner, [0.0; 2]),
+            "dps live  A [B*]  PROCESSED  match off"
+        );
+        // The same in both: no matching to speak of.
+        tuner.apply(Action::Copy, 48_000);
+        assert_eq!(status(&tuner, [0.0; 2]), "dps live  A* [B*]  PROCESSED");
+    }
+
+    #[test]
+    fn the_blind_screen_shows_nothing_that_tells_the_slots_apart() {
+        let mut tuner = compared();
+        tuner.apply(Action::Graph, 48_000);
+        tuner.apply(Action::Blind, 48_000);
+        tuner.apply(Action::Vote(0), 48_000);
+        tuner.apply(Action::Vote(1), 48_000);
+        let playing = tuner.trial().unwrap().playing;
+        let mut top = 0;
+        let view = View {
+            clamped: 12,
+            dry_gain: 0.5,
+            meters: readings(),
+            trim: [0.0, -1.3],
+            ..view(&tuner)
+        };
+        let lines = layout(&view, 80, 24, &mut top);
+        let text = texts(&lines);
+        assert_eq!(lines.len(), 24);
+        assert_eq!(text[0], format!("dps live  BLIND  playing {playing}"));
+        assert_eq!(lines[0].style, Style::Bold);
+        assert_eq!(text[1], "trial 3");
+        assert_eq!(&text[24 - BLIND_LEGEND.len()..], BLIND_LEGEND);
+        assert_eq!(
+            text[24 - BLIND_LEGEND.len() - 1],
+            "voted for Y; trial 3: X and Y drawn again"
+        );
+        let all = text.join("\n");
+        for giveaway in [
+            "dB", "Hz", "LUFS", "ms", ":1", "trim", "match", "[A", "[B", "A*", "B*", "clamped",
+            "music", "MacBook",
+        ] {
+            assert!(!all.contains(giveaway), "{giveaway:?} in {text:#?}");
+        }
+        let words: Vec<&str> = all.split(|c: char| !c.is_alphanumeric()).collect();
+        assert!(!words.contains(&"A") && !words.contains(&"B"), "{text:#?}");
+        // No list row, so no selection to show either.
+        assert!(selected(&lines).is_empty());
+        assert!(!all.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)));
+    }
+
+    #[test]
+    fn any_terminal_size_gives_exactly_that_many_lines_with_every_panel() {
+        let plain = Tuner::new(Profile::default(), String::new());
+        let mut graphed = compared();
+        graphed.apply(Action::Graph, 48_000);
+        let mut blind = compared();
+        blind.apply(Action::Blind, 48_000);
+        for tuner in [&plain, &graphed, &blind] {
+            for (width, height) in [
+                (1, 1),
+                (10, 3),
+                (20, 8),
+                (40, 10),
+                (40, 30),
+                (80, 24),
+                (80, 40),
+                (120, 50),
+                (200, 100),
+                (0, 0),
+            ] {
+                let mut top = 0;
+                let view = View {
+                    meters: readings(),
+                    trim: [0.0, -1.3],
+                    ..view(tuner)
+                };
+                let lines = layout(&view, width, height, &mut top);
+                assert_eq!(lines.len(), usize::from(height), "{width}x{height}");
+                let limit = usize::from(width).saturating_sub(1).max(1);
+                assert!(
+                    lines.iter().all(|l| l.text.chars().count() <= limit),
+                    "{width}x{height}: {:#?}",
+                    texts(&lines)
+                );
+            }
         }
     }
 
@@ -966,10 +1666,11 @@ mod tests {
         tuner
     }
 
-    /// Where the last character of each setting's value is.
+    /// Where the last character of each listed setting's value is.
     fn value_ends(lines: &[Line]) -> Vec<usize> {
         lines
             .iter()
+            .filter(|l| l.text.starts_with([' ', '>']))
             .filter_map(|l| l.text.find(" dB").map(|at| at + 2))
             .collect()
     }
@@ -977,7 +1678,8 @@ mod tests {
     #[test]
     fn a_band_row_brackets_its_active_field_and_lines_up_with_the_rest() {
         let mut top = 0;
-        let rows = |tuner: &Tuner, top: &mut usize| layout(&view(tuner), 80, 24, top);
+        // Tall enough to show six dB values above the band.
+        let rows = |tuner: &Tuner, top: &mut usize| layout(&view(tuner), 80, 25, top);
         let tuner = on_band(Profile::default(), 1, 0);
         let lines = rows(&tuner, &mut top);
         assert_eq!(selected(&lines), [">     56.4 Hz  Q 1.50       [+0.0 dB]"]);
@@ -985,7 +1687,8 @@ mod tests {
         assert!(text.contains(&" EQ bands"), "{text:#?}");
         assert!(text.contains(&"      30.0 Hz  Q 1.50        +0.0 dB "));
         // Only the selected band shows brackets.
-        assert_eq!(text.iter().filter(|t| t.contains('[')).count(), 1);
+        let listed = text.iter().filter(|t| t.starts_with([' ', '>']));
+        assert_eq!(listed.filter(|t| t.contains('[')).count(), 1);
         // Every dB value ends in the same column, band or not.
         let ends = value_ends(&lines);
         assert!(ends.len() >= 6, "{text:#?}");
@@ -1054,9 +1757,9 @@ mod tests {
     fn the_status_line_counts_the_bands_the_chain_skips() {
         let tuner = Tuner::new(Profile::default(), String::new());
         for (rate, want) in [
-            (48_000, "dps live  PROCESSED"),
-            (32_000, "dps live  PROCESSED  1 EQ band skipped"),
-            (16_000, "dps live  PROCESSED  2 EQ bands skipped"),
+            (48_000, "dps live  [A] B  PROCESSED"),
+            (32_000, "dps live  [A] B  PROCESSED  1 EQ band skipped"),
+            (16_000, "dps live  [A] B  PROCESSED  2 EQ bands skipped"),
         ] {
             let mut top = 0;
             let lines = layout(
@@ -1088,7 +1791,7 @@ mod tests {
         let lines = layout(&view, 80, 24, &mut top);
         assert_eq!(
             lines[0].text,
-            "dps live  PROCESSED  UNSAVED  clamped 5  1 EQ band skipped"
+            "dps live  [A*] B  PROCESSED  trim 0.0 dB  clamped 5  1 EQ band skipped"
         );
         assert!(selected(&lines)[0].ends_with(" skipped"));
     }
@@ -1108,16 +1811,23 @@ mod tests {
         let mut top = 0;
         let lines = layout(&view(&tuner), 80, 24, &mut top);
         let text = texts(&lines);
-        assert_eq!(&text[22..], LEGEND);
-        assert_eq!(text[20], "reloaded presets/music.toml");
-        assert_eq!(text[21], "save changes to music.toml? y/n (Esc cancels)");
-        assert_eq!(lines[21].style, Style::Bold);
+        let legend = 24 - LEGEND.len();
+        assert_eq!(&text[legend..], LEGEND);
+        assert_eq!(text[legend - 2], "reloaded presets/music.toml");
+        assert_eq!(
+            text[legend - 1],
+            "save changes in A to music.toml? y/n (Esc cancels)"
+        );
+        assert_eq!(lines[legend - 1].style, Style::Bold);
         // A message as long as the whole area still leaves the question.
         tuner.set_message("word ".repeat(200));
         let lines = layout(&view(&tuner), 80, 24, &mut top);
         let text = texts(&lines);
-        assert_eq!(text[21], "save changes to music.toml? y/n (Esc cancels)");
-        assert!(text[20].ends_with("..."), "{}", text[20]);
+        assert_eq!(
+            text[legend - 1],
+            "save changes in A to music.toml? y/n (Esc cancels)"
+        );
+        assert!(text[legend - 2].ends_with("..."), "{}", text[legend - 2]);
         assert_eq!(selected(&lines).len(), 1);
     }
 
@@ -1150,6 +1860,7 @@ mod tests {
             size: (80, 24),
             top: 0,
             clear: false,
+            hold: Hold::default(),
         };
         let notice = screen.notice("waiting\x1b[2J");
         let text = &notice[notice.iter().rposition(|&b| b == b'K').unwrap() + 1..];
