@@ -1917,6 +1917,62 @@ mod tests {
     }
 
     #[test]
+    fn a_bands_frequency_and_q_reach_the_audio_one_chain_per_change() {
+        let dir = Scratch::new("eq");
+        let boosted = "[eq]\ngains_db = [0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]\n";
+        let (mut live, path) = live_in(&dir, boosted, None);
+        let original = live.tuner.profile().clone();
+        let (handoff, controls) = (Handoff::new(), Controls::default());
+        let press = |live: &mut Live, key| {
+            assert!(!live.step(Some(key), 48_000, &handoff, &controls));
+            handoff.take()
+        };
+        // Down to the fourth band, then Tab to its frequency: no new chain.
+        for _ in 0..16 {
+            assert!(press(&mut live, Key::Down).is_none());
+        }
+        assert!(press(&mut live, Key::Tab).is_none());
+        // 199 Hz a sixth of an octave up is 223 Hz.
+        let chain = press(&mut live, Key::Right).expect("a new chain");
+        let mut want = original.clone();
+        want.eq.freqs_hz[3] = 223.0;
+        assert_eq!(live.tuner.profile(), &want);
+        assert!(plays(*chain, &want));
+        assert!(!plays(Processor::new(&original, 48_000, 2), &want));
+        // Nothing more is posted until the next change.
+        assert!(press(&mut live, Key::Tab).is_none());
+        let chain = press(&mut live, Key::ShiftLeft).expect("a new chain");
+        want.eq.q[3] = 1.48;
+        assert_eq!(live.tuner.profile(), &want);
+        assert!(plays(*chain, &want));
+        // A refused step posts nothing: Q cannot go above 20.
+        for _ in 0..30 {
+            press(&mut live, Key::Right);
+        }
+        assert_eq!(live.tuner.profile().eq.q[3], 18.0);
+        assert!(press(&mut live, Key::Right).is_none());
+        assert!(live.tuner.message().starts_with("refused: eq.q[3] = 20.2"));
+        for _ in 0..50 {
+            press(&mut live, Key::Left);
+        }
+        assert_eq!(live.tuner.profile().eq.q[3], 0.111);
+        let chain = press(&mut live, Key::Char('r')).expect("the saved settings again");
+        assert!(plays(*chain, &original));
+        assert_eq!(live.tuner.profile(), &original);
+        // Saved, the file reads back as the edited profile.
+        assert!(press(&mut live, Key::BackTab).is_none());
+        let chain = press(&mut live, Key::ShiftRight).expect("a new chain");
+        let mut want = original.clone();
+        want.eq.freqs_hz[3] = 201.0;
+        assert!(plays(*chain, &want));
+        assert!(press(&mut live, Key::Char('s')).is_none());
+        assert_eq!(super::super::load_profile(&path).unwrap(), want);
+        assert!(fs::read_to_string(&path).unwrap().contains(
+            "freqs_hz = [30.0, 56.4, 106.0, 201.0, 375.0, 705.0, 1327.0, 2497.0, 4698.0, 8839.0, 16000.0]"
+        ));
+    }
+
+    #[test]
     fn a_save_of_the_watched_file_is_played_and_said() {
         let dir = Scratch::new("reload");
         let reports = Arc::new(Reports::default());

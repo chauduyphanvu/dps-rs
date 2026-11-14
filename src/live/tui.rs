@@ -22,7 +22,7 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 
-use super::tuner::{Key, Row, Tuner};
+use super::tuner::{Field, Key, Row, Tuner};
 use super::{SIG_ERR, signal};
 
 /// Set while the terminal is in the tuner's state; cleared once it is back.
@@ -85,8 +85,8 @@ const RESTORE: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l";
 const SEQUENCE_WAIT: Duration = Duration::from_millis(50);
 
 const LEGEND: [&str; 2] = [
-    "j/k Up/Down select   h/l Left/Right change   H/L or Shift: fine   Space on/off",
-    "b bypass (A/B at the same L+R level)   s save   r revert   q quit",
+    "j/k Up/Down select   h/l Left/Right change   H/L or Shift: fine   Tab EQ field",
+    "Space on/off   b bypass (A/B, L+R level matched)   s save   r revert   q quit",
 ];
 const MAX_MESSAGE_LINES: usize = 6;
 
@@ -140,6 +140,11 @@ pub fn layout(view: &View, width: u16, height: u16, top: &mut usize) -> Vec<Line
     if view.clamped > 0 {
         status += &format!("  clamped {}", view.clamped);
     }
+    match tuner.profile().skipped_eq_bands(view.rate).len() {
+        0 => {}
+        1 => status += "  1 EQ band skipped",
+        n => status += &format!("  {n} EQ bands skipped"),
+    }
     let (at, count) = tuner.position();
     let output = format!("{} at {} Hz   ", view.device, view.rate);
     let room = width.saturating_sub(output.chars().count());
@@ -168,24 +173,52 @@ pub fn layout(view: &View, width: u16, height: u16, top: &mut usize) -> Vec<Line
     }
     let fixed = lines.len() + 1 + message.len() + LEGEND.len();
     let list = height.saturating_sub(fixed).max(1);
-    let rows = tuner.rows();
+    let rows = tuner.rows(view.rate);
     scroll(&rows, list, top);
     for i in *top..*top + list {
-        lines.push(match rows.get(i) {
-            Some(Row::Group(name)) => line(format!(" {name}"), Style::Bold),
-            Some(Row::Setting {
-                label,
-                value,
-                selected,
-            }) => {
-                let (marker, style) = if *selected {
-                    ('>', Style::Reverse)
-                } else {
-                    (' ', Style::Plain)
-                };
+        let Some(row) = rows.get(i) else {
+            lines.push(line(String::new(), Style::Plain));
+            continue;
+        };
+        let (marker, style) = if row.selected() {
+            ('>', Style::Reverse)
+        } else {
+            (' ', Style::Plain)
+        };
+        lines.push(match row {
+            Row::Group(name) => line(format!(" {name}"), Style::Bold),
+            Row::Setting { label, value, .. } => {
                 line(format!("{marker}   {label:<20}{value:>12} "), style)
             }
-            None => line(String::new(), Style::Plain),
+            Row::Band {
+                freq,
+                q,
+                gain,
+                active,
+                skipped,
+                ..
+            } => {
+                // Every field keeps a column on each side for the brackets,
+                // so the columns stay put as the active field moves, and
+                // the gain lines up with the other settings' values.
+                let cell = |field, text: &str| {
+                    if *active == Some(field) {
+                        format!("[{text}]")
+                    } else {
+                        format!(" {text} ")
+                    }
+                };
+                let (freq, q, gain) = (
+                    cell(Field::Freq, freq),
+                    cell(Field::Q, q),
+                    cell(Field::Gain, gain),
+                );
+                let skipped = if *skipped { " skipped" } else { "" };
+                line(
+                    format!("{marker} {freq:>12}{q:<10}{gain:>13}{skipped}"),
+                    style,
+                )
+            }
         });
     }
     lines.push(line("-".repeat(width), Style::Plain));
@@ -204,10 +237,7 @@ pub fn layout(view: &View, width: u16, height: u16, top: &mut usize) -> Vec<Line
 /// Moves `top` so the selected row is among the `height` rows shown, with
 /// its group's heading when it is the group's first setting.
 fn scroll(rows: &[Row], height: usize, top: &mut usize) {
-    let selected = rows
-        .iter()
-        .position(|r| matches!(r, Row::Setting { selected: true, .. }))
-        .unwrap_or(0);
+    let selected = rows.iter().position(Row::selected).unwrap_or(0);
     let heading =
         usize::from(height > 1 && selected > 0 && matches!(rows[selected - 1], Row::Group(_)));
     *top = (*top).min(selected - heading);
@@ -328,6 +358,7 @@ fn next_key(bytes: &[u8]) -> Option<(Option<Key>, usize)> {
     Some(match bytes {
         [] | [0x1b] => return None,
         [0x03, ..] => (Some(Key::CtrlC), 1),
+        [b'\t', ..] => (Some(Key::Tab), 1),
         // CSI or SS3: parameter bytes, then a final byte in 0x40..=0x7e.
         [0x1b, b'[' | b'O', rest @ ..] => {
             for (n, &byte) in rest.iter().enumerate() {
@@ -341,6 +372,7 @@ fn next_key(bytes: &[u8]) -> Option<(Option<Key>, usize)> {
                             (b"", b'D') => Some(Key::Left),
                             (b"1;2", b'C') => Some(Key::ShiftRight),
                             (b"1;2", b'D') => Some(Key::ShiftLeft),
+                            (b"", b'Z') => Some(Key::BackTab),
                             _ => None,
                         };
                         return Some((key, 2 + n + 1));
@@ -890,6 +922,170 @@ mod tests {
         assert_eq!(keys(b"\x1b[1;5Cj\x1b[3~k"), [Char('j'), Char('k')]);
         // A sequence cut off at the end of a read is dropped.
         assert_eq!(keys(b"j\x1b[1;"), [Char('j')]);
+    }
+
+    #[test]
+    fn tab_and_shift_tab_are_keys() {
+        use Key::*;
+        assert_eq!(keys(b"\t\x1b[Z\tZ"), [Tab, BackTab, Tab, Char('Z')]);
+        // Shift+Tab cut off anywhere is still one key, not Esc and Z.
+        for split in [[&b"\x1b"[..], b"[Z"], [b"\x1b[", b"Z"]] {
+            assert_eq!(reads(&split), [BackTab], "{split:?}");
+        }
+        assert_eq!(
+            reads(&[b"j\x1b", b"[Z\t", b"k"]),
+            [Char('j'), BackTab, Tab, Char('k')]
+        );
+        // Alt+Z, and Ctrl+Shift+Tab as some terminals send it, are neither.
+        assert_eq!(keys(b"\x1bZ"), []);
+        assert_eq!(keys(b"\x1b[1;5Z"), []);
+    }
+
+    #[test]
+    fn the_legend_names_tab_and_fits_80_columns() {
+        assert!(LEGEND[0].contains("Tab EQ field"));
+        for line in LEGEND {
+            assert!(line.chars().count() <= 79, "{line}");
+        }
+    }
+
+    /// The tuner with band `band` selected and `tabs` presses of Tab made.
+    fn on_band(profile: Profile, band: usize, tabs: usize) -> Tuner {
+        let mut tuner = Tuner::new(profile, String::new());
+        for _ in 0..13 + band {
+            tuner.apply(Action::Down, 48_000);
+        }
+        for _ in 0..tabs {
+            tuner.apply(Action::NextField, 48_000);
+        }
+        tuner
+    }
+
+    /// Where the last character of each setting's value is.
+    fn value_ends(lines: &[Line]) -> Vec<usize> {
+        lines
+            .iter()
+            .filter_map(|l| l.text.find(" dB").map(|at| at + 2))
+            .collect()
+    }
+
+    #[test]
+    fn a_band_row_brackets_its_active_field_and_lines_up_with_the_rest() {
+        let mut top = 0;
+        let rows = |tuner: &Tuner, top: &mut usize| layout(&view(tuner), 80, 24, top);
+        let tuner = on_band(Profile::default(), 1, 0);
+        let lines = rows(&tuner, &mut top);
+        assert_eq!(selected(&lines), [">     56.4 Hz  Q 1.50       [+0.0 dB]"]);
+        let text = texts(&lines);
+        assert!(text.contains(&" EQ bands"), "{text:#?}");
+        assert!(text.contains(&"      30.0 Hz  Q 1.50        +0.0 dB "));
+        // Only the selected band shows brackets.
+        assert_eq!(text.iter().filter(|t| t.contains('[')).count(), 1);
+        // Every dB value ends in the same column, band or not.
+        let ends = value_ends(&lines);
+        assert!(ends.len() >= 6, "{text:#?}");
+        assert!(ends.iter().all(|&e| e == 35), "{text:#?}");
+        // Tab moves the brackets and nothing else.
+        let tuner = on_band(Profile::default(), 1, 1);
+        let lines = rows(&tuner, &mut top);
+        assert_eq!(selected(&lines), [">    [56.4 Hz] Q 1.50        +0.0 dB "]);
+        let tuner = on_band(Profile::default(), 1, 2);
+        let lines = rows(&tuner, &mut top);
+        assert_eq!(selected(&lines), [">     56.4 Hz [Q 1.50]       +0.0 dB "]);
+        assert!(value_ends(&lines).iter().all(|&e| e == 35));
+        let tuner = on_band(Profile::default(), 6, 0);
+        let lines = rows(&tuner, &mut top);
+        assert_eq!(selected(&lines), [">     1327 Hz  Q 1.50       [+0.0 dB]"]);
+    }
+
+    #[test]
+    fn band_rows_with_the_widest_values_fit_80_columns() {
+        // A frequency written by hand with a decimal, the widest Q and gain
+        // on the grids, at 32 kHz where both top bands are skipped.
+        let mut p = Profile::default();
+        p.eq.freqs_hz[0] = 0.0484;
+        p.eq.freqs_hz[9] = 24_000.0;
+        p.eq.freqs_hz[10] = 16_000.5;
+        p.eq.q[0] = 19.9;
+        p.eq.q[9] = 20.0;
+        p.eq.q[10] = 0.101;
+        p.eq.gains_db = [-24.0; 11];
+        p.eq.gains_db[9] = 24.0;
+        for tabs in 0..3 {
+            let tuner = on_band(p.clone(), 10, tabs);
+            let mut top = 0;
+            let lines = layout(
+                &View {
+                    rate: 32_000,
+                    ..view(&tuner)
+                },
+                80,
+                24,
+                &mut top,
+            );
+            let text = texts(&lines);
+            assert!(text.iter().all(|t| t.chars().count() <= 79), "{text:#?}");
+            let want = [
+                ">  16000.5 Hz  Q 0.101     [-24.0 dB] skipped",
+                "> [16000.5 Hz] Q 0.101      -24.0 dB  skipped",
+                ">  16000.5 Hz [Q 0.101]     -24.0 dB  skipped",
+            ][tabs];
+            assert_eq!(selected(&lines), [want]);
+            assert!(
+                text.contains(&"     24000 Hz  Q 20.0       +24.0 dB  skipped"),
+                "{text:#?}"
+            );
+            assert!(value_ends(&lines).iter().all(|&e| e == 35), "{text:#?}");
+            assert!(text[0].ends_with("  2 EQ bands skipped"), "{}", text[0]);
+        }
+        // The lowest band shows its frequency in full.
+        let tuner = on_band(p, 0, 1);
+        let mut top = 0;
+        let lines = layout(&view(&tuner), 80, 24, &mut top);
+        assert_eq!(selected(&lines), [">  [0.0484 Hz] Q 19.9       -24.0 dB "]);
+    }
+
+    #[test]
+    fn the_status_line_counts_the_bands_the_chain_skips() {
+        let tuner = Tuner::new(Profile::default(), String::new());
+        for (rate, want) in [
+            (48_000, "dps live  PROCESSED"),
+            (32_000, "dps live  PROCESSED  1 EQ band skipped"),
+            (16_000, "dps live  PROCESSED  2 EQ bands skipped"),
+        ] {
+            let mut top = 0;
+            let lines = layout(
+                &View {
+                    rate,
+                    ..view(&tuner)
+                },
+                80,
+                24,
+                &mut top,
+            );
+            assert_eq!(lines[0].text, want);
+        }
+        // After unsaved changes and clamping.
+        let mut tuner = on_band(Profile::default(), 10, 0);
+        tuner.apply(
+            Action::Step {
+                up: true,
+                fine: false,
+            },
+            32_000,
+        );
+        let mut top = 0;
+        let view = View {
+            rate: 32_000,
+            clamped: 5,
+            ..view(&tuner)
+        };
+        let lines = layout(&view, 80, 24, &mut top);
+        assert_eq!(
+            lines[0].text,
+            "dps live  PROCESSED  UNSAVED  clamped 5  1 EQ band skipped"
+        );
+        assert!(selected(&lines)[0].ends_with(" skipped"));
     }
 
     #[test]

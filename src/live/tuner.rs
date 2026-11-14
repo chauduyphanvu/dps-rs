@@ -36,7 +36,7 @@ pub enum Setting {
     LowShelf,
     HighShelf,
     Dynamics(Stage, Dynamics),
-    /// The gain of one EQ band.
+    /// One EQ band: its frequency, Q and gain on one row.
     Band(usize),
     StereoEnabled,
     Crossover,
@@ -46,11 +46,114 @@ pub enum Setting {
     LimiterRelease,
 }
 
+/// The value of an EQ band that Left and Right change; other settings have
+/// only one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Field {
+    Freq,
+    Q,
+    Gain,
+}
+
+impl Field {
+    /// The next field to the right in the order shown, frequency, Q, gain,
+    /// going round; or, if not `forward`, the next to the left.
+    fn next(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::Gain, true) | (Self::Q, false) => Self::Freq,
+            (Self::Freq, true) | (Self::Gain, false) => Self::Q,
+            (Self::Q, true) | (Self::Freq, false) => Self::Gain,
+        }
+    }
+}
+
+/// The highest EQ band frequency the tuner steps up to. Nothing above it is
+/// audible, and it is Nyquist at 48 kHz, so a band can still be moved to
+/// where the chain skips it at 44.1 and 48 kHz. Being fixed, what can be
+/// reached does not depend on the device in use while tuning.
+const MAX_BAND_HZ: f32 = 24_000.0;
+
 enum Unit {
     Db,
     Hz,
     Ratio,
     Ms,
+    /// An EQ band's frequency.
+    BandHz,
+    Q,
+}
+
+/// How a value moves on Left and Right.
+#[derive(Clone, Copy)]
+enum Grid {
+    /// To the next multiple of the coarse or the fine step.
+    Linear { coarse: f64, fine: f64 },
+    /// Along `octave_point`s through `anchor`.
+    Octaves { anchor: f64 },
+}
+
+/// `Octaves` grid points per octave, and points per coarse step: fine steps
+/// of 1/48 octave (a quarter semitone, 1.5 %) and coarse ones of 1/6 octave
+/// (a whole tone, 12 %). Q takes the same steps, as what it does is also
+/// proportional: its range, 0.1 to 20, is 46 coarse steps.
+const POINTS_PER_OCTAVE: i32 = 48;
+const POINTS_PER_COARSE_STEP: i32 = 8;
+
+impl Grid {
+    fn step(self, value: f32, up: bool, fine: bool) -> f32 {
+        match self {
+            Self::Linear {
+                coarse,
+                fine: fine_step,
+            } => snap(value, if fine { fine_step } else { coarse }, up),
+            Self::Octaves { anchor } => {
+                let every = if fine { 1 } else { POINTS_PER_COARSE_STEP };
+                step_octaves(value, anchor, every, up)
+            }
+        }
+    }
+}
+
+/// Point `k` of the grid through `anchor`: `anchor * 2^(k/48)` to three
+/// significant figures. Adjacent points stay distinct and in order, as they
+/// are 1.45 % apart and rounding moves each by at most 0.5 %.
+fn octave_point(anchor: f64, k: i32) -> f32 {
+    let exact = anchor * (f64::from(k) / f64::from(POINTS_PER_OCTAVE)).exp2();
+    let decimals = 2 - exact.log10().floor() as i32;
+    // Dividing by an exact power of ten, not multiplying by an inexact one,
+    // gives the f64 nearest the decimal, so the f32 is the one it parses to.
+    // Ties (31.25 Hz) go to even, as the formatter rounds them.
+    let rounded = if decimals >= 0 {
+        let scale = 10f64.powi(decimals);
+        (exact * scale).round_ties_even() / scale
+    } else {
+        let scale = 10f64.powi(-decimals);
+        (exact / scale).round_ties_even() * scale
+    };
+    rounded as f32
+}
+
+/// The point of the grid through `anchor` next above or below `value` whose
+/// index is a multiple of `every`.
+fn step_octaves(value: f32, anchor: f64, every: i32, up: bool) -> f32 {
+    let point = |k| octave_point(anchor, k);
+    let x = (f64::from(value) / anchor).log2() * f64::from(POINTS_PER_OCTAVE);
+    // Rounding moves a point by under half the spacing, so the point one
+    // below `x` is below `value` and the one above `x` is above it.
+    let k = if up {
+        let mut k = x.floor() as i32 - 1;
+        while point(k) <= value {
+            k += 1;
+        }
+        (k + every - 1).div_euclid(every) * every
+    } else {
+        let mut k = x.ceil() as i32 + 1;
+        while point(k) >= value {
+            k -= 1;
+        }
+        k.div_euclid(every) * every
+    };
+    point(k)
 }
 
 impl Setting {
@@ -82,7 +185,7 @@ impl Setting {
             Self::ShelfCorner | Self::LowShelf | Self::HighShelf => "Shelves",
             Self::Dynamics(Stage::One, _) => "Compressor 1",
             Self::Dynamics(Stage::Two, _) => "Compressor 2",
-            Self::Band(_) => "EQ band gains",
+            Self::Band(_) => "EQ bands",
             Self::StereoEnabled
             | Self::Crossover
             | Self::SideBoost
@@ -91,8 +194,8 @@ impl Setting {
         }
     }
 
-    fn label(self, profile: &Profile) -> String {
-        let text = match self {
+    fn label(self) -> &'static str {
+        match self {
             Self::InputGain => "input gain",
             Self::OutputGain => "output gain",
             Self::ShelfCorner => "corner",
@@ -102,20 +205,17 @@ impl Setting {
             Self::Dynamics(_, Dynamics::Ratio) => "ratio",
             Self::Dynamics(_, Dynamics::Attack) => "attack",
             Self::Dynamics(_, Dynamics::Release) | Self::LimiterRelease => "release",
-            Self::Band(i) => {
-                let (freq, q) = (profile.eq.freqs_hz[i], profile.eq.q[i]);
-                return format!("{:>7} Hz  Q {q}", freq.to_string());
-            }
+            Self::Band(_) => "EQ band",
             Self::StereoEnabled | Self::LimiterEnabled => "enabled",
             Self::Crossover => "crossover",
             Self::SideBoost => "side boost",
             Self::Ceiling => "ceiling",
-        };
-        text.into()
+        }
     }
 
-    /// The value this setting changes; `None` for an on/off switch.
-    fn number(self, p: &mut Profile) -> Option<&mut f32> {
+    /// The value this setting changes, `field` of it for an EQ band; `None`
+    /// for an on/off switch.
+    fn number(self, field: Field, p: &mut Profile) -> Option<&mut f32> {
         Some(match self {
             Self::InputGain => &mut p.input_gain_db,
             Self::OutputGain => &mut p.output_gain_db,
@@ -153,7 +253,11 @@ impl Setting {
                     Dynamics::Release => release,
                 }
             }
-            Self::Band(i) => &mut p.eq.gains_db[i],
+            Self::Band(i) => match field {
+                Field::Freq => &mut p.eq.freqs_hz[i],
+                Field::Q => &mut p.eq.q[i],
+                Field::Gain => &mut p.eq.gains_db[i],
+            },
             Self::StereoEnabled | Self::LimiterEnabled => return None,
             Self::Crossover => &mut p.stereo.crossover_hz,
             Self::SideBoost => &mut p.stereo.side_boost_db,
@@ -171,8 +275,13 @@ impl Setting {
         }
     }
 
-    fn unit(self) -> Unit {
+    fn unit(self, field: Field) -> Unit {
         match self {
+            Self::Band(_) => match field {
+                Field::Freq => Unit::BandHz,
+                Field::Q => Unit::Q,
+                Field::Gain => Unit::Db,
+            },
             Self::ShelfCorner | Self::Crossover => Unit::Hz,
             Self::Dynamics(_, Dynamics::Ratio) => Unit::Ratio,
             Self::Dynamics(_, Dynamics::Attack | Dynamics::Release) | Self::LimiterRelease => {
@@ -182,30 +291,49 @@ impl Setting {
         }
     }
 
-    /// The coarse and the fine step.
-    fn steps(self) -> (f64, f64) {
+    fn grid(self, field: Field) -> Grid {
+        let linear = |coarse, fine| Grid::Linear { coarse, fine };
         match self {
-            Self::ShelfCorner => (50.0, 10.0),
-            Self::Crossover => (10.0, 1.0),
-            Self::Dynamics(_, Dynamics::Threshold | Dynamics::Attack) => (1.0, 0.1),
-            Self::Dynamics(_, Dynamics::Release) | Self::LimiterRelease => (10.0, 1.0),
-            _ => (0.5, 0.1),
+            Self::Band(_) => match field {
+                Field::Freq => Grid::Octaves { anchor: 1000.0 },
+                Field::Q => Grid::Octaves { anchor: 1.0 },
+                Field::Gain => linear(0.5, 0.1),
+            },
+            Self::ShelfCorner => linear(50.0, 10.0),
+            Self::Crossover => linear(10.0, 1.0),
+            Self::Dynamics(_, Dynamics::Threshold | Dynamics::Attack) => linear(1.0, 0.1),
+            Self::Dynamics(_, Dynamics::Release) | Self::LimiterRelease => linear(10.0, 1.0),
+            _ => linear(0.5, 0.1),
         }
     }
 
-    fn format(self, profile: &mut Profile) -> String {
-        let Some(&mut v) = self.number(profile) else {
+    fn format(self, field: Field, profile: &mut Profile) -> String {
+        let Some(&mut v) = self.number(field, profile) else {
             let on = *self
                 .switch(profile)
                 .expect("a setting is a number or a switch");
             return if on { "on" } else { "off" }.into();
         };
-        match self.unit() {
+        match self.unit(field) {
             Unit::Db => format!("{} dB", decimal(v, true)),
             Unit::Hz => format!("{v} Hz"),
             Unit::Ratio => format!("{}:1", decimal(v, false)),
             Unit::Ms => format!("{} ms", decimal(v, false)),
+            Unit::BandHz => format!("{} Hz", significant(v)),
+            Unit::Q => format!("Q {}", significant(v)),
         }
+    }
+}
+
+/// Positive `v` to three significant figures, as the octave grids hold
+/// values, or with as many as it needs to be exact.
+fn significant(v: f32) -> String {
+    let decimals = (2 - f64::from(v).log10().floor() as i32).max(0) as usize;
+    let short = format!("{v:.decimals$}");
+    if short.parse::<f32>() == Ok(v) {
+        short
+    } else {
+        format!("{v}")
     }
 }
 
@@ -253,6 +381,9 @@ pub enum Key {
     Right,
     ShiftLeft,
     ShiftRight,
+    Tab,
+    /// Shift+Tab.
+    BackTab,
     /// A printable ASCII character.
     Char(char),
     Esc,
@@ -268,6 +399,9 @@ pub enum Action {
         up: bool,
         fine: bool,
     },
+    /// Move to the EQ band field to the right, or to the left.
+    NextField,
+    PreviousField,
     Toggle,
     Bypass,
     Save,
@@ -300,6 +434,25 @@ pub enum Row {
         value: String,
         selected: bool,
     },
+    Band {
+        freq: String,
+        q: String,
+        gain: String,
+        /// The field Left and Right change, on the selected band only.
+        active: Option<Field>,
+        /// The chain skips the band at the rate the rows were made for.
+        skipped: bool,
+        selected: bool,
+    },
+}
+
+impl Row {
+    pub fn selected(&self) -> bool {
+        match self {
+            Self::Group(_) => false,
+            Self::Setting { selected, .. } | Self::Band { selected, .. } => *selected,
+        }
+    }
 }
 
 pub struct Tuner {
@@ -308,13 +461,16 @@ pub struct Tuner {
     saved: Profile,
     settings: Vec<Setting>,
     selected: usize,
+    /// The field of whichever EQ band is selected that Left and Right change.
+    field: Field,
     bypass: bool,
     /// Asking whether to save before quitting; the question is drawn from
     /// this, not kept in `message`.
     quitting: bool,
     message: String,
-    /// The message is a refusal, cleared by the next change that goes through.
-    refused: bool,
+    /// The message is about the last change, a refusal or a skipped band,
+    /// and is cleared by the next change that goes through.
+    transient: bool,
     /// Where `s` saves, as shown to the user.
     save_to: String,
 }
@@ -326,10 +482,11 @@ impl Tuner {
             profile,
             settings: Setting::all(),
             selected: 0,
+            field: Field::Gain,
             bypass: false,
             quitting: false,
             message: String::new(),
-            refused: false,
+            transient: false,
             save_to,
         }
     }
@@ -358,7 +515,7 @@ impl Tuner {
 
     pub fn set_message(&mut self, message: String) {
         self.message = message;
-        self.refused = false;
+        self.transient = false;
     }
 
     /// Records that the profile was saved.
@@ -381,19 +538,33 @@ impl Tuner {
         edited
     }
 
-    pub fn rows(&self) -> Vec<Row> {
+    /// The settings list, with the EQ bands the chain skips at `rate` marked.
+    pub fn rows(&self, rate: u32) -> Vec<Row> {
         let mut scratch = self.profile.clone();
+        let skipped = self.profile.skipped_eq_bands(rate);
         let mut rows = Vec::new();
         let mut group = "";
-        for (i, setting) in self.settings.iter().enumerate() {
+        for (i, &setting) in self.settings.iter().enumerate() {
             if setting.group() != group {
                 group = setting.group();
                 rows.push(Row::Group(group));
             }
-            rows.push(Row::Setting {
-                label: setting.label(&self.profile),
-                value: setting.format(&mut scratch),
-                selected: i == self.selected,
+            let selected = i == self.selected;
+            let mut format = |field| setting.format(field, &mut scratch);
+            rows.push(match setting {
+                Setting::Band(band) => Row::Band {
+                    freq: format(Field::Freq),
+                    q: format(Field::Q),
+                    gain: format(Field::Gain),
+                    active: selected.then_some(self.field),
+                    skipped: skipped.contains(&band),
+                    selected,
+                },
+                _ => Row::Setting {
+                    label: setting.label().into(),
+                    value: format(self.field),
+                    selected,
+                },
             });
         }
         rows
@@ -431,6 +602,8 @@ impl Tuner {
             Key::Right | Key::Char('l') => step(true, false),
             Key::ShiftLeft | Key::Char('H') => step(false, true),
             Key::ShiftRight | Key::Char('L') => step(true, true),
+            Key::Tab => Action::NextField,
+            Key::BackTab => Action::PreviousField,
             Key::Char(' ') => Action::Toggle,
             Key::Char('b') => Action::Bypass,
             Key::Char('s') => Action::Save,
@@ -454,11 +627,37 @@ impl Tuner {
                 let mut candidate = self.profile.clone();
                 if let Some(on) = setting.switch(&mut candidate) {
                     *on = !*on;
-                } else if let Some(value) = setting.number(&mut candidate) {
-                    let (coarse, fine_step) = setting.steps();
-                    *value = snap(*value, if fine { fine_step } else { coarse }, up);
+                } else if let Some(value) = setting.number(self.field, &mut candidate) {
+                    let next = setting.grid(self.field).step(*value, up, fine);
+                    if let (Setting::Band(i), Field::Freq) = (setting, self.field)
+                        && up
+                        && next > MAX_BAND_HZ
+                    {
+                        return self.refuse(format!(
+                            "eq.freqs_hz[{i}] = {next} Hz is above the tuner's {MAX_BAND_HZ} Hz limit"
+                        ));
+                    }
+                    *value = next;
                 }
-                self.offer(candidate, rate)
+                let effect = self.offer(candidate, rate);
+                if let Setting::Band(i) = setting
+                    && effect == Effect::Apply
+                    && self.profile.skipped_eq_bands(rate).contains(&i)
+                {
+                    self.message = format!(
+                        "this band is skipped at {rate} Hz: a band's centre and bandwidth \
+                         (freq / Q) must be below {} Hz",
+                        f64::from(rate) / 2.0
+                    );
+                    self.transient = true;
+                }
+                effect
+            }
+            Action::NextField | Action::PreviousField => {
+                if let Setting::Band(_) = setting {
+                    self.field = self.field.next(action == Action::NextField);
+                }
+                Effect::None
             }
             Action::Toggle => {
                 let mut candidate = self.profile.clone();
@@ -509,17 +708,19 @@ impl Tuner {
         match candidate.validate(rate) {
             Ok(()) => {
                 self.profile = candidate;
-                if self.refused {
+                if self.transient {
                     self.set_message(String::new());
                 }
                 Effect::Apply
             }
-            Err(e) => {
-                self.message = format!("refused: {e}");
-                self.refused = true;
-                Effect::None
-            }
+            Err(e) => self.refuse(e),
         }
+    }
+
+    fn refuse(&mut self, reason: String) -> Effect {
+        self.message = format!("refused: {reason}");
+        self.transient = true;
+        Effect::None
     }
 }
 
@@ -615,8 +816,10 @@ mod tests {
         assert_eq!(t.settings[t.selected], setting);
     }
 
+    /// The selected row's label and value; for a band, its frequency and Q,
+    /// and its gain.
     fn selected(t: &Tuner) -> (String, String) {
-        t.rows()
+        t.rows(RATE)
             .into_iter()
             .find_map(|row| match row {
                 Row::Setting {
@@ -624,6 +827,13 @@ mod tests {
                     value,
                     selected: true,
                 } => Some((label, value)),
+                Row::Band {
+                    freq,
+                    q,
+                    gain,
+                    selected: true,
+                    ..
+                } => Some((format!("{freq}  {q}"), gain)),
                 _ => None,
             })
             .unwrap()
@@ -631,12 +841,12 @@ mod tests {
 
     #[test]
     fn every_setting_is_listed_once_under_its_group() {
-        let rows = tuner().rows();
+        let rows = tuner().rows(RATE);
         let groups: Vec<&str> = rows
             .iter()
             .filter_map(|r| match r {
                 Row::Group(g) => Some(*g),
-                Row::Setting { .. } => None,
+                _ => None,
             })
             .collect();
         assert_eq!(
@@ -646,7 +856,7 @@ mod tests {
                 "Shelves",
                 "Compressor 1",
                 "Compressor 2",
-                "EQ band gains",
+                "EQ bands",
                 "Stereo",
                 "Limiter"
             ]
@@ -658,6 +868,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 Row::Setting { label, value, .. } => Some(format!("{label}: {value}")),
+                Row::Band { freq, q, gain, .. } => Some(format!("{freq}  {q}: {gain}")),
                 Row::Group(_) => None,
             })
             .collect();
@@ -666,9 +877,12 @@ mod tests {
         assert_eq!(labels[3], "low shelf: -10.0 dB");
         assert_eq!(labels[6], "ratio: 4.0:1");
         assert_eq!(labels[8], "release: 100.0 ms");
-        assert_eq!(labels[13], "     30 Hz  Q 1.5: +0.0 dB");
-        assert_eq!(labels[14], "   56.4 Hz  Q 1.5: +0.0 dB");
-        assert_eq!(labels[23], "  16000 Hz  Q 1.5: +0.0 dB");
+        assert_eq!(labels[13], "30.0 Hz  Q 1.50: +0.0 dB");
+        assert_eq!(labels[14], "56.4 Hz  Q 1.50: +0.0 dB");
+        assert_eq!(labels[17], "375 Hz  Q 1.50: +0.0 dB");
+        // Off the three-figure grid, shown exactly.
+        assert_eq!(labels[19], "1327 Hz  Q 1.50: +0.0 dB");
+        assert_eq!(labels[23], "16000 Hz  Q 1.50: +0.0 dB");
         assert_eq!(labels[24], "enabled: off");
         assert_eq!(labels[30], "release: 200.0 ms");
         assert_eq!(labels[31], "enabled: on");
@@ -1060,11 +1274,595 @@ mod tests {
         // As a hand-written profile can hold it.
         let p: Profile = toml::from_str("low_shelf_db = -0.0").unwrap();
         let t = Tuner::new(p, String::new());
-        let low = t.rows().into_iter().find_map(|row| match row {
+        let low = t.rows(RATE).into_iter().find_map(|row| match row {
             Row::Setting { label, value, .. } if label == "low shelf" => Some(value),
             _ => None,
         });
         assert_eq!(low.as_deref(), Some("+0.0 dB"));
+    }
+
+    /// Point `k` of the grid through `anchor`, worked out apart from
+    /// `octave_point`: `anchor * 2^(k/48)` to three significant figures, as
+    /// the formatter rounds it.
+    fn point(anchor: f64, k: i32) -> f32 {
+        format!("{:.2e}", anchor * 2f64.powf(f64::from(k) / 48.0))
+            .parse()
+            .unwrap()
+    }
+
+    /// The point of the grid through `anchor` nearest `value` in the
+    /// direction of `up` whose index is a multiple of `every`, found by
+    /// trying every index.
+    fn next_point(anchor: f64, value: f32, every: i32, up: bool) -> f32 {
+        let candidates = (-1200..=600)
+            .filter(|k: &i32| k.rem_euclid(every) == 0)
+            .map(|k| point(anchor, k));
+        if up {
+            candidates.filter(|&p| p > value).reduce(f32::min).unwrap()
+        } else {
+            candidates.filter(|&p| p < value).reduce(f32::max).unwrap()
+        }
+    }
+
+    /// Moves up or down to band `band` and makes `field` the active one,
+    /// with Tab.
+    fn select_field(t: &mut Tuner, band: usize, field: Field) {
+        let target = t
+            .settings
+            .iter()
+            .position(|&s| s == Setting::Band(band))
+            .unwrap();
+        while t.selected != target {
+            let key = if t.selected < target {
+                Key::Down
+            } else {
+                Key::Up
+            };
+            assert_eq!(press(t, key), Effect::None);
+        }
+        while t.field != field {
+            assert_eq!(press(t, Key::Tab), Effect::None);
+        }
+    }
+
+    /// The field shown as active, and on which band row.
+    fn active(t: &Tuner) -> Vec<(usize, Field)> {
+        let bands = t
+            .rows(RATE)
+            .into_iter()
+            .filter(|r| matches!(r, Row::Band { .. }));
+        bands
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                Row::Band {
+                    active: Some(f), ..
+                } => Some((i, f)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Which bands the rows mark as skipped at `rate`.
+    fn marked_skipped(t: &Tuner, rate: u32) -> Vec<usize> {
+        let bands = t
+            .rows(rate)
+            .into_iter()
+            .filter(|r| matches!(r, Row::Band { .. }));
+        bands
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                Row::Band { skipped: true, .. } => Some(i),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tab_moves_through_a_bands_fields_and_the_field_stays_across_bands() {
+        let mut t = tuner();
+        select(&mut t, Setting::Band(0));
+        assert_eq!(active(&t), [(0, Field::Gain)]);
+        // Tab goes right through frequency, Q and gain; Shift+Tab goes left.
+        for want in [Field::Freq, Field::Q, Field::Gain, Field::Freq] {
+            assert_eq!(press(&mut t, Key::Tab), Effect::None);
+            assert_eq!(active(&t), [(0, want)]);
+        }
+        for want in [Field::Gain, Field::Q, Field::Freq, Field::Gain, Field::Q] {
+            assert_eq!(press(&mut t, Key::BackTab), Effect::None);
+            assert_eq!(active(&t), [(0, want)]);
+        }
+        assert!(!t.dirty());
+        // Q stays the field on the next band, where Right changes that
+        // band's Q and nothing else.
+        press(&mut t, Key::Down);
+        assert_eq!(active(&t), [(1, Field::Q)]);
+        assert_eq!(press(&mut t, Key::Right), Effect::Apply);
+        let mut want = Profile::default();
+        want.eq.q[1] = 1.59;
+        assert_eq!(t.profile(), &want);
+        // Up through the settings above the bands, which step as before,
+        // and back: Q is still the field.
+        press(&mut t, Key::Up);
+        press(&mut t, Key::Up);
+        assert_eq!(selected(&t), ("release".into(), "100.0 ms".into()));
+        assert_eq!(press(&mut t, Key::Right), Effect::Apply);
+        assert_eq!(t.profile().compressor2.release_ms, 110.0);
+        select(&mut t, Setting::Band(7));
+        assert_eq!(active(&t), [(7, Field::Q)]);
+        // Below the bands, a switch still switches.
+        select(&mut t, Setting::StereoEnabled);
+        assert_eq!(active(&t), []);
+        assert_eq!(press(&mut t, Key::Left), Effect::Apply);
+        assert!(t.profile().stereo.enabled);
+        // A reload keeps the field too.
+        assert!(t.reload(Profile::default()));
+        press(&mut t, Key::Up);
+        assert_eq!(active(&t), [(10, Field::Q)]);
+    }
+
+    #[test]
+    fn tab_does_nothing_on_other_rows() {
+        let mut t = tuner();
+        t.set_message("now on External Headphones at 44100 Hz".into());
+        for setting in [
+            Setting::InputGain,
+            Setting::Dynamics(Stage::Two, Dynamics::Release),
+            Setting::StereoEnabled,
+            Setting::LimiterRelease,
+        ] {
+            select(&mut t, setting);
+            for key in [Key::Tab, Key::BackTab, Key::Tab] {
+                assert_eq!(press(&mut t, key), Effect::None, "{setting:?}");
+            }
+            assert_eq!(t.settings[t.selected], setting);
+        }
+        assert!(!t.dirty());
+        assert_eq!(t.message(), "now on External Headphones at 44100 Hz");
+        // The field did not move: on a band, gain is still the one changed.
+        while t.selected > 13 {
+            press(&mut t, Key::Up);
+        }
+        assert_eq!(t.settings[t.selected], Setting::Band(0));
+        assert_eq!(active(&t), [(0, Field::Gain)]);
+        assert_eq!(press(&mut t, Key::Right), Effect::Apply);
+        assert_eq!(t.profile().eq.gains_db[0], 0.5);
+        // While asking whether to save, Tab does nothing either.
+        press(&mut t, Key::Char('q'));
+        assert_eq!(press(&mut t, Key::Tab), Effect::None);
+        assert_eq!(press(&mut t, Key::BackTab), Effect::None);
+        assert!(t.prompt().is_some());
+        assert_eq!(press(&mut t, Key::Esc), Effect::None);
+        assert_eq!(active(&t), [(0, Field::Gain)]);
+    }
+
+    #[test]
+    fn frequency_and_q_grids_are_48ths_of_an_octave_to_three_figures() {
+        // Every point from below the lowest band frequency any rate allows
+        // to above the tuner's limit, and over Q's whole range, stepped both
+        // ways by the fine and the coarse step.
+        for (anchor, lo, hi) in [(1000.0, -820, 230), (1.0, -165, 212)] {
+            for k in lo..=hi {
+                let value = point(anchor, k);
+                assert_eq!(octave_point(anchor, k), value, "{anchor} {k}");
+                let coarse_up = (k.div_euclid(8) + 1) * 8;
+                let coarse_down = (k + 7).div_euclid(8) * 8 - 8;
+                for (every, up, want) in [
+                    (1, true, k + 1),
+                    (1, false, k - 1),
+                    (8, true, coarse_up),
+                    (8, false, coarse_down),
+                ] {
+                    assert_eq!(
+                        step_octaves(value, anchor, every, up),
+                        point(anchor, want),
+                        "{anchor} {value} every {every} up={up}"
+                    );
+                }
+            }
+        }
+        // Values off the grid, as the defaults and hand-written files have
+        // them, go to the nearest point in the step's direction.
+        for value in [30.0, 56.4, 106.0, 1327.0, 4698.0, 8839.0, 30_000.0, 0.05] {
+            for (every, up) in [(1, true), (1, false), (8, true), (8, false)] {
+                assert_eq!(
+                    step_octaves(value, 1000.0, every, up),
+                    next_point(1000.0, value, every, up),
+                    "{value} every {every} up={up}"
+                );
+            }
+        }
+        for value in [std::f32::consts::FRAC_1_SQRT_2, 2.5, 20.0, 0.1, 1.0] {
+            for (every, up) in [(1, true), (1, false), (8, true), (8, false)] {
+                assert_eq!(
+                    step_octaves(value, 1.0, every, up),
+                    next_point(1.0, value, every, up),
+                    "Q {value} every {every} up={up}"
+                );
+            }
+        }
+        // As the keys step them, from numbers worked out by hand.
+        let mut t = tuner();
+        select_field(&mut t, 10, Field::Freq);
+        let mut freqs = vec![];
+        for key in [Key::Right, Key::ShiftLeft, Key::Left, Key::Left] {
+            assert_eq!(press(&mut t, key), Effect::Apply);
+            freqs.push(t.profile().eq.freqs_hz[10]);
+        }
+        assert_eq!(freqs, [18_000.0, 17_700.0, 16_000.0, 14_300.0]);
+        select_field(&mut t, 0, Field::Freq);
+        for key in [Key::ShiftRight, Key::ShiftLeft, Key::ShiftLeft, Key::Right] {
+            press(&mut t, key);
+            freqs.push(t.profile().eq.freqs_hz[0]);
+        }
+        assert_eq!(&freqs[4..], [30.4, 29.9, 29.5, 31.2]);
+        assert_eq!(selected(&t).0, "31.2 Hz  Q 1.50");
+        press(&mut t, Key::Tab);
+        for key in [
+            Key::ShiftRight,
+            Key::Right,
+            Key::Left,
+            Key::Left,
+            Key::ShiftLeft,
+        ] {
+            press(&mut t, key);
+            freqs.push(t.profile().eq.q[0]);
+        }
+        assert_eq!(&freqs[8..], [1.52, 1.59, 1.41, 1.26, 1.24]);
+        assert_eq!(selected(&t).0, "31.2 Hz  Q 1.24");
+    }
+
+    #[test]
+    fn frequency_and_q_return_to_their_start_and_never_drift() {
+        let mut p = Profile::default();
+        p.eq.freqs_hz[5] = 1000.0;
+        let mut t = Tuner::new(p, String::new());
+        select_field(&mut t, 5, Field::Freq);
+        // 200 fine steps up and back, each on the grid.
+        for (key, step) in [(Key::ShiftRight, 1), (Key::ShiftLeft, -1)] {
+            for i in 1..=200 {
+                assert_eq!(press(&mut t, key), Effect::Apply);
+                let k = if step > 0 { i } else { 200 - i };
+                assert_eq!(t.profile().eq.freqs_hz[5], point(1000.0, k), "{k}");
+            }
+        }
+        assert_eq!(t.profile().eq.freqs_hz[5], 1000.0);
+        assert!(!t.dirty());
+        // Coarse steps up to the limit and back down.
+        for _ in 0..27 {
+            assert_eq!(press(&mut t, Key::Right), Effect::Apply);
+        }
+        assert_eq!(t.profile().eq.freqs_hz[5], 22_600.0);
+        for _ in 0..27 {
+            assert_eq!(press(&mut t, Key::Left), Effect::Apply);
+        }
+        assert_eq!(t.profile().eq.freqs_hz[5], 1000.0);
+        // A thousand fine steps up stop at the limit, a thousand down stop
+        // at the lowest frequency 48 kHz allows (0.048 Hz), and 688 back up
+        // come to 1000 Hz exactly.
+        for _ in 0..1000 {
+            press(&mut t, Key::ShiftRight);
+        }
+        assert_eq!(t.profile().eq.freqs_hz[5], 24_000.0);
+        for _ in 0..1000 {
+            press(&mut t, Key::ShiftLeft);
+        }
+        assert_eq!(t.profile().eq.freqs_hz[5], 0.0484);
+        for _ in 0..688 {
+            assert_eq!(press(&mut t, Key::ShiftRight), Effect::Apply);
+        }
+        assert_eq!(t.profile().eq.freqs_hz[5], 1000.0);
+
+        // Q likewise, from the default 1.5, which is on the fine grid, and
+        // from 1.41, which is on the coarse one.
+        press(&mut t, Key::Tab);
+        for _ in 0..150 {
+            press(&mut t, Key::ShiftRight);
+        }
+        assert_eq!(t.profile().eq.q[5], point(1.0, 178));
+        for _ in 0..150 {
+            press(&mut t, Key::ShiftLeft);
+        }
+        assert_eq!(t.profile().eq.q[5], 1.5);
+        press(&mut t, Key::Left);
+        assert_eq!(t.profile().eq.q[5], 1.41);
+        for _ in 0..40 {
+            press(&mut t, Key::Left);
+        }
+        assert_eq!(t.profile().eq.q[5], 0.111);
+        for _ in 0..50 {
+            press(&mut t, Key::Right);
+        }
+        assert_eq!(t.profile().eq.q[5], 18.0);
+        for _ in 0..22 {
+            assert_eq!(press(&mut t, Key::Left), Effect::Apply);
+        }
+        assert_eq!(t.profile().eq.q[5], 1.41);
+    }
+
+    #[test]
+    fn frequency_and_q_stop_at_their_limits_with_the_reason() {
+        let mut p = Profile::default();
+        p.eq.freqs_hz[0] = 0.0484;
+        let mut t = Tuner::new(p.clone(), String::new());
+        select_field(&mut t, 0, Field::Freq);
+        // The lowest frequency is the rate's: fs / 1e6.
+        assert_eq!(press(&mut t, Key::ShiftLeft), Effect::None);
+        assert_eq!(
+            t.message(),
+            "refused: eq.freqs_hz[0] = 0.0477 Hz must be at least 0.048 Hz at 48000 Hz sample rate"
+        );
+        assert_eq!(t.profile(), &p);
+        assert_eq!(t.key(Key::ShiftRight, 192_000), Effect::None);
+        assert!(
+            t.message()
+                .starts_with("refused: eq.freqs_hz[0] = 0.0491 Hz must be at least 0.192 Hz"),
+            "{}",
+            t.message()
+        );
+        // The next change that goes through clears the refusal.
+        assert_eq!(press(&mut t, Key::ShiftRight), Effect::Apply);
+        assert_eq!(t.message(), "");
+
+        // The highest is the tuner's 24 kHz, whatever the rate.
+        let mut p = Profile::default();
+        p.eq.freqs_hz[9] = 23_600.0;
+        p.eq.freqs_hz[10] = 30_000.0;
+        p.eq.q[1] = 0.101;
+        p.eq.q[2] = 19.9;
+        p.eq.q[3] = 20.0;
+        let mut t = Tuner::new(p, String::new());
+        select_field(&mut t, 9, Field::Freq);
+        assert_eq!(t.key(Key::ShiftRight, 96_000), Effect::Apply);
+        assert_eq!(t.profile().eq.freqs_hz[9], 24_000.0);
+        assert_eq!(t.key(Key::ShiftRight, 96_000), Effect::None);
+        assert_eq!(
+            t.message(),
+            "refused: eq.freqs_hz[9] = 24300 Hz is above the tuner's 24000 Hz limit"
+        );
+        assert_eq!(press(&mut t, Key::Left), Effect::Apply);
+        assert_eq!(t.profile().eq.freqs_hz[9], 22_600.0);
+        assert_eq!(press(&mut t, Key::Right), Effect::None);
+        assert_eq!(
+            t.message(),
+            "refused: eq.freqs_hz[9] = 25400 Hz is above the tuner's 24000 Hz limit"
+        );
+        // A band set above it by hand can come down but not go up.
+        press(&mut t, Key::Down);
+        assert_eq!(press(&mut t, Key::ShiftRight), Effect::None);
+        assert_eq!(t.profile().eq.freqs_hz[10], 30_000.0);
+        assert_eq!(press(&mut t, Key::Left), Effect::Apply);
+        assert_eq!(t.profile().eq.freqs_hz[10], 28_500.0);
+
+        // Q stays within 0.1..=20, the range validation sets.
+        select_field(&mut t, 1, Field::Q);
+        assert_eq!(press(&mut t, Key::ShiftLeft), Effect::None);
+        assert_eq!(t.message(), "refused: eq.q[1] = 0.0992 is outside 0.1..=20");
+        assert_eq!(press(&mut t, Key::Down), Effect::None);
+        assert_eq!(press(&mut t, Key::ShiftRight), Effect::None);
+        assert_eq!(t.message(), "refused: eq.q[2] = 20.2 is outside 0.1..=20");
+        assert_eq!(press(&mut t, Key::Left), Effect::Apply);
+        assert_eq!(t.profile().eq.q[2], 18.0);
+        assert_eq!(t.message(), "");
+        press(&mut t, Key::Down);
+        assert_eq!(press(&mut t, Key::ShiftLeft), Effect::Apply);
+        assert_eq!(t.profile().eq.q[3], 19.9);
+    }
+
+    #[test]
+    fn bands_the_chain_skips_are_marked_and_said() {
+        // At 44.1 kHz Nyquist is 22050 Hz: the top band, moved up from
+        // 22000 Hz, is skipped at 22300 Hz.
+        let mut p = Profile::default();
+        p.eq.freqs_hz[10] = 22_000.0;
+        let mut t = Tuner::new(p, String::new());
+        select_field(&mut t, 10, Field::Freq);
+        assert_eq!(marked_skipped(&t, 44_100), []);
+        assert_eq!(t.key(Key::ShiftRight, 44_100), Effect::Apply);
+        assert_eq!(t.profile().eq.freqs_hz[10], 22_300.0);
+        assert_eq!(marked_skipped(&t, 44_100), [10]);
+        let said = "this band is skipped at 44100 Hz: a band's centre and bandwidth (freq / Q) \
+                    must be below 22050 Hz";
+        assert_eq!(t.message(), said);
+        // It can go further, and a change to another field says it again.
+        assert_eq!(t.key(Key::Right, 44_100), Effect::Apply);
+        t.set_message(String::new());
+        press(&mut t, Key::BackTab);
+        assert_eq!(t.key(Key::Right, 44_100), Effect::Apply);
+        assert_eq!(t.profile().eq.gains_db[10], 0.5);
+        assert_eq!(t.message(), said);
+        // Played again, the notice goes.
+        press(&mut t, Key::Tab);
+        assert_eq!(t.key(Key::ShiftLeft, 44_100), Effect::Apply);
+        assert_eq!(t.message(), said);
+        assert_eq!(t.key(Key::ShiftLeft, 44_100), Effect::Apply);
+        assert_eq!(t.profile().eq.freqs_hz[10], 22_000.0);
+        assert_eq!(marked_skipped(&t, 44_100), []);
+        assert_eq!(t.message(), "");
+
+        // A small Q skips a band too: at 48 kHz, 16 kHz with Q 0.667 spans
+        // 23988 Hz and plays, with Q 0.658 it spans 24316 Hz.
+        let mut p = Profile::default();
+        p.eq.q[10] = 0.667;
+        let mut t = Tuner::new(p, String::new());
+        select_field(&mut t, 10, Field::Q);
+        assert_eq!(marked_skipped(&t, RATE), []);
+        assert_eq!(press(&mut t, Key::ShiftLeft), Effect::Apply);
+        assert_eq!(t.profile().eq.q[10], 0.658);
+        assert_eq!(marked_skipped(&t, RATE), [10]);
+        assert!(t.message().starts_with("this band is skipped at 48000 Hz"));
+        assert_eq!(press(&mut t, Key::ShiftRight), Effect::Apply);
+        assert_eq!(marked_skipped(&t, RATE), []);
+
+        // The marks follow the rate the rows are made for: the bands at or
+        // above Nyquist, or with freq / Q there, worked out in f64.
+        let mut p = Profile::default();
+        p.eq.q = [1.5, 0.2, 1.5, 1.5, 1.5, 0.15, 1.5, 0.5, 1.5, 0.9, 1.5];
+        let t = Tuner::new(p.clone(), String::new());
+        for rate in [
+            8_000, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 96_000,
+        ] {
+            let nyquist = f64::from(rate) / 2.0;
+            let want: Vec<usize> = (0..EQ_BANDS)
+                .filter(|&i| {
+                    let (f, q) = (f64::from(p.eq.freqs_hz[i]), f64::from(p.eq.q[i]));
+                    f >= nyquist || f / q >= nyquist
+                })
+                .collect();
+            assert_eq!(marked_skipped(&t, rate), want, "{rate} Hz");
+        }
+        assert_eq!(marked_skipped(&t, 32_000), [10]);
+        assert_eq!(marked_skipped(&t, 16_000), [9, 10]);
+        assert_eq!(marked_skipped(&t, 8_000), [5, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn a_step_changes_only_its_own_value_of_its_own_band() {
+        for band in 0..EQ_BANDS {
+            for field in [Field::Freq, Field::Q, Field::Gain] {
+                for (key, up, every) in [(Key::Right, true, 8), (Key::ShiftLeft, false, 1)] {
+                    let mut t = tuner();
+                    select_field(&mut t, band, field);
+                    assert_eq!(press(&mut t, key), Effect::Apply, "{band} {field:?}");
+                    let mut want = Profile::default();
+                    let eq = &mut want.eq;
+                    match field {
+                        Field::Freq => {
+                            eq.freqs_hz[band] = next_point(1000.0, eq.freqs_hz[band], every, up)
+                        }
+                        Field::Q => eq.q[band] = next_point(1.0, 1.5, every, up),
+                        Field::Gain => eq.gains_db[band] = if up { 0.5 } else { -0.1 },
+                    }
+                    assert_eq!(t.profile(), &want, "{band} {field:?} {key:?}");
+                }
+            }
+        }
+    }
+
+    /// A small deterministic generator, so a failing walk can be replayed.
+    struct Walk(u64);
+
+    impl Walk {
+        fn next(&mut self, below: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % below
+        }
+    }
+
+    #[test]
+    fn random_walks_over_the_bands_save_and_read_back_exactly() {
+        let dir = scratch_dir("walk");
+        let path = dir.join("walk.toml");
+        let mut walk = Walk(0x2545_f491_4f6c_dd1d);
+        let first = 13;
+        let last = first + EQ_BANDS - 1;
+        let mut changes = 0;
+        for round in 0..24 {
+            let rate = [44_100, 48_000, 96_000][round % 3];
+            let mut t = tuner();
+            select(&mut t, Setting::Band(walk.next(EQ_BANDS as u64) as usize));
+            for _ in 0..400 {
+                let key = match walk.next(12) {
+                    0 if t.selected > first => Key::Up,
+                    1 if t.selected < last => Key::Down,
+                    2 => Key::Tab,
+                    3 => Key::BackTab,
+                    4 | 5 => Key::Left,
+                    6 | 7 => Key::Right,
+                    8 | 9 => Key::ShiftLeft,
+                    _ => Key::ShiftRight,
+                };
+                let before = t.profile().clone();
+                let effect = t.key(key, rate);
+                // A chain is posted exactly when something changed.
+                match effect {
+                    Effect::Apply => assert_ne!(t.profile(), &before, "{key:?}"),
+                    Effect::None => assert_eq!(t.profile(), &before, "{key:?}"),
+                    other => panic!("{other:?} from {key:?}"),
+                }
+                changes += usize::from(effect == Effect::Apply);
+                let p = t.profile();
+                assert_eq!(p.validate(rate), Ok(()));
+                for i in 0..EQ_BANDS {
+                    let (f, q) = (p.eq.freqs_hz[i], p.eq.q[i]);
+                    assert!(f <= MAX_BAND_HZ, "{f}");
+                    // Each value is a default or has three figures at most.
+                    let three = |v: f32| format!("{v:.2e}").parse::<f32>() == Ok(v);
+                    let default = Profile::default().eq;
+                    assert!(three(f) || f == default.freqs_hz[i], "{f}");
+                    assert!(three(q), "{q}");
+                }
+            }
+            save(&path, t.profile()).unwrap();
+            let back: Profile = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(&back, t.profile(), "round {round}");
+        }
+        assert!(changes > 5000, "{changes}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_reachable_frequency_and_q_is_saved_as_its_three_figures() {
+        // Frequencies from the lowest 8 kHz allows up to the tuner's limit,
+        // Q over its range, eleven to a profile.
+        let freqs: Vec<i32> = (-812..=220).collect();
+        let qs: Vec<i32> = (-159..=207).collect();
+        assert_eq!(point(1000.0, -812), 0.00808);
+        assert_eq!(point(1000.0, 220), MAX_BAND_HZ);
+        assert_eq!((point(1.0, -159), point(1.0, 207)), (0.101, 19.9));
+        for (anchor, ks, key) in [(1000.0, freqs, "freqs_hz"), (1.0, qs, "q")] {
+            for chunk in ks.chunks(EQ_BANDS) {
+                let mut p = Profile::default();
+                let values = if anchor == 1.0 {
+                    &mut p.eq.q
+                } else {
+                    &mut p.eq.freqs_hz
+                };
+                for (slot, &k) in values.iter_mut().zip(chunk) {
+                    *slot = octave_point(anchor, k);
+                }
+                let text = toml::to_string(&p).unwrap();
+                let back: Profile = toml::from_str(&text).unwrap();
+                assert_eq!(back, p);
+                // The file holds the decimal itself, such as 56.5, not the
+                // f32's binary expansion.
+                let line = text
+                    .lines()
+                    .find(|l| l.starts_with(&format!("{key} = [")))
+                    .unwrap();
+                let saved: Vec<f64> = line[key.len() + 4..line.len() - 1]
+                    .split(", ")
+                    .map(|n| n.parse().unwrap())
+                    .collect();
+                for (&saved, &k) in saved.iter().zip(chunk) {
+                    let decimal = format!("{:.2e}", anchor * 2f64.powf(f64::from(k) / 48.0));
+                    assert_eq!(saved, decimal.parse::<f64>().unwrap(), "{line}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frequencies_and_q_show_three_figures_or_all_they_need() {
+        for (v, want) in [
+            (30.0, "30.0"),
+            (56.5, "56.5"),
+            (9.44, "9.44"),
+            (0.0484, "0.0484"),
+            (1000.0, "1000"),
+            (16_000.0, "16000"),
+            (1327.0, "1327"),
+            (0.1, "0.100"),
+            (1.5, "1.50"),
+            (20.0, "20.0"),
+            (0.707, "0.707"),
+            (16_000.5, "16000.5"),
+            (99.95, "99.95"),
+            (std::f32::consts::FRAC_1_SQRT_2, "0.70710677"),
+        ] {
+            assert_eq!(significant(v), want);
+        }
     }
 
     fn scratch_dir(name: &str) -> std::path::PathBuf {
