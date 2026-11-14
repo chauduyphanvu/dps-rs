@@ -30,13 +30,14 @@ const DEFAULT: &str = "default";
 /// System volume given to every configuration whose loudness contour is on.
 const CONTOUR_VOLUME_DB: f32 = -40.0;
 
-const PRESETS: [(&str, &str); 4] = [
+const PRESETS: [(&str, &str); 5] = [
     ("headphones", include_str!("../presets/headphones.toml")),
     (
         "laptop-speakers",
         include_str!("../presets/laptop-speakers.toml"),
     ),
     ("music", include_str!("../presets/music.toml")),
+    ("night", include_str!("../presets/night.toml")),
     ("voice", include_str!("../presets/voice.toml")),
 ];
 
