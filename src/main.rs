@@ -37,6 +37,7 @@ Examples:
   dps doctor                Check that live mode can work here
   dps process song.flac     Write song.dps.flac (formats other than WAV use ffmpeg)
   dps import hd650.txt      Import an AutoEQ headphone correction (ParametricEQ.txt)
+  dps calibrate             Measure your speakers with the microphone and correct them
   dps presets               List the built-in presets
   dps profile               Print the default profile as TOML
 
@@ -158,6 +159,38 @@ enum Command {
         #[arg(short, long, value_name = "FILE.toml")]
         profile: Option<PathBuf>,
     },
+    /// Measure the speakers with the microphone and write a correction for them.
+    ///
+    /// Plays a quiet warble tone for each third of an octave from 100 Hz to
+    /// 8 kHz on the default output device, records it with the default
+    /// input device (the Mac's microphone), and fits up to 8 peaking filters
+    /// that flatten what was heard, with at most 6 dB of boost and 10 dB of
+    /// cut. They go into the [correction] table of the settings file (or of
+    /// --profile), turned on, as `dps import` does. It takes about 35 s: put
+    /// the microphone where you listen and keep the room quiet; Ctrl-C stops
+    /// it and writes nothing. --level is the only loudness control: dps
+    /// leaves the system volume alone. Quit dps live, or stop the background
+    /// run with `dps stop`, first. The result corrects the speakers as this
+    /// microphone hears them at this position.
+    #[cfg(target_os = "macos")]
+    Calibrate {
+        /// Profile to write the correction into instead of the settings file.
+        #[arg(short, long, value_name = "FILE.toml")]
+        profile: Option<PathBuf>,
+        /// RMS level of the test tones in dBFS, from -60 to -12; no sample
+        /// goes above its peak, 3 dB higher.
+        #[arg(
+            long,
+            value_name = "DB",
+            default_value_t = dps::calibrate::DEFAULT_LEVEL_DB,
+            value_parser = dps::calibrate::parse_level,
+            allow_negative_numbers = true
+        )]
+        level: f64,
+        /// Measure and print the result, but write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List the built-in presets.
     Presets,
     /// Print the default profile as TOML.
@@ -194,6 +227,12 @@ fn main() -> ExitCode {
             .resolve(&dirs)
             .and_then(|source| process(&input, output, &source)),
         Some(Command::Import { input, profile }) => import::run(&input, profile, &dirs),
+        #[cfg(target_os = "macos")]
+        Some(Command::Calibrate {
+            profile,
+            level,
+            dry_run,
+        }) => live::calibrate(profile, level, dry_run, &dirs),
         Some(Command::Presets) => print_presets(),
         Some(Command::Profile { preset }) => print_profile(preset),
         Some(Command::Doctor { source }) => return doctor::run(source.resolve(&dirs), &dirs),

@@ -6,6 +6,7 @@
 pub mod bass;
 pub mod bell;
 pub mod biquad;
+pub mod calibrate;
 pub mod chain;
 pub mod compressor;
 pub mod contour;

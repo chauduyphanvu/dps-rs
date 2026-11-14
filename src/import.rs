@@ -90,7 +90,7 @@ fn skipped_warnings(profile: &Profile) -> Vec<String> {
 /// file beside it, so a `dps` watching the file never reads it half written.
 /// A symlink stays and the file it points to is replaced; that file keeps its
 /// permissions. The file must exist.
-fn rewrite(path: &Path, profile: &Profile) -> Result<(), String> {
+pub(crate) fn rewrite(path: &Path, profile: &Profile) -> Result<(), String> {
     let cannot = |e: io::Error| format!("cannot write {}: {e}", path.display());
     let real = fs::canonicalize(path).map_err(cannot)?;
     let permissions = fs::metadata(&real).map_err(cannot)?.permissions();

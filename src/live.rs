@@ -12,11 +12,14 @@
 //! audio runs; otherwise messages are plain lines on stderr. A background
 //! run (`dps start`) also reports its progress for `dps status`.
 
+mod calibrate;
 mod hal;
 mod mix;
 mod render;
 mod tui;
 mod tuner;
+
+pub use calibrate::run as calibrate;
 
 use std::collections::VecDeque;
 use std::ffi::{c_int, c_void};

@@ -1,6 +1,9 @@
 //! Thin wrappers over the Core Audio HAL calls `dps live` makes. Each object
 //! created here is destroyed by its guard's `Drop`.
 
+mod input;
+pub use input::*;
+
 use std::ffi::{CStr, c_void};
 use std::fmt;
 use std::mem::{MaybeUninit, size_of};
