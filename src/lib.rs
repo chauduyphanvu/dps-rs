@@ -15,6 +15,7 @@ pub mod leveler;
 pub mod limiter;
 pub mod loudness;
 pub mod profile;
+pub mod response;
 pub mod shelf;
 pub mod stereo;
 

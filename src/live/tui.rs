@@ -22,6 +22,8 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 
+use dps::response::response_db;
+
 use super::mix::Readings;
 use super::tuner::{Field, Key, Row, Tuner};
 use super::{SIG_ERR, signal};
@@ -87,7 +89,7 @@ const SEQUENCE_WAIT: Duration = Duration::from_millis(50);
 
 const LEGEND: [&str; 2] = [
     "j/k Up/Down select   h/l Left/Right change   H/L or Shift: fine   Tab EQ field",
-    "Space on/off   b bypass (A/B, L+R level matched)   s save   r revert   q quit",
+    "Space on/off   b bypass (level matched)   g graph   s save   r revert   q quit",
 ];
 const MAX_MESSAGE_LINES: usize = 6;
 
@@ -98,6 +100,26 @@ const HOLD: Duration = Duration::from_secs(1);
 /// A reduction's bar: this many cells of this many dB each.
 const BAR_CELLS: usize = 8;
 const BAR_CELL_DB: f32 = 1.5;
+
+/// Rows of the response curve, with a row for its frequency scale under it.
+const GRAPH_ROWS: usize = 7;
+/// The narrowest curve drawn, in columns.
+const MIN_GRAPH_COLUMNS: usize = 20;
+/// The settings list keeps at least this many rows; with fewer the curve
+/// gives way.
+const MIN_LIST_ROWS: usize = 5;
+/// The curve spans 20 Hz to 20 kHz, in the smallest of these ranges, ± dB,
+/// that holds it.
+const GRAPH_HZ: (f64, f64) = (20.0, 20_000.0);
+const GRAPH_RANGES_DB: [f64; 3] = [6.0, 12.0, 24.0];
+/// The frequencies the scale names.
+const GRAPH_TICKS: [(f64, &str); 5] = [
+    (20.0, "20"),
+    (100.0, "100"),
+    (1000.0, "1k"),
+    (10_000.0, "10k"),
+    (20_000.0, "20k"),
+];
 
 /// What the screen shows.
 #[derive(Clone, Copy)]
@@ -167,10 +189,6 @@ pub fn layout(view: &View, width: u16, height: u16, top: &mut usize) -> Vec<Line
     for meters in meter_lines(&view.meters, leveler, width) {
         lines.push(line(meters, Style::Plain));
     }
-    lines.push(line(
-        format!("{:-<width$}", format!("-- {}/{count} ", at + 1)),
-        Style::Plain,
-    ));
 
     // The question, when there is one, is always shown, under the message.
     let prompt = tuner
@@ -186,7 +204,24 @@ pub fn layout(view: &View, width: u16, height: u16, top: &mut usize) -> Vec<Line
     if message.is_empty() {
         message.push((String::new(), Style::Plain));
     }
-    let fixed = lines.len() + 1 + message.len() + LEGEND.len();
+    // The list's heading, the rule under it, the message and the legend.
+    let mut fixed = lines.len() + 2 + message.len() + LEGEND.len();
+    if tuner.graph() && height >= fixed + GRAPH_ROWS + 1 + MIN_LIST_ROWS {
+        let marker = tuner
+            .selected_band()
+            .map(|i| f64::from(tuner.profile().eq.freqs_hz[i]));
+        let graph = graph_lines(
+            |f| response_db(tuner.profile(), f, view.rate),
+            marker,
+            width,
+        );
+        fixed += graph.len();
+        lines.extend(graph.into_iter().map(|g| line(g, Style::Plain)));
+    }
+    lines.push(line(
+        format!("{:-<width$}", format!("-- {}/{count} ", at + 1)),
+        Style::Plain,
+    ));
     let list = height.saturating_sub(fixed).max(1);
     let rows = tuner.rows(view.rate);
     scroll(&rows, list, top);
@@ -246,6 +281,121 @@ pub fn layout(view: &View, width: u16, height: u16, top: &mut usize) -> Vec<Line
             style: Style::Plain,
         },
     );
+    lines
+}
+
+/// The curve of `response` (dB at a frequency) from 20 Hz to 20 kHz on a
+/// log axis, in braille dots two across and four down a character, with
+/// the range on the left, a dashed 0 dB line, a dotted line up at `marker`
+/// Hz, and a frequency scale under it; nothing if `width` is too narrow.
+fn graph_lines(response: impl Fn(f64) -> f64, marker: Option<f64>, width: usize) -> Vec<String> {
+    const LABEL: usize = 4;
+    let Some(columns) = width.checked_sub(LABEL).filter(|&c| c >= MIN_GRAPH_COLUMNS) else {
+        return Vec::new();
+    };
+    let (low, high) = GRAPH_HZ;
+    let xs = 2 * columns;
+    let x_of = |f: f64| ((xs - 1) as f64 * (f / low).ln() / (high / low).ln()).round();
+    let dbs: Vec<f64> = (0..xs)
+        .map(|x| response(low * (high / low).powf(x as f64 / (xs - 1) as f64)))
+        .collect();
+    let peak = dbs.iter().fold(0.0f64, |m, d| m.max(d.abs()));
+    let range = GRAPH_RANGES_DB
+        .into_iter()
+        .find(|&r| peak <= r + 0.05)
+        .unwrap_or(GRAPH_RANGES_DB[2]);
+    // One dot row fewer than the cells hold, so 0 dB has a row of its own,
+    // in the middle.
+    let last = 4 * GRAPH_ROWS - 2;
+    let zero = last / 2;
+    let y_of = |db: f64| {
+        ((range - db) / (2.0 * range) * last as f64)
+            .round()
+            .clamp(0.0, last as f64) as usize
+    };
+    let mut dots = vec![[false; 2 * 4 * GRAPH_ROWS]; columns];
+    let mut set = |x: usize, y: usize| dots[x / 2][2 * y + x % 2] = true;
+    for x in (0..xs).step_by(2) {
+        set(x, zero);
+    }
+    if let Some(f) = marker.filter(|f| (low..=high).contains(f)) {
+        let x = x_of(f) as usize;
+        for y in (0..=last).step_by(2) {
+            set(x, y);
+        }
+    }
+    let mut previous = y_of(dbs[0]);
+    for (x, &db) in dbs.iter().enumerate() {
+        // Down to the dot beside the last one, so a steep stretch is one line.
+        let y = y_of(db);
+        let span = if previous < y {
+            previous + 1..=y
+        } else {
+            y..=previous.saturating_sub(1).max(y)
+        };
+        for y in span {
+            set(x, y);
+        }
+        previous = y;
+    }
+    // Braille dot bits by row within a character, left column then right.
+    const BITS: [[u32; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+    let label = |row: usize| {
+        let rows = |y: usize| y / 4;
+        let db = if row == rows(0) {
+            range
+        } else if row == rows(zero) {
+            0.0
+        } else if row == rows(last) {
+            -range
+        } else {
+            return " ".repeat(LABEL);
+        };
+        format!(
+            "{:>3} ",
+            if db == 0.0 {
+                "0".into()
+            } else {
+                format!("{db:+}")
+            }
+        )
+    };
+    let mut lines: Vec<String> = (0..GRAPH_ROWS)
+        .map(|row| {
+            let cells = dots.iter().map(|cell| {
+                let mut bits = 0;
+                for (r, pair) in BITS.iter().enumerate() {
+                    for (c, bit) in pair.iter().enumerate() {
+                        if cell[2 * (4 * row + r) + c] {
+                            bits |= bit;
+                        }
+                    }
+                }
+                if bits == 0 {
+                    ' '
+                } else {
+                    char::from_u32(0x2800 + bits).expect("braille patterns are chars")
+                }
+            });
+            label(row) + &cells.collect::<String>()
+        })
+        .collect();
+    let mut scale = vec![' '; columns];
+    let mut free = 0;
+    for (f, name) in GRAPH_TICKS {
+        let len = name.len();
+        let centre = x_of(f) as usize / 2;
+        let start = centre.saturating_sub(len / 2).min(columns - len);
+        if start < free {
+            continue;
+        }
+        scale[start..start + len]
+            .iter_mut()
+            .zip(name.chars())
+            .for_each(|(s, c)| *s = c);
+        free = start + len + 1;
+    }
+    lines.push(" ".repeat(LABEL) + scale.iter().collect::<String>().trim_end());
     lines
 }
 
@@ -985,6 +1135,140 @@ mod tests {
         assert_eq!(at(7.0, 3.0, 1600), (7.0, 3.0));
     }
 
+    /// The braille dots set in character `column` of `line`, as a bit mask.
+    fn dots(line: &str, column: usize) -> u32 {
+        match line.chars().nth(column) {
+            Some(c @ '\u{2800}'..='\u{28ff}') => c as u32 - 0x2800,
+            _ => 0,
+        }
+    }
+
+    /// A tuner on the default profile with one band changed, the curve on.
+    fn graphed(band: usize, freq: f32, gain: f32) -> Tuner {
+        let mut p = Profile::default();
+        p.eq.freqs_hz[band] = freq;
+        p.eq.gains_db[band] = gain;
+        let mut tuner = Tuner::new(p, String::new());
+        tuner.apply(Action::Graph, 48_000);
+        tuner
+    }
+
+    /// The laid-out lines from the meters to the list's heading.
+    fn graph_of(tuner: &Tuner, width: u16, height: u16) -> Vec<String> {
+        let mut top = 0;
+        let lines = layout(&view(tuner), width, height, &mut top);
+        let heading = lines
+            .iter()
+            .position(|l| l.text.starts_with("-- "))
+            .unwrap();
+        lines[4..heading].iter().map(|l| l.text.clone()).collect()
+    }
+
+    #[test]
+    fn one_band_up_12_db_peaks_in_its_column_on_the_top_row() {
+        // 80 columns leave 75 for the curve, 150 dots across: 1 kHz is dot
+        // 149 log(1000 / 20) / log(1000) = 84.4 from the left, in the 43rd
+        // character after the 4 of the labels.
+        let tuner = graphed(6, 1000.0, 12.0);
+        let graph = graph_of(&tuner, 80, 24);
+        assert_eq!(graph.len(), 8, "{graph:#?}");
+        assert!(graph[0].starts_with("+12 "), "{graph:#?}");
+        assert!(graph[3].starts_with("  0 "), "{graph:#?}");
+        assert!(graph[6].starts_with("-12 "), "{graph:#?}");
+        // The top row of dots (bits 0x01 and 0x08) is set only around 1 kHz.
+        let top: Vec<usize> = (0..80)
+            .filter(|&c| dots(&graph[0], c) & 0x09 != 0)
+            .collect();
+        assert!(
+            !top.is_empty() && top.iter().all(|&c| c.abs_diff(46) <= 1),
+            "{top:?}"
+        );
+        // Away from the band the curve is on the 0 dB row, and nothing is
+        // drawn below it: a boost never dips.
+        assert_eq!(dots(&graph[3], 6), 0x12, "{}", graph[3]);
+        for row in &graph[4..7] {
+            assert!(row[4..].trim().is_empty(), "{graph:#?}");
+        }
+        assert_eq!(
+            graph[7],
+            "    20              100                      1k                       10k   20k"
+        );
+        // Every character the curve uses gets through to the terminal.
+        for row in &graph {
+            assert_eq!(&printable(row), row);
+        }
+    }
+
+    #[test]
+    fn the_curve_picks_the_smallest_range_that_holds_it() {
+        for (gain, range) in [(5.0, " +6"), (6.0, " +6"), (12.0, "+12"), (-18.0, "+24")] {
+            let graph = graph_of(&graphed(5, 705.0, gain), 80, 30);
+            assert!(graph[0].starts_with(range), "{gain} dB: {graph:#?}");
+        }
+        // Past 24 dB the curve is cut at the edge: two bands at +24 dB
+        // overlap to more than that.
+        let mut p = Profile::default();
+        p.eq.gains_db[5] = 24.0;
+        p.eq.gains_db[6] = 24.0;
+        let mut tuner = Tuner::new(p, String::new());
+        tuner.apply(Action::Graph, 48_000);
+        let graph = graph_of(&tuner, 80, 30);
+        assert!(graph[0].starts_with("+24"));
+        assert!(graph[0][4..].chars().any(|c| c != ' '));
+    }
+
+    #[test]
+    fn the_selected_band_is_marked_and_the_curve_follows_changes() {
+        // On band 7 (2497 Hz), a dotted line goes down the curve's column
+        // for it: 149 log(2497 / 20) / log(1000) = 104.2 dots, the 53rd
+        // character after the labels, in rows the curve leaves empty.
+        let mut tuner = Tuner::new(Profile::default(), String::new());
+        tuner.apply(Action::Graph, 48_000);
+        let unmarked = graph_of(&tuner, 80, 24);
+        for _ in 0..19 + 7 {
+            tuner.apply(Action::Down, 48_000);
+        }
+        let marked = graph_of(&tuner, 80, 24);
+        for row in [0, 1, 5, 6] {
+            assert_eq!(dots(&marked[row], 4 + 52), 0x05, "{marked:#?}");
+            assert_eq!(dots(&unmarked[row], 4 + 52), 0, "{unmarked:#?}");
+        }
+        // Turning the band up changes the curve with the next draw.
+        let up = Action::Step {
+            up: true,
+            fine: false,
+        };
+        for _ in 0..12 {
+            tuner.apply(up, 48_000);
+        }
+        let boosted = graph_of(&tuner, 80, 24);
+        assert_ne!(boosted, marked);
+        assert!(boosted[0].starts_with(" +6"), "{boosted:#?}");
+        assert!(dots(&boosted[0], 4 + 52) & 0x09 != 0, "{boosted:#?}");
+    }
+
+    #[test]
+    fn the_curve_gives_way_to_the_list_on_a_short_or_narrow_terminal() {
+        let tuner = graphed(6, 1000.0, 12.0);
+        // At 80 by 24 the list keeps 7 rows; at 22 it keeps the 5 it needs.
+        for (width, height, shown) in [
+            (80, 24, true),
+            (80, 22, true),
+            (80, 21, false),
+            (24, 40, false),
+            (25, 40, true),
+        ] {
+            let mut top = 0;
+            let lines = layout(&view(&tuner), width, height, &mut top);
+            assert_eq!(lines.len(), usize::from(height));
+            let has = lines.iter().any(|l| l.text.starts_with("+12 "));
+            assert_eq!(has, shown, "{width}x{height}: {:#?}", texts(&lines));
+            assert_eq!(selected(&lines).len(), 1, "{width}x{height}");
+            let limit = usize::from(width) - 1;
+            assert!(lines.iter().all(|l| l.text.chars().count() <= limit));
+        }
+    }
+
     #[test]
     fn the_list_scrolls_to_keep_the_selection_in_view() {
         let mut tuner = Tuner::new(Profile::default(), String::new());
@@ -1171,6 +1455,7 @@ mod tests {
     #[test]
     fn the_legend_names_tab_and_fits_80_columns() {
         assert!(LEGEND[0].contains("Tab EQ field"));
+        assert!(LEGEND[1].contains("g graph"));
         for line in LEGEND {
             assert!(line.chars().count() <= 79, "{line}");
         }

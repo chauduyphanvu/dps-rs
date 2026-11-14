@@ -571,6 +571,8 @@ pub enum Action {
     PreviousField,
     Toggle,
     Bypass,
+    /// Show or hide the response curve.
+    Graph,
     Save,
     Revert,
     Quit,
@@ -631,6 +633,8 @@ pub struct Tuner {
     /// The field of whichever EQ band is selected that Left and Right change.
     field: Field,
     bypass: bool,
+    /// The response curve is shown.
+    graph: bool,
     /// Asking whether to save before quitting; the question is drawn from
     /// this, not kept in `message`.
     quitting: bool,
@@ -651,6 +655,7 @@ impl Tuner {
             selected: 0,
             field: Field::Gain,
             bypass: false,
+            graph: false,
             quitting: false,
             message: String::new(),
             transient: false,
@@ -668,6 +673,18 @@ impl Tuner {
 
     pub fn bypass(&self) -> bool {
         self.bypass
+    }
+
+    pub fn graph(&self) -> bool {
+        self.graph
+    }
+
+    /// The EQ band selected, if one is.
+    pub fn selected_band(&self) -> Option<usize> {
+        match self.settings[self.selected] {
+            Setting::Band(i) => Some(i),
+            _ => None,
+        }
     }
 
     pub fn message(&self) -> &str {
@@ -773,6 +790,7 @@ impl Tuner {
             Key::BackTab => Action::PreviousField,
             Key::Char(' ') => Action::Toggle,
             Key::Char('b') => Action::Bypass,
+            Key::Char('g') => Action::Graph,
             Key::Char('s') => Action::Save,
             Key::Char('r') => Action::Revert,
             _ => return None,
@@ -839,6 +857,10 @@ impl Tuner {
             Action::Bypass => {
                 self.bypass = !self.bypass;
                 Effect::Bypass(self.bypass)
+            }
+            Action::Graph => {
+                self.graph = !self.graph;
+                Effect::None
             }
             Action::Save => Effect::Save,
             Action::Revert if !self.dirty() => {
@@ -1399,6 +1421,22 @@ mod tests {
         for key in [Key::Char('x'), Key::Char('Q'), Key::Esc, Key::Char('y')] {
             assert_eq!(press(&mut t, key), Effect::None, "{key:?}");
         }
+        assert!(!t.dirty());
+    }
+
+    #[test]
+    fn g_shows_and_hides_the_curve_and_the_selected_band_is_known() {
+        let mut t = tuner();
+        assert!(!t.graph());
+        assert_eq!(press(&mut t, Key::Char('g')), Effect::None);
+        assert!(t.graph());
+        assert_eq!(t.selected_band(), None);
+        select(&mut t, Setting::Band(3));
+        assert_eq!(t.selected_band(), Some(3));
+        press(&mut t, Key::Down);
+        assert_eq!(t.selected_band(), Some(4));
+        assert_eq!(press(&mut t, Key::Char('g')), Effect::None);
+        assert!(!t.graph());
         assert!(!t.dirty());
     }
 
