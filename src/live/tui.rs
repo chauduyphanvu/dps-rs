@@ -25,7 +25,7 @@ use crossterm::{execute, queue};
 use dps::response::response_db;
 
 use super::mix::Readings;
-use super::tuner::{Field, Key, Row, Tuner};
+use super::tuner::{Field, Key, Row, SLOTS, Tuner};
 use super::{SIG_ERR, signal};
 
 /// Set while the terminal is in the tuner's state; cleared once it is back.
@@ -87,9 +87,17 @@ const RESTORE: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l";
 /// ends partway through one.
 const SEQUENCE_WAIT: Duration = Duration::from_millis(50);
 
-const LEGEND: [&str; 2] = [
+const LEGEND: [&str; 3] = [
     "j/k Up/Down select   h/l Left/Right change   H/L or Shift: fine   Tab EQ field",
     "Space on/off   b bypass (level matched)   g graph   s save   r revert   q quit",
+    "a A/B (* unsaved)   c copy to other   p next preset   m match levels   x blind",
+];
+/// As many lines as `LEGEND`, so a notice lands on the message line in a
+/// blind test too.
+const BLIND_LEGEND: [&str; 3] = [
+    "a or Tab switch between X and Y   1 prefer X   2 prefer Y",
+    "x or Esc end the test and show the tally   q quit",
+    "",
 ];
 const MAX_MESSAGE_LINES: usize = 6;
 
@@ -131,6 +139,8 @@ pub struct View<'a> {
     pub clamped: u64,
     pub dry_gain: f32,
     pub meters: Readings,
+    /// The gain level matching puts on A and on B, in dB.
+    pub trim: [f32; 2],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -158,38 +168,6 @@ pub fn layout(view: &View, width: u16, height: u16, top: &mut usize) -> Vec<Line
     };
     let tuner = view.tuner;
 
-    let mut status = String::from("dps live  ");
-    if tuner.bypass() {
-        status += &format!(
-            "BYPASS (dry {:+.1} dB, L+R level matched)",
-            20.0 * view.dry_gain.log10()
-        );
-    } else {
-        status += "PROCESSED";
-    }
-    if tuner.dirty() {
-        status += "  UNSAVED";
-    }
-    if view.clamped > 0 {
-        status += &format!("  clamped {}", view.clamped);
-    }
-    match tuner.profile().skipped_eq_bands(view.rate).len() {
-        0 => {}
-        1 => status += "  1 EQ band skipped",
-        n => status += &format!("  {n} EQ bands skipped"),
-    }
-    let (at, count) = tuner.position();
-    let output = format!("{} at {} Hz   ", view.device, view.rate);
-    let room = width.saturating_sub(output.chars().count());
-    let mut lines = vec![
-        line(status, Style::Bold),
-        line(output + &tail(view.name, room), Style::Plain),
-    ];
-    let leveler = tuner.profile().leveler.enabled;
-    for meters in meter_lines(&view.meters, leveler, width) {
-        lines.push(line(meters, Style::Plain));
-    }
-
     // The question, when there is one, is always shown, under the message.
     let prompt = tuner
         .prompt()
@@ -204,84 +182,165 @@ pub fn layout(view: &View, width: u16, height: u16, top: &mut usize) -> Vec<Line
     if message.is_empty() {
         message.push((String::new(), Style::Plain));
     }
-    // The list's heading, the rule under it, the message and the legend.
-    let mut fixed = lines.len() + 2 + message.len() + LEGEND.len();
-    if tuner.graph() && height >= fixed + GRAPH_ROWS + 1 + MIN_LIST_ROWS {
-        let marker = tuner
-            .selected_band()
-            .map(|i| f64::from(tuner.profile().eq.freqs_hz[i]));
-        let graph = graph_lines(
-            |f| response_db(tuner.profile(), f, view.rate),
-            marker,
-            width,
-        );
-        fixed += graph.len();
-        lines.extend(graph.into_iter().map(|g| line(g, Style::Plain)));
-    }
-    lines.push(line(
-        format!("{:-<width$}", format!("-- {}/{count} ", at + 1)),
-        Style::Plain,
-    ));
-    let list = height.saturating_sub(fixed).max(1);
-    let rows = tuner.rows(view.rate);
-    scroll(&rows, list, top);
-    for i in *top..*top + list {
-        let Some(row) = rows.get(i) else {
-            lines.push(line(String::new(), Style::Plain));
-            continue;
-        };
-        let (marker, style) = if row.selected() {
-            ('>', Style::Reverse)
-        } else {
-            (' ', Style::Plain)
-        };
-        lines.push(match row {
-            Row::Group(name) => line(format!(" {name}"), Style::Bold),
-            Row::Setting { label, value, .. } => {
-                line(format!("{marker}   {label:<20}{value:>12} "), style)
-            }
-            Row::Band {
-                freq,
-                q,
-                gain,
-                active,
-                skipped,
-                ..
-            } => {
-                // Every field keeps a column on each side for the brackets,
-                // so the columns stay put as the active field moves, and
-                // the gain lines up with the other settings' values.
-                let cell = |field, text: &str| {
-                    if *active == Some(field) {
-                        format!("[{text}]")
-                    } else {
-                        format!(" {text} ")
-                    }
-                };
-                let (freq, q, gain) = (
-                    cell(Field::Freq, freq),
-                    cell(Field::Q, q),
-                    cell(Field::Gain, gain),
-                );
-                let skipped = if *skipped { " skipped" } else { "" };
+
+    let (mut lines, legend) = match tuner.trial() {
+        // Nothing that would tell the slots apart: no settings, meters,
+        // curve, slot names or matching gain.
+        Some(trial) => (
+            vec![
                 line(
-                    format!("{marker} {freq:>12}{q:<10}{gain:>13}{skipped}"),
-                    style,
-                )
+                    format!("dps live  BLIND  playing {}", trial.playing),
+                    Style::Bold,
+                ),
+                line(format!("trial {}", trial.number), Style::Plain),
+            ],
+            BLIND_LEGEND,
+        ),
+        None => {
+            let output = format!("{} at {} Hz   ", view.device, view.rate);
+            let room = width.saturating_sub(output.chars().count());
+            let mut lines = vec![
+                line(status(view), Style::Bold),
+                line(output + &tail(view.name, room), Style::Plain),
+            ];
+            let leveler = tuner.profile().leveler.enabled;
+            for meters in meter_lines(&view.meters, leveler, width) {
+                lines.push(line(meters, Style::Plain));
             }
-        });
+            // The list's heading, the rule under it, the message and the
+            // legend.
+            let mut fixed = lines.len() + 2 + message.len() + LEGEND.len();
+            if tuner.graph() && height >= fixed + GRAPH_ROWS + 1 + MIN_LIST_ROWS {
+                let marker = tuner
+                    .selected_band()
+                    .map(|i| f64::from(tuner.profile().eq.freqs_hz[i]));
+                let graph = graph_lines(
+                    |f| response_db(tuner.profile(), f, view.rate),
+                    marker,
+                    width,
+                );
+                fixed += graph.len();
+                lines.extend(graph.into_iter().map(|g| line(g, Style::Plain)));
+            }
+            let (at, count) = tuner.position();
+            lines.push(line(
+                format!("{:-<width$}", format!("-- {}/{count} ", at + 1)),
+                Style::Plain,
+            ));
+            let list = height.saturating_sub(fixed).max(1);
+            let rows = tuner.rows(view.rate);
+            scroll(&rows, list, top);
+            for i in *top..*top + list {
+                lines.push(match rows.get(i) {
+                    Some(row) => {
+                        let (text, style) = list_line(row);
+                        line(text, style)
+                    }
+                    None => line(String::new(), Style::Plain),
+                });
+            }
+            (lines, LEGEND)
+        }
+    };
+    let blank = Line {
+        text: String::new(),
+        style: Style::Plain,
+    };
+    let body = height.saturating_sub(1 + message.len() + legend.len());
+    if lines.len() < body {
+        lines.resize(body, blank.clone());
     }
     lines.push(line("-".repeat(width), Style::Plain));
     lines.extend(message.into_iter().map(|(m, style)| line(m, style)));
-    lines.extend(LEGEND.iter().map(|l| line((*l).into(), Style::Plain)));
-    lines.resize(
-        height,
-        Line {
-            text: String::new(),
-            style: Style::Plain,
-        },
-    );
+    lines.extend(legend.iter().map(|l| line((*l).into(), Style::Plain)));
+    lines.resize(height, blank);
     lines
+}
+
+/// The top line: the slots, the heard one in brackets and each marked `*`
+/// while it differs from what was saved, whether bypass is on, the matching
+/// gain while the slots differ, and what else is worth knowing.
+fn status(view: &View) -> String {
+    let tuner = view.tuner;
+    let slots: Vec<String> = SLOTS
+        .iter()
+        .enumerate()
+        .map(|(s, name)| {
+            let star = if tuner.differs(s) { "*" } else { "" };
+            if s == tuner.slot() {
+                format!("[{name}{star}]")
+            } else {
+                format!("{name}{star}")
+            }
+        })
+        .collect();
+    let mut status = format!("dps live  {}  ", slots.join(" "));
+    if tuner.bypass() {
+        status += &format!("BYPASS (dry {:+.1} dB)", 20.0 * view.dry_gain.log10());
+    } else {
+        status += "PROCESSED";
+    }
+    if tuner.compared() {
+        status += &if !tuner.matching() {
+            "  match off".into()
+        } else {
+            match (0..2).find(|&s| view.trim[s] <= -0.05) {
+                Some(s) => format!("  trim {} {:.1} dB", SLOTS[s], view.trim[s]),
+                None => "  trim 0.0 dB".into(),
+            }
+        };
+    }
+    if view.clamped > 0 {
+        status += &format!("  clamped {}", view.clamped);
+    }
+    match tuner.profile().skipped_eq_bands(view.rate).len() {
+        0 => {}
+        1 => status += "  1 EQ band skipped",
+        n => status += &format!("  {n} EQ bands skipped"),
+    }
+    status
+}
+
+/// One row of the settings list, and how to show it.
+fn list_line(row: &Row) -> (String, Style) {
+    let (marker, style) = if row.selected() {
+        ('>', Style::Reverse)
+    } else {
+        (' ', Style::Plain)
+    };
+    match row {
+        Row::Group(name) => (format!(" {name}"), Style::Bold),
+        Row::Setting { label, value, .. } => (format!("{marker}   {label:<20}{value:>12} "), style),
+        Row::Band {
+            freq,
+            q,
+            gain,
+            active,
+            skipped,
+            ..
+        } => {
+            // Every field keeps a column on each side for the brackets, so
+            // the columns stay put as the active field moves, and the gain
+            // lines up with the other settings' values.
+            let cell = |field, text: &str| {
+                if *active == Some(field) {
+                    format!("[{text}]")
+                } else {
+                    format!(" {text} ")
+                }
+            };
+            let (freq, q, gain) = (
+                cell(Field::Freq, freq),
+                cell(Field::Q, q),
+                cell(Field::Gain, gain),
+            );
+            let skipped = if *skipped { " skipped" } else { "" };
+            (
+                format!("{marker} {freq:>12}{q:<10}{gain:>13}{skipped}"),
+                style,
+            )
+        }
+    }
 }
 
 /// The curve of `response` (dB at a frequency) from 20 Hz to 20 kHz on a
@@ -996,6 +1055,7 @@ mod tests {
             clamped: 0,
             dry_gain: 1.0,
             meters: Readings::default(),
+            trim: [0.0; 2],
         }
     }
 
@@ -1019,7 +1079,7 @@ mod tests {
         let text = texts(&lines);
         assert_eq!(lines.len(), 24);
         assert!(text.iter().all(|t| t.chars().count() <= 79), "{text:#?}");
-        assert_eq!(text[0], "dps live  PROCESSED");
+        assert_eq!(text[0], "dps live  [A] B  PROCESSED");
         assert_eq!(
             text[1],
             "MacBook Pro Speakers at 48000 Hz   presets/music.toml"
@@ -1250,11 +1310,11 @@ mod tests {
     #[test]
     fn the_curve_gives_way_to_the_list_on_a_short_or_narrow_terminal() {
         let tuner = graphed(6, 1000.0, 12.0);
-        // At 80 by 24 the list keeps 7 rows; at 22 it keeps the 5 it needs.
+        // At 80 by 24 the list keeps 6 rows; at 23 it keeps the 5 it needs.
         for (width, height, shown) in [
             (80, 24, true),
-            (80, 22, true),
-            (80, 21, false),
+            (80, 23, true),
+            (80, 22, false),
             (24, 40, false),
             (25, 40, true),
         ] {
@@ -1318,7 +1378,7 @@ mod tests {
         );
         assert_eq!(
             lines[0].text,
-            "dps live  BYPASS (dry -6.0 dB, L+R level matched)  UNSAVED  clamped 1234"
+            "dps live  [A*] B  BYPASS (dry -6.0 dB)  trim 0.0 dB  clamped 1234"
         );
     }
 
@@ -1456,8 +1516,136 @@ mod tests {
     fn the_legend_names_tab_and_fits_80_columns() {
         assert!(LEGEND[0].contains("Tab EQ field"));
         assert!(LEGEND[1].contains("g graph"));
-        for line in LEGEND {
+        for key in ["a A/B", "c copy", "p next preset", "m match", "x blind"] {
+            assert!(LEGEND[2].contains(key), "{key}");
+        }
+        for key in ["a or Tab", "1 prefer X", "2 prefer Y", "x or Esc"] {
+            assert!(BLIND_LEGEND.iter().any(|l| l.contains(key)), "{key}");
+        }
+        for line in LEGEND.iter().chain(&BLIND_LEGEND) {
             assert!(line.chars().count() <= 79, "{line}");
+        }
+    }
+
+    /// A tuner with B holding a preset, A heard.
+    fn compared() -> Tuner {
+        let mut tuner = Tuner::new(Profile::default(), "music.toml".into());
+        tuner.apply(Action::Switch, 48_000);
+        tuner.apply(Action::Preset, 48_000);
+        tuner.apply(Action::Switch, 48_000);
+        tuner
+    }
+
+    #[test]
+    fn the_status_line_shows_the_slots_and_the_matching_gain() {
+        let mut tuner = compared();
+        let status = |tuner: &Tuner, trim: [f32; 2]| {
+            let mut top = 0;
+            let view = View {
+                trim,
+                ..view(tuner)
+            };
+            layout(&view, 80, 24, &mut top)[0].text.clone()
+        };
+        assert_eq!(
+            status(&tuner, [0.0, -1.34]),
+            "dps live  [A] B*  PROCESSED  trim B -1.3 dB"
+        );
+        assert_eq!(
+            status(&tuner, [-0.02, 0.0]),
+            "dps live  [A] B*  PROCESSED  trim 0.0 dB"
+        );
+        tuner.apply(Action::Switch, 48_000);
+        assert_eq!(
+            status(&tuner, [-2.0, 0.0]),
+            "dps live  A [B*]  PROCESSED  trim A -2.0 dB"
+        );
+        tuner.apply(Action::Matching, 48_000);
+        assert_eq!(
+            status(&tuner, [0.0; 2]),
+            "dps live  A [B*]  PROCESSED  match off"
+        );
+        // The same in both: no matching to speak of.
+        tuner.apply(Action::Copy, 48_000);
+        assert_eq!(status(&tuner, [0.0; 2]), "dps live  A* [B*]  PROCESSED");
+    }
+
+    #[test]
+    fn the_blind_screen_shows_nothing_that_tells_the_slots_apart() {
+        let mut tuner = compared();
+        tuner.apply(Action::Graph, 48_000);
+        tuner.apply(Action::Blind, 48_000);
+        tuner.apply(Action::Vote(0), 48_000);
+        tuner.apply(Action::Vote(1), 48_000);
+        let playing = tuner.trial().unwrap().playing;
+        let mut top = 0;
+        let view = View {
+            clamped: 12,
+            dry_gain: 0.5,
+            meters: readings(),
+            trim: [0.0, -1.3],
+            ..view(&tuner)
+        };
+        let lines = layout(&view, 80, 24, &mut top);
+        let text = texts(&lines);
+        assert_eq!(lines.len(), 24);
+        assert_eq!(text[0], format!("dps live  BLIND  playing {playing}"));
+        assert_eq!(lines[0].style, Style::Bold);
+        assert_eq!(text[1], "trial 3");
+        assert_eq!(&text[24 - BLIND_LEGEND.len()..], BLIND_LEGEND);
+        assert_eq!(
+            text[24 - BLIND_LEGEND.len() - 1],
+            "voted for Y; trial 3: X and Y drawn again"
+        );
+        let all = text.join("\n");
+        for giveaway in [
+            "dB", "Hz", "LUFS", "ms", ":1", "trim", "match", "[A", "[B", "A*", "B*", "clamped",
+            "music", "MacBook",
+        ] {
+            assert!(!all.contains(giveaway), "{giveaway:?} in {text:#?}");
+        }
+        let words: Vec<&str> = all.split(|c: char| !c.is_alphanumeric()).collect();
+        assert!(!words.contains(&"A") && !words.contains(&"B"), "{text:#?}");
+        // No list row, so no selection to show either.
+        assert!(selected(&lines).is_empty());
+        assert!(!all.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)));
+    }
+
+    #[test]
+    fn any_terminal_size_gives_exactly_that_many_lines_with_every_panel() {
+        let plain = Tuner::new(Profile::default(), String::new());
+        let mut graphed = compared();
+        graphed.apply(Action::Graph, 48_000);
+        let mut blind = compared();
+        blind.apply(Action::Blind, 48_000);
+        for tuner in [&plain, &graphed, &blind] {
+            for (width, height) in [
+                (1, 1),
+                (10, 3),
+                (20, 8),
+                (40, 10),
+                (40, 30),
+                (80, 24),
+                (80, 40),
+                (120, 50),
+                (200, 100),
+                (0, 0),
+            ] {
+                let mut top = 0;
+                let view = View {
+                    meters: readings(),
+                    trim: [0.0, -1.3],
+                    ..view(tuner)
+                };
+                let lines = layout(&view, width, height, &mut top);
+                assert_eq!(lines.len(), usize::from(height), "{width}x{height}");
+                let limit = usize::from(width).saturating_sub(1).max(1);
+                assert!(
+                    lines.iter().all(|l| l.text.chars().count() <= limit),
+                    "{width}x{height}: {:#?}",
+                    texts(&lines)
+                );
+            }
         }
     }
 
@@ -1486,7 +1674,8 @@ mod tests {
     #[test]
     fn a_band_row_brackets_its_active_field_and_lines_up_with_the_rest() {
         let mut top = 0;
-        let rows = |tuner: &Tuner, top: &mut usize| layout(&view(tuner), 80, 24, top);
+        // Tall enough to show six dB values above the band.
+        let rows = |tuner: &Tuner, top: &mut usize| layout(&view(tuner), 80, 25, top);
         let tuner = on_band(Profile::default(), 1, 0);
         let lines = rows(&tuner, &mut top);
         assert_eq!(selected(&lines), [">     56.4 Hz  Q 1.50       [+0.0 dB]"]);
@@ -1494,7 +1683,8 @@ mod tests {
         assert!(text.contains(&" EQ bands"), "{text:#?}");
         assert!(text.contains(&"      30.0 Hz  Q 1.50        +0.0 dB "));
         // Only the selected band shows brackets.
-        assert_eq!(text.iter().filter(|t| t.contains('[')).count(), 1);
+        let listed = text.iter().filter(|t| t.starts_with([' ', '>']));
+        assert_eq!(listed.filter(|t| t.contains('[')).count(), 1);
         // Every dB value ends in the same column, band or not.
         let ends = value_ends(&lines);
         assert!(ends.len() >= 6, "{text:#?}");
@@ -1563,9 +1753,9 @@ mod tests {
     fn the_status_line_counts_the_bands_the_chain_skips() {
         let tuner = Tuner::new(Profile::default(), String::new());
         for (rate, want) in [
-            (48_000, "dps live  PROCESSED"),
-            (32_000, "dps live  PROCESSED  1 EQ band skipped"),
-            (16_000, "dps live  PROCESSED  2 EQ bands skipped"),
+            (48_000, "dps live  [A] B  PROCESSED"),
+            (32_000, "dps live  [A] B  PROCESSED  1 EQ band skipped"),
+            (16_000, "dps live  [A] B  PROCESSED  2 EQ bands skipped"),
         ] {
             let mut top = 0;
             let lines = layout(
@@ -1597,7 +1787,7 @@ mod tests {
         let lines = layout(&view, 80, 24, &mut top);
         assert_eq!(
             lines[0].text,
-            "dps live  PROCESSED  UNSAVED  clamped 5  1 EQ band skipped"
+            "dps live  [A*] B  PROCESSED  trim 0.0 dB  clamped 5  1 EQ band skipped"
         );
         assert!(selected(&lines)[0].ends_with(" skipped"));
     }
@@ -1622,7 +1812,7 @@ mod tests {
         assert_eq!(text[legend - 2], "reloaded presets/music.toml");
         assert_eq!(
             text[legend - 1],
-            "save changes to music.toml? y/n (Esc cancels)"
+            "save changes in A to music.toml? y/n (Esc cancels)"
         );
         assert_eq!(lines[legend - 1].style, Style::Bold);
         // A message as long as the whole area still leaves the question.
@@ -1631,7 +1821,7 @@ mod tests {
         let text = texts(&lines);
         assert_eq!(
             text[legend - 1],
-            "save changes to music.toml? y/n (Esc cancels)"
+            "save changes in A to music.toml? y/n (Esc cancels)"
         );
         assert!(text[legend - 2].ends_with("..."), "{}", text[legend - 2]);
         assert_eq!(selected(&lines).len(), 1);
