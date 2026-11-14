@@ -330,11 +330,15 @@ fn assert_close(actual: &[f64], expected: &[f64], tolerance: f64, what: &str) {
 }
 
 /// What the chain makes of `samples`, as `process` would write them to a
-/// float WAV file.
+/// float WAV file: with its latency cut from the start and made up with
+/// silence at the end.
 fn processed(profile: &Profile, sample_rate: u32, channels: usize, samples: &[f32]) -> Vec<f64> {
+    let mut chain = Processor::new(profile, sample_rate, channels);
+    let latency = chain.latency_frames() * channels;
     let mut x = samples.to_vec();
-    Processor::new(profile, sample_rate, channels).process(&mut x);
-    x.into_iter().map(f64::from).collect()
+    x.resize(samples.len() + latency, 0.0);
+    chain.process(&mut x);
+    x[latency..].iter().copied().map(f64::from).collect()
 }
 
 fn preset_profile(dir: &TempDir, name: &str) -> Profile {
@@ -447,6 +451,29 @@ fn stream_longer_than_one_block_keeps_its_length() {
 }
 
 #[test]
+fn the_limiters_lookahead_is_taken_back_out_of_the_output() {
+    // The identity chain with the limiter on, with its lookahead and true
+    // peak, on audio it never turns down: the output is the input, sample for
+    // sample and as long, also for a file shorter than the lookahead.
+    let dir = TempDir::new("lookahead");
+    let profile = dir.write(
+        "limited.toml",
+        &IDENTITY.replace("[limiter]\nenabled = false", "[limiter]\nenabled = true"),
+    );
+    let output = dir.join("out.wav");
+    for frames in [10, 2 * BLOCK_FRAMES + 1781] {
+        let input = dir.join(&format!("in-{frames}.wav"));
+        let spec = int_spec(2, 48_000, 16);
+        let quiet: Vec<f32> = signal(frames, 2).iter().map(|v| v * 0.3).collect();
+        let stored = write_wav(&input, spec, &quiet);
+        assert_quiet_success(&dir.process(&input, &output, Some(&profile)));
+        let (out_spec, out_samples) = read_wav(&output);
+        assert_eq!(out_spec, spec);
+        assert_close(&out_samples, &stored, 0.0, &format!("{frames} frames"));
+    }
+}
+
+#[test]
 fn stateful_run_equals_one_processor_over_the_whole_stream() {
     // Both compressors and the stereo AGC are active, so state that did not
     // carry across the CLI's blocks would change the output.
@@ -467,9 +494,7 @@ fn stateful_run_equals_one_processor_over_the_whole_stream() {
     write_wav(&input, spec, &samples);
 
     assert_success(&dir.process(&input, &output, Some(&profile_path)));
-    let mut want = samples;
-    Processor::new(&profile, 48_000, 2).process(&mut want);
-    let want: Vec<f64> = want.into_iter().map(f64::from).collect();
+    let want = processed(&profile, 48_000, 2, &samples);
     let (_, got) = read_wav(&output);
     assert_close(&got, &want, 0.0, "stateful stereo file");
 }

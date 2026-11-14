@@ -549,23 +549,55 @@ mod tests {
     #[test]
     fn limiter_off_or_unneeded_leaves_the_chain_exact() {
         // Off, it passes 12 dB over full scale untouched; on, audio that
-        // never reaches the ceiling.
+        // never reaches the ceiling comes out delayed by the lookahead and
+        // otherwise untouched. That is samples up to the ceiling itself when
+        // it limits sample peaks; with true peak, as by default, noise up to
+        // the ceiling has points between samples over it and is turned down,
+        // and noise at 1 / 2.2 of the ceiling, which no point between samples
+        // can reach it from, is not.
         let loud: Vec<f32> = noise(48_000, 23).iter().map(|x| 8.0 * x).collect();
         let mut out = loud.clone();
         Processor::new(&flat(), FS, 1).process(&mut out);
         assert_eq!(out, loud);
 
         let on = limited(&flat(), true);
+        assert!(on.limiter.true_peak && on.limiter.lookahead_ms > 0.0);
+        let sample_peak = Profile {
+            limiter: LimiterParams {
+                true_peak: false,
+                ..on.limiter
+            },
+            ..on.clone()
+        };
         let ceiling = 10f64.powf(f64::from(on.limiter.ceiling_db) / 20.0) as f32;
-        let mut quiet: Vec<f32> = noise(2 * 48_000, 24)
-            .iter()
-            .map(|x| 2.0 * ceiling * x)
-            .collect();
-        quiet[0] = ceiling;
-        quiet[1] = -ceiling;
-        let mut out = quiet.clone();
-        Processor::new(&on, FS, 2).process(&mut out);
-        assert_eq!(out, quiet);
+        let quiet = |peak: f32| {
+            let mut x: Vec<f32> = noise(2 * 48_000, 24)
+                .iter()
+                .map(|x| 2.0 * peak * x)
+                .collect();
+            x[0] = peak;
+            x[1] = -peak;
+            x
+        };
+        for (profile, peak, limits) in [
+            (&sample_peak, ceiling, false),
+            (&on, ceiling, true),
+            (&on, ceiling / 2.2, false),
+        ] {
+            let input = quiet(peak);
+            let mut chain = Processor::new(profile, FS, 2);
+            let delay = 2 * chain.latency_frames();
+            assert!(delay > 0);
+            let mut out = input.clone();
+            chain.process(&mut out);
+            assert!(out[..delay].iter().all(|x| *x == 0.0));
+            let what = format!("true peak {}, peak {peak}", profile.limiter.true_peak);
+            assert_eq!(
+                out[delay..] != input[..input.len() - delay],
+                limits,
+                "{what}"
+            );
+        }
     }
 
     #[test]

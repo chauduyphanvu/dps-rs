@@ -1075,6 +1075,11 @@ trait Chain {
     /// replaces, keeps the switch smooth. Called on the callback, so it may
     /// not allocate or free.
     fn adopt(&mut self, _from: &Self) {}
+
+    /// Frames by which the output lags the input.
+    fn latency_frames(&self) -> usize {
+        0
+    }
 }
 
 impl Chain for Processor {
@@ -1084,6 +1089,10 @@ impl Chain for Processor {
 
     fn adopt(&mut self, from: &Self) {
         self.adopt_levels(from);
+    }
+
+    fn latency_frames(&self) -> usize {
+        Processor::latency_frames(self)
     }
 }
 
@@ -2268,9 +2277,12 @@ mod tests {
 
     #[test]
     fn with_the_limiter_on_the_callback_has_nothing_to_clamp() {
-        // The same 12 dB over full scale, from the first sample, comes out at
-        // the limiter's ceiling; the clamp stays for a limiter turned off.
-        let frames = 64;
+        // The same 12 dB over full scale, from the first sample, comes out
+        // after the limiter's lookahead under its ceiling, by what true peak
+        // reads between the samples of so abrupt a start (a sampled step
+        // reconstructs to about 1.13 times its height); the clamp stays for
+        // a limiter turned off.
+        let frames = 512;
         let mut profile = flat();
         profile.output_gain_db = 12.0;
         profile.limiter.enabled = true;
@@ -2282,7 +2294,13 @@ mod tests {
         call(&mut engine, &mut input, &mut output);
 
         let ceiling = 10f64.powf(f64::from(profile.limiter.ceiling_db) / 20.0) as f32;
-        assert!(out.iter().all(|&x| x <= ceiling && x > 0.99 * ceiling));
+        let delay = 2 * Processor::new(&profile, 48_000, 2).latency_frames();
+        assert!(out[..delay].iter().all(|&x| x == 0.0));
+        assert!(
+            out[delay..]
+                .iter()
+                .all(|&x| x <= ceiling && x > ceiling / 1.15)
+        );
         assert_eq!(engine.stats.clamped.load(Relaxed), 0);
     }
 

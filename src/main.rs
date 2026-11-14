@@ -374,7 +374,9 @@ fn validate(profile: &Profile, spec: WavSpec, source: &Source) -> Result<(), Str
 }
 
 /// Runs all of `reader` through the chain into `writer` and returns how many
-/// samples were clipped.
+/// samples were clipped. The output lines up with the input and is as long:
+/// the chain's latency is cut from its start, and as much silence after the
+/// input pushes the rest out.
 fn run_chain(
     mut reader: wav::Reader,
     mut writer: wav::Writer,
@@ -384,6 +386,20 @@ fn run_chain(
     let spec = reader.spec();
     let channels = usize::from(spec.channels);
     let mut processor = Processor::new(profile, spec.sample_rate, channels);
+    let latency = processor.latency_frames() * channels;
+    let mut to_cut = latency;
+    let mut emit = |samples: &mut [f32]| {
+        processor.process(samples);
+        if samples.iter().any(|s| !s.is_finite()) {
+            return Err(format!(
+                "the output became non-finite (NaN or infinity) while processing {}; check the profile",
+                input.display()
+            ));
+        }
+        let cut = to_cut.min(samples.len());
+        to_cut -= cut;
+        writer.write(&samples[cut..])
+    };
     let mut block = vec![0.0; BLOCK_FRAMES * channels];
     let mut samples_before = 0;
     loop {
@@ -402,14 +418,15 @@ fn run_chain(
             ));
         }
         samples_before += n;
-        processor.process(&mut block[..n]);
-        if block[..n].iter().any(|s| !s.is_finite()) {
-            return Err(format!(
-                "the output became non-finite (NaN or infinity) while processing {}; check the profile",
-                input.display()
-            ));
-        }
-        writer.write(&block[..n])?;
+        emit(&mut block[..n])?;
+    }
+    let mut tail = latency;
+    while tail > 0 {
+        interrupt::check()?;
+        let n = tail.min(block.len());
+        block[..n].fill(0.0);
+        emit(&mut block[..n])?;
+        tail -= n;
     }
     writer.finish()
 }
@@ -594,6 +611,102 @@ mod tests {
             result.unwrap_err(),
             "stopped by SIGTERM; nothing was written and the temporary files were removed"
         );
+    }
+
+    /// `samples` written as a float WAV file of `channels` at 48 kHz, run
+    /// through `run_chain` with `profile` and read back.
+    fn chained(
+        dir: &config::tests::TestDir,
+        samples: &[f32],
+        channels: u16,
+        profile: &Profile,
+    ) -> Vec<f32> {
+        let (input, output) = (dir.0.join("in.wav"), dir.0.join("out.wav"));
+        let spec = WavSpec {
+            channels,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&input, spec).unwrap();
+        for &s in samples {
+            writer.write_sample(s).unwrap();
+        }
+        writer.finalize().unwrap();
+        let reader = wav::Reader::open(&input).unwrap();
+        let writer = wav::Writer::new(File::create(&output).unwrap(), &output, spec).unwrap();
+        assert_eq!(run_chain(reader, writer, profile, &input), Ok(0));
+        hound::WavReader::open(&output)
+            .unwrap()
+            .samples::<f32>()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Deterministic values in [-amp, amp).
+    fn noise(n: usize, amp: f32, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * amp
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_output_lines_up_with_the_input_and_is_as_long() {
+        // Every stage at unity but the limiter, with its lookahead and true
+        // peak, on audio it never turns down: all it does is delay, and that
+        // is taken back out, at every length from under the latency to past
+        // a block.
+        let dir = config::tests::TestDir::new("chain-latency");
+        let unity = dps::profile::CompressorParams {
+            ratio: 1.0,
+            ..Default::default()
+        };
+        let profile = Profile {
+            output_gain_db: 0.0,
+            low_shelf_db: 0.0,
+            high_shelf_db: 0.0,
+            compressor1: unity,
+            compressor2: unity,
+            ..Profile::default()
+        };
+        assert!(profile.limiter.enabled && profile.limiter.lookahead_ms > 0.0);
+        let latency = Processor::new(&profile, 48_000, 2).latency_frames();
+        assert!(latency > 10);
+        for frames in [
+            0,
+            10,
+            latency,
+            BLOCK_FRAMES - latency / 2,
+            2 * BLOCK_FRAMES + 17,
+        ] {
+            let input = noise(2 * frames, 0.3, frames as u64);
+            assert_eq!(chained(&dir, &input, 2, &profile), input, "{frames} frames");
+        }
+
+        // A file shorter than the latency that the limiter turns down comes
+        // out whole, every sample turned down but there, under the ceiling.
+        let ceiling = 10f64.powf(f64::from(profile.limiter.ceiling_db) / 20.0) as f32;
+        let loud = noise(2 * 10, 4.0, 1);
+        let out = chained(&dir, &loud, 2, &profile);
+        assert_eq!(out.len(), loud.len());
+        for (o, i) in out.iter().zip(&loud) {
+            assert!(o.abs() <= ceiling && o.abs() < i.abs(), "{o} from {i}");
+            assert_eq!(o.signum(), i.signum(), "{o} from {i}");
+        }
+
+        // Through the default chain, which also turns it down, the length
+        // stays the input's.
+        for frames in [1, 100, BLOCK_FRAMES + 1] {
+            let input = noise(2 * frames, 2.0, 7);
+            let out = chained(&dir, &input, 2, &Profile::default());
+            assert_eq!(out.len(), input.len(), "{frames} frames");
+        }
     }
 
     #[test]

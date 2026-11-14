@@ -11,10 +11,18 @@
 //!
 //! The chain keeps running in bypass, so its filters stay warm and the
 //! loudness it is matched to stays measured.
+//!
+//! The unprocessed signal is delayed as far as the chain delays its output,
+//! so the bypass crossfade mixes the same moment of the audio and the levels
+//! compare the same stretch of it. A new chain with another latency moves the
+//! delay over the same 30 ms fade, which comb-filters the unprocessed signal
+//! for that long.
 
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+
+use dps::limiter::Limiter;
 
 use super::{Chain, Handoff};
 
@@ -116,6 +124,14 @@ pub struct Mixer<C> {
     /// The unprocessed block, and the old chain's output while fading.
     dry: Vec<f32>,
     old: Vec<f32>,
+    /// A ring of the last unprocessed frames, the next to be written at
+    /// `history_at`, long enough for any chain's latency.
+    history: Vec<f32>,
+    history_at: usize,
+    /// How many frames back the unprocessed signal is played and measured:
+    /// the chain's latency, and while a new chain fades in, the old one's.
+    delay: usize,
+    old_delay: usize,
     /// How far bypass has faded in, in frames: 0 to `fade_frames`.
     dry_frames: usize,
     levels: Levels,
@@ -143,12 +159,17 @@ impl<C: Chain> Mixer<C> {
         let levels = Levels::load(&controls);
         let max_gain = 10f64.powf(MAX_GAIN_DB / 20.0);
         let fade_frames = ((FADE_SECONDS * fs).round() as usize).max(1);
+        let delay = chain.latency_frames();
         Self {
             chain,
             fading: None,
             fade_frames,
             dry: vec![0.0; 2 * block_frames],
             old: vec![0.0; 2 * block_frames],
+            history: vec![0.0; 2 * (Limiter::max_latency_frames(fs) + 1)],
+            history_at: 0,
+            delay,
+            old_delay: delay,
             dry_frames: if controls.bypass.load(Relaxed) {
                 fade_frames
             } else {
@@ -176,12 +197,15 @@ impl<C: Chain> Mixer<C> {
         {
             new.adopt(&self.chain);
             self.fading = Some((mem::replace(&mut self.chain, new), 0));
+            self.old_delay = self.delay;
+            self.delay = self.chain.latency_frames();
         }
         let dry = &mut self.dry[..block.len()];
         dry.copy_from_slice(block);
         self.chain.process(block);
 
         let mut finished = false;
+        let mut faded = None;
         if let Some((old_chain, done)) = &mut self.fading {
             let old = &mut self.old[..block.len()];
             old.copy_from_slice(dry);
@@ -197,9 +221,11 @@ impl<C: Chain> Mixer<C> {
                     *x = (1.0 - t) * o + t * *x;
                 }
             }
+            faded = Some(*done);
             *done += block.len() / 2;
             finished = *done >= self.fade_frames;
         }
+        self.delay_dry(block.len() / 2, faded);
         if finished && let Some((old_chain, _)) = self.fading.take() {
             self.handoff.retire(old_chain);
             // The new chain's level is measured from scratch, so the match
@@ -210,6 +236,32 @@ impl<C: Chain> Mixer<C> {
 
         if block.iter().all(|x| x.is_finite()) {
             self.mix_dry(block);
+        }
+    }
+
+    /// Replaces the first `frames` unprocessed frames in `dry` with those
+    /// `delay` frames earlier. `faded` is how far a fade between chains had
+    /// got at the block's start; if their latencies differ, the frames are
+    /// faded from `old_delay` frames earlier as the chains are.
+    fn delay_dry(&mut self, frames: usize, faded: Option<usize>) {
+        let size = self.history.len() / 2;
+        let back = |at: usize, by: usize| 2 * ((at + size - by) % size);
+        let faded = faded.filter(|_| self.old_delay != self.delay);
+        for (f, dry) in self.dry[..2 * frames].chunks_exact_mut(2).enumerate() {
+            let at = self.history_at;
+            self.history[2 * at..2 * at + 2].copy_from_slice(dry);
+            let new = &self.history[back(at, self.delay)..][..2];
+            match faded {
+                Some(done) => {
+                    let t = ((done + f + 1) as f32 / self.fade_frames as f32).min(1.0);
+                    let old = &self.history[back(at, self.old_delay)..][..2];
+                    for ((x, o), n) in dry.iter_mut().zip(old).zip(new) {
+                        *x = (1.0 - t) * o + t * n;
+                    }
+                }
+                None => dry.copy_from_slice(new),
+            }
+            self.history_at = if at + 1 == size { 0 } else { at + 1 };
         }
     }
 
@@ -261,15 +313,40 @@ mod tests {
     /// 30 ms at 48 kHz.
     const FADE: usize = 1440;
 
-    /// Multiplies every sample by its gain, counting how often it is dropped.
+    /// Multiplies every sample by its gain and delays it by a latency,
+    /// counting how often it is dropped.
     struct Scale {
         gain: f32,
         drops: Arc<AtomicU64>,
+        /// The delayed samples, interleaved, the oldest at `at`.
+        line: Vec<f32>,
+        at: usize,
+    }
+
+    impl Scale {
+        fn new(gain: f32, latency: usize, drops: &Arc<AtomicU64>) -> Self {
+            Self {
+                gain,
+                drops: Arc::clone(drops),
+                line: vec![0.0; 2 * latency],
+                at: 0,
+            }
+        }
     }
 
     impl Chain for Scale {
         fn process(&mut self, block: &mut [f32]) {
-            block.iter_mut().for_each(|x| *x *= self.gain);
+            for x in block {
+                *x *= self.gain;
+                if !self.line.is_empty() {
+                    mem::swap(x, &mut self.line[self.at]);
+                    self.at = (self.at + 1) % self.line.len();
+                }
+            }
+        }
+
+        fn latency_frames(&self) -> usize {
+            self.line.len() / 2
         }
     }
 
@@ -293,12 +370,14 @@ mod tests {
 
         /// A rig whose mixer carries on from `controls`, as a new session does.
         fn with(gain: f32, controls: Arc<Controls>) -> Self {
+            Self::delayed(gain, 0, controls)
+        }
+
+        /// A rig on a chain that delays its output by `latency` frames.
+        fn delayed(gain: f32, latency: usize, controls: Arc<Controls>) -> Self {
             let drops = Arc::new(AtomicU64::new(0));
             let handoff = Arc::new(Handoff::new());
-            let chain = Box::new(Scale {
-                gain,
-                drops: Arc::clone(&drops),
-            });
+            let chain = Box::new(Scale::new(gain, latency, &drops));
             let mixer = Mixer::new(
                 chain,
                 RATE,
@@ -315,10 +394,11 @@ mod tests {
         }
 
         fn post(&self, gain: f32) {
-            self.handoff.post(Scale {
-                gain,
-                drops: Arc::clone(&self.drops),
-            });
+            self.post_delayed(gain, 0);
+        }
+
+        fn post_delayed(&self, gain: f32, latency: usize) {
+            self.handoff.post(Scale::new(gain, latency, &self.drops));
         }
 
         /// Runs `input` (one sample per frame, the same on both sides)
@@ -483,6 +563,76 @@ mod tests {
         let bypassed = mean_square(&out[FADE..]);
         let error_db = 10.0 * (bypassed / processed).log10();
         assert!(error_db.abs() < 0.001, "{error_db} dB");
+    }
+
+    #[test]
+    fn bypass_plays_the_dry_signal_as_late_as_the_chain_plays_its_output() {
+        // The chain halves the signal 300 frames late; bypass plays the
+        // input 300 frames late too, at the matched gain.
+        let (freq, amp, latency) = (440.0, 0.4, 300);
+        let mut rig = Rig::delayed(0.5, latency, Arc::default());
+        let start = 4 * 48_000;
+        let processed = rig.run(&sine(freq, amp, 0, start));
+        let late = sine(freq, amp, start - 48_000 - latency, 48_000);
+        assert!(
+            processed[start - 48_000..]
+                .iter()
+                .zip(&late)
+                .all(|(o, i)| *o == 0.5 * i)
+        );
+        assert!((rig.controls.dry_gain() - 0.5).abs() < 1e-6);
+        rig.controls.bypass.store(true, Relaxed);
+        let out = rig.run(&sine(freq, amp, start, 48_000));
+        let late = sine(freq, amp, start - latency, 48_000);
+        let g = rig.controls.dry_gain();
+        for (o, i) in out[FADE..].iter().zip(&late[FADE..]) {
+            assert!((o - g * i).abs() <= 1e-6, "{o} vs {}", g * i);
+        }
+    }
+
+    #[test]
+    fn bypass_matches_bursts_through_a_chain_that_delays_them() {
+        // 10 ms tone bursts every 40 ms through a chain that halves them
+        // 10 ms late. Each processed burst starts as its unprocessed one
+        // ends, so unaligned the measurements would set unprocessed sound
+        // against processed silence and hold the gain at its -12 dB floor.
+        let latency = 480;
+        let bursts = |start: usize, n: usize| -> Vec<f32> {
+            sine(1000.0, 0.4, start, n)
+                .into_iter()
+                .enumerate()
+                .map(|(i, x)| if (start + i) % 1920 < 480 { x } else { 0.0 })
+                .collect()
+        };
+        let mut rig = Rig::delayed(0.5, latency, Arc::default());
+        rig.run(&bursts(0, 6 * 48_000));
+        let gain = rig.controls.dry_gain();
+        assert!((gain - 0.5).abs() < 0.5 * 1e-4, "{gain}");
+    }
+
+    #[test]
+    fn in_bypass_a_chain_with_another_latency_takes_over_without_a_jump() {
+        // Bypassed at unity, a chain 300 frames late replaces one with none:
+        // the dry signal moves to its new delay over the 30 ms fade, rather
+        // than jumping back 300 frames, and then plays that late.
+        let (freq, amp, latency) = (440.0, 0.5, 300);
+        let input = sine(freq, amp, 0, 6 * 48_000);
+        let mut rig = Rig::new(1.0);
+        rig.controls.bypass.store(true, Relaxed);
+        let at = 4 * 48_000;
+        let mut out = rig.run(&input[..at]);
+        rig.post_delayed(1.0, latency);
+        out.extend(rig.run(&input[at..]));
+
+        let bound = sine_step(freq, amp) + (2.0 * amp / 1440.0) as f32 + 1e-6;
+        assert!(max_step(&out) <= bound, "{} > {bound}", max_step(&out));
+        let jump = (input[at] - input[at - latency]).abs();
+        assert!(jump > 10.0 * bound, "{jump}");
+        // The gain still moves by a few parts in a million after the new
+        // chain's empty delay read quieter during the fade.
+        for (o, i) in out[at + FADE..].iter().zip(&input[at + FADE - latency..]) {
+            assert!((o - i).abs() <= 1e-4, "{o} vs {i}");
+        }
     }
 
     #[test]
