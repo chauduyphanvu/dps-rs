@@ -1,28 +1,43 @@
 # dps
 
-A command-line tool that runs audio through a reimplementation of the
-"Digital Power Station" processing chain: on files, or live on everything your
-Mac plays.
+A system-wide audio processor for macOS that needs no virtual audio driver:
+it levels, shapes and limits everything your Mac plays, with a profile for
+each output device. The same chain processes audio files on any platform.
 
-This project is not affiliated with or endorsed by Bongiovi Acoustics. There is
-no public source for their product, so the chain here is rebuilt from the
-published patents (the US 8,284,955 family, and US 9,398,394 for the stereo
-block). The patents publish no tuning values, so the default profile and the
-presets are this project's own starting points and will not sound like the
-commercial product. The MIT license covers this code only; it grants no rights
-under anyone's patents.
+The core of the chain is a reimplementation of the "Digital Power Station"
+processing chain. This project is not affiliated with or endorsed by Bongiovi
+Acoustics. There is no public source for their product, so that core is
+rebuilt from the published patents (the US 8,284,955 family, and US 9,398,394
+for the stereo block). The patents publish no tuning values, so the default
+profile and the presets are this project's own starting points and will not
+sound like the commercial product. The leveler, bass harmonics, contour,
+crossfeed, device correction and limiter are this project's own additions.
+The MIT license covers this code only; it grants no rights under anyone's
+patents.
 
 ## What it does
 
 ```
-input gain → low shelf cut → high shelf boost → compressor
-           → mirrored shelves → 11-band parametric EQ → compressor
-           → output gain → stereo field enhancement → peak limiter
+leveler → input gain → low shelf cut → high shelf boost → compressor
+        → mirrored shelves → 11-band parametric EQ → compressor → output gain
+        → bass harmonics → contour → stereo field enhancement → crossfeed
+        → device correction → peak limiter
 ```
 
+| Stage | What it is for | Off by default |
+|---|---|---|
+| Leveler | Brings every source to one loudness, so the compressors work the same on quiet and loud material | yes |
+| Shelves, compressors, EQ, output gain | The patent chain | |
+| Bass harmonics | Makes bass audible on speakers too small to play it | yes |
+| Contour | Adds bass and treble as the system volume goes down (live only) | yes |
+| Stereo field enhancement | The patent's widening | yes |
+| Crossfeed | Feeds each ear some of the other channel, for headphones | yes |
+| Device correction | A measured correction for the output device, kept apart from your EQ | yes |
+| Limiter | No peak above the ceiling, with lookahead and true-peak detection | |
+
 - **Live:** intercepts system audio with a Core Audio process tap, processes it
-  and plays it on the default output device. No virtual audio driver. Adds
-  about 25 ms of latency.
+  and plays it on the default output device. No virtual audio driver. When it
+  starts it states the latency Core Audio reports for the session.
 - **Files:** WAV directly; any other format through `ffmpeg`, keeping tags,
   cover art, codec and bit depth where the container allows.
 
@@ -32,6 +47,8 @@ input gain → low shelf cut → high shelf boost → compressor
 - Live mode: macOS 14.2 or later, and your terminal allowed under System
   Settings > Privacy & Security > Screen & System Audio Recording.
 - `ffmpeg` and `ffprobe` on `PATH` for files other than WAV.
+- `dps calibrate`: a microphone, and your terminal allowed under Privacy &
+  Security > Microphone.
 
 File processing builds on other platforms; live mode is macOS only.
 
@@ -57,13 +74,20 @@ dps --preset music        # the same, starting from a built-in preset
 dps process song.flac     # write song.dps.flac
 dps start                 # run live in the background (dps status, dps stop)
 dps start --login         # also start at every login
+dps devices               # list the outputs and the profile each plays with
+dps import hd650.txt      # import a headphone correction
+dps calibrate             # measure your speakers and correct them
+dps set eq.gains_db[3] --by +2   # change one setting from a script
+dps bypass                # toggle bypass in the running dps
 dps presets               # list the built-in presets
 dps profile               # print the default profile as TOML
 ```
 
 ### Tuning while it plays
 
-In a terminal, live mode shows every setting.
+In a terminal, live mode shows every setting, with meters above them: input
+and output loudness, the leveler's gain, and how much each compressor and the
+limiter are taking off.
 
 | Key | Action |
 |---|---|
@@ -73,12 +97,28 @@ In a terminal, live mode shows every setting.
 | Tab, Shift + Tab | on an EQ band: switch between gain, frequency and Q |
 | Space | toggle an on/off setting |
 | `b` | bypass, matched to the processed level (total of left and right) |
-| `s` | save to the settings file |
-| `r` | revert to the last saved settings |
+| `g` | show or hide the response curve of the EQ and the device correction |
+| `a` | switch between A and B |
+| `c` | copy the slot you hear into the other |
+| `p` | load the next built-in preset into the slot you hear, not saved |
+| `m` | level matching between A and B on or off (on to begin with) |
+| `x` | start a blind test; `x` or Esc ends it and shows the tally |
+| `s` | save the slot you hear to the settings file |
+| `r` | revert it to the last saved settings |
 | `q` | quit |
 
 Changes crossfade over 30 ms. Saving rewrites the settings file, so comments
 in a hand-edited file are not kept.
+
+**A and B.** The tuner holds two sets of settings. B starts as what was last
+saved, so `a` compares your edits with it. With level matching on, the louder
+of the two is turned down to the other's loudness, since louder tends to win
+a comparison.
+
+**Blind test.** `x` hides the settings and calls the two X and Y, drawn at
+random. `a` or Tab switches between them, `1` or `2` votes for X or Y, and
+each vote draws the order again. Ending the test shows how often each was
+preferred and whether a split that lopsided could be chance.
 
 ### Settings
 
@@ -99,12 +139,82 @@ gains_db = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 A band at or above half the sample rate is skipped rather than rejected.
 
+### Scripting
+
+`dps get` and `dps set` read and change one value of the profile; a running
+dps picks a change up as it does any save.
+
+```sh
+dps get eq.gains_db[3]            # one value; a table or a list prints as TOML
+dps set eq.gains_db[3] --by +2    # add to a number (--by -1.5 works too)
+dps set leveler.target_lufs -16   # a number, true/false or on/off
+```
+
+Keys are paths into the profile's TOML (`dps profile` prints every key), with
+`[N]` for a position in a list. A value out of range changes nothing; otherwise
+the file is rewritten, so its comments are not kept. A running dps, in a
+terminal or from `dps start`, also takes:
+
+```sh
+dps bypass            # toggle the level-matched bypass (or: on, off)
+dps use night         # play a preset or profile file until that run ends
+dps use --settings    # back to the settings file and per-device profiles
+```
+
+### A profile for each output
+
+Speakers and headphones want different settings. `dps devices` lists the
+outputs; `dps devices assign` gives the default output (or `--device NAME`) a
+profile file of its own, a copy of what it plays with now, or `--preset NAME`.
+Live mode with the settings file then follows the output: when you plug in
+headphones it switches to their profile, and the tuner edits and saves that
+file. Unsaved changes are dropped at a switch, and the message says so.
+
+The assignments are kept in `config.toml` beside the settings file, which also
+lists apps to leave alone:
+
+```toml
+# Bundle IDs whose audio is not processed. An entry also covers IDs that
+# continue it after a dot, such as a browser's helper processes.
+exclude = ["us.zoom.xos", "com.apple.FaceTime"]
+
+[devices."BuiltInSpeakerDevice"]
+name = "MacBook Pro Speakers"
+profile = "devices/macbook-pro-speakers.toml"
+```
+
+`dps doctor` lists the bundle IDs of the apps playing audio now.
+
+### Correcting the output device
+
+The `[correction]` table holds a measured correction for the device, applied
+last before the limiter and kept apart from the EQ.
+
+- **Headphones:** `dps import ParametricEQ.txt` reads the parametric EQ files
+  the AutoEQ project publishes for each headphone model (Equalizer APO
+  format).
+- **Speakers:** `dps calibrate` plays a quiet warble tone for each third of an
+  octave from 100 Hz to 8 kHz, records it with the default input device, and
+  fits up to 8 filters that flatten what it heard, with at most 6 dB of boost.
+  It takes about 35 s. Put the microphone where you listen. `--level` sets how
+  loud the tones are (−30 dBFS unless you say otherwise) and `--dry-run` only
+  prints the result. It corrects the speakers as that microphone hears them at
+  that position.
+
+Both write to the profile the current output device uses, or to `--profile`.
+
 ### Presets
 
-`headphones`, `laptop-speakers`, `music` and `voice`. They were set by
-measurement on test signals, not by listening tests. With the limiter on, a
-mix at −14 LUFS comes out about as loud as it went in; loud masters come out a
-few LU quieter because the compressors turn loud material down most.
+`headphones`, `laptop-speakers`, `music`, `night` and `voice`. They were set by
+measurement on test signals, not by listening tests. Each starts with a leveler
+that steers its input to a target loudness (−14 LUFS; −16 for `voice` and
+`night`), so once it has settled, after a few seconds, a mix at −20 to −4 LUFS
+comes out within 1 LU of a −14 LUFS one, and one at −30 LUFS within 2 LU.
+`laptop-speakers` adds bass harmonics, `headphones` crossfeed, and `headphones`,
+`music` and `night` a contour that follows the system volume in live mode.
+`night` is for low volume late at night: a programme swinging 20 LU between
+quiet and loud passages comes out 3.4 LU apart. A limiter keeps every peak at
+or below −1 dBFS (−2 for `night`).
 
 ## Safety in live mode
 
@@ -120,16 +230,36 @@ few LU quieter because the compressors turn loud material down most.
 - Start at login was checked through launchd's state, not an actual logout.
 - macOS below 14.2 is untested, and the binary may not launch there.
 - Decoded audio above 4 GiB is not supported.
+- The leveler holds its gain for 5 s after a sudden drop in level, so material
+  that alternates between quiet and loud every few seconds comes out with a
+  wider gap than it went in with. `night` avoids this by never cutting.
+- The contour needs an output device with a volume control; others, and
+  files, get nothing from it.
 
 ## Development
 
 ```sh
 cargo fmt --check && cargo test && cargo clippy --all-targets -- -D warnings
+cargo run --release --example bench    # what the chain costs, stage by stage
 ```
 
 The tests never touch the real settings file, launchd or audio devices.
 `docs/` holds the specs extracted from the patents, including the errors in
 the printed equations and the corrected forms the code uses.
+
+With every stage on, the chain takes about 1.5 % of one core at 48 kHz on an
+Apple silicon Mac; the default profile about 0.5 %.
+
+### Releasing
+
+One-time setup: `rustup target add aarch64-apple-darwin x86_64-apple-darwin`, then
+`xcrun notarytool store-credentials dps-notary --apple-id <id> --team-id <team>`
+(prompts for an app-specific password and keeps it in the keychain).
+
+1. Bump `version` in `Cargo.toml`, run `cargo build` to refresh `Cargo.lock`, commit both and push.
+2. `scripts/release.sh` builds, signs and notarises `dist/dps-<version>-macos-universal.zip` and prints its sha256. It publishes nothing.
+3. `gh release create v<version> dist/dps-<version>-macos-universal.zip --generate-notes`
+4. In the Homebrew tap, copy `packaging/homebrew/dps.rb` to `Formula/dps.rb`, set `url` and `sha256`, push.
 
 ## License
 
