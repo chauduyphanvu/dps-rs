@@ -17,12 +17,18 @@
 //! compare the same stretch of it. A new chain with another latency moves the
 //! delay over the same 30 ms fade, which comb-filters the unprocessed signal
 //! for that long.
+//!
+//! Once a block, the mixer publishes meters for the screen: the chain's gain
+//! reductions and leveler gain, and the short-term loudness of the
+//! unprocessed input and of what plays.
 
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 
+use dps::Meters;
 use dps::limiter::Limiter;
+use dps::loudness::Meter;
 
 use super::{Chain, Handoff};
 
@@ -39,6 +45,8 @@ const MAX_GAIN_DB: f64 = 12.0;
 /// Mean square below which an unprocessed frame counts as silent and is left
 /// out of the measurements, so the gain holds through silence (-120 dBFS).
 const SILENT: f64 = 1e-12;
+/// Window of the loudness meters: BS.1770's short-term loudness.
+const METER_SECONDS: f64 = 3.0;
 
 /// Shared by the main thread and the audio callback for the whole run, so a
 /// new session after a device change starts where the last one left off.
@@ -49,14 +57,49 @@ pub struct Controls {
     dry_gain: AtomicU32,
     /// Callback: the measurements the gain comes from, as f64 bits.
     levels: [AtomicU64; 3],
+    /// Callback: the largest gain reductions of compressor 1, compressor 2
+    /// and the limiter since the main thread last read them, in dB as f32
+    /// bits. They are never negative, so their bits order as they do.
+    reductions: [AtomicU32; 3],
+    /// Callback: the leveler's gain in dB, as f32 bits.
+    leveler_db: AtomicU32,
+    /// Callback: the short-term loudness of the unprocessed input and of
+    /// what plays, in LUFS as f32 bits.
+    loudness: [AtomicU32; 2],
 }
 
 impl Default for Controls {
     fn default() -> Self {
+        let silent = || AtomicU32::new(f32::NEG_INFINITY.to_bits());
         Self {
             bypass: AtomicBool::new(false),
             dry_gain: AtomicU32::new(1f32.to_bits()),
             levels: Default::default(),
+            reductions: Default::default(),
+            leveler_db: AtomicU32::new(0f32.to_bits()),
+            loudness: [silent(), silent()],
+        }
+    }
+}
+
+/// What the meters read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Readings {
+    /// Short-term loudness of the unprocessed input and of what plays, in
+    /// LUFS; -inf in digital silence.
+    pub input_lufs: f32,
+    pub output_lufs: f32,
+    /// The heard chain's leveler gain, and its largest gain reductions
+    /// since the last reading.
+    pub chain: Meters,
+}
+
+impl Default for Readings {
+    fn default() -> Self {
+        Self {
+            input_lufs: f32::NEG_INFINITY,
+            output_lufs: f32::NEG_INFINITY,
+            chain: Meters::default(),
         }
     }
 }
@@ -64,6 +107,41 @@ impl Default for Controls {
 impl Controls {
     pub fn dry_gain(&self) -> f32 {
         f32::from_bits(self.dry_gain.load(Relaxed))
+    }
+
+    /// Main thread: the meters, starting the gain reductions over.
+    pub fn readings(&self) -> Readings {
+        let [c1, c2, lim] = self
+            .reductions
+            .each_ref()
+            .map(|r| f32::from_bits(r.swap(0, Relaxed)));
+        let [input_lufs, output_lufs] = self
+            .loudness
+            .each_ref()
+            .map(|l| f32::from_bits(l.load(Relaxed)));
+        Readings {
+            input_lufs,
+            output_lufs,
+            chain: Meters {
+                leveler_db: f32::from_bits(self.leveler_db.load(Relaxed)),
+                compressor1_db: c1,
+                compressor2_db: c2,
+                limiter_db: lim,
+            },
+        }
+    }
+
+    /// Callback: one block's meters.
+    fn publish(&self, chain: Meters, input_lufs: f32, output_lufs: f32) {
+        let reductions = [chain.compressor1_db, chain.compressor2_db, chain.limiter_db];
+        for (slot, db) in self.reductions.iter().zip(reductions) {
+            // NaN and -0.0 would break the bits' order.
+            let db = if db > 0.0 { db } else { 0.0 };
+            slot.fetch_max(db.to_bits(), Relaxed);
+        }
+        self.leveler_db.store(chain.leveler_db.to_bits(), Relaxed);
+        self.loudness[0].store(input_lufs.to_bits(), Relaxed);
+        self.loudness[1].store(output_lufs.to_bits(), Relaxed);
     }
 }
 
@@ -142,6 +220,9 @@ pub struct Mixer<C> {
     gain: f64,
     target: f64,
     gain_coef: f64,
+    /// Loudness of the unprocessed input, and of what plays.
+    input_meter: Meter,
+    output_meter: Meter,
 }
 
 impl<C: Chain> Mixer<C> {
@@ -181,6 +262,8 @@ impl<C: Chain> Mixer<C> {
             gain,
             target: levels.gain(max_gain).unwrap_or(gain),
             gain_coef: 1.0 - (-1.0 / (GAIN_SECONDS * fs)).exp(),
+            input_meter: Meter::new(fs, 2, METER_SECONDS),
+            output_meter: Meter::new(fs, 2, METER_SECONDS),
             handoff,
             controls,
         }
@@ -202,6 +285,9 @@ impl<C: Chain> Mixer<C> {
         }
         let dry = &mut self.dry[..block.len()];
         dry.copy_from_slice(block);
+        for frame in block.chunks_exact(2) {
+            self.input_meter.frame(frame);
+        }
         self.chain.process(block);
 
         let mut finished = false;
@@ -237,6 +323,14 @@ impl<C: Chain> Mixer<C> {
         if block.iter().all(|x| x.is_finite()) {
             self.mix_dry(block);
         }
+        for frame in block.chunks_exact(2) {
+            self.output_meter.frame(frame);
+        }
+        self.controls.publish(
+            self.chain.meters(),
+            self.input_meter.lufs(),
+            self.output_meter.lufs(),
+        );
     }
 
     /// Replaces the first `frames` unprocessed frames in `dry` with those
@@ -1173,6 +1267,90 @@ mod tests {
                 .zip(&input[30_000 + FADE..])
                 .all(|(o, i)| *o == -i)
         );
+    }
+
+    /// Passes audio through and meters it: its reductions are 10, 20 and 30
+    /// times the largest sample since the last reading, and its leveler
+    /// gain the negated last sample, so a test can steer them.
+    #[derive(Default)]
+    struct Metered {
+        peak: f32,
+        last: f32,
+    }
+
+    impl Chain for Metered {
+        fn process(&mut self, block: &mut [f32]) {
+            for &x in block.iter() {
+                self.peak = self.peak.max(x.abs());
+                self.last = x;
+            }
+        }
+
+        fn meters(&mut self) -> Meters {
+            let peak = mem::take(&mut self.peak);
+            Meters {
+                leveler_db: -self.last,
+                compressor1_db: 10.0 * peak,
+                compressor2_db: 20.0 * peak,
+                limiter_db: 30.0 * peak,
+            }
+        }
+    }
+
+    #[test]
+    fn meters_show_the_largest_reduction_since_the_last_reading() {
+        let controls = Arc::new(Controls::default());
+        let mut mixer = Mixer::new(
+            Box::new(Metered::default()),
+            RATE,
+            256,
+            Arc::new(Handoff::new()),
+            Arc::clone(&controls),
+        );
+        let mut play = |levels: &[f32]| {
+            for &level in levels {
+                mixer.process(&mut [level; 512]);
+            }
+        };
+        let close = |got: f32, want: f32| (got - want).abs() < 1e-5;
+        play(&[0.1, 0.5, 0.2]);
+        let r = controls.readings();
+        assert!(close(r.chain.compressor1_db, 5.0), "{r:?}");
+        assert!(close(r.chain.compressor2_db, 10.0), "{r:?}");
+        assert!(close(r.chain.limiter_db, 15.0), "{r:?}");
+        assert!(close(r.chain.leveler_db, -0.2), "{r:?}");
+        // Reading started them over: the next shows only what came since.
+        play(&[0.05, 0.03]);
+        let r = controls.readings();
+        assert!(close(r.chain.compressor1_db, 0.5), "{r:?}");
+        assert!(close(r.chain.leveler_db, -0.03), "{r:?}");
+        // Nothing since: no reduction, and the leveler still where it was.
+        let r = controls.readings();
+        assert_eq!(r.chain.limiter_db, 0.0);
+        assert!(close(r.chain.leveler_db, -0.03), "{r:?}");
+    }
+
+    #[test]
+    fn loudness_meters_read_the_input_and_what_plays() {
+        // A 997 Hz sine at 0.5 on both sides reads -6.02 LUFS; the chain
+        // halves it to -12.04, and bypass, matched, plays it at that too.
+        let mut rig = Rig::new(0.5);
+        assert_eq!(rig.controls.readings(), Readings::default());
+        rig.run(&vec![0.0; 48_000]);
+        let r = rig.controls.readings();
+        assert_eq!(
+            (r.input_lufs, r.output_lufs),
+            (f32::NEG_INFINITY, f32::NEG_INFINITY)
+        );
+        rig.run(&sine(997.0, 0.5, 0, 4 * 48_000));
+        let r = rig.controls.readings();
+        assert!((r.input_lufs + 6.02).abs() < 0.05, "{r:?}");
+        assert!((r.output_lufs + 12.04).abs() < 0.05, "{r:?}");
+        rig.controls.bypass.store(true, Relaxed);
+        rig.run(&sine(997.0, 0.5, 0, 4 * 48_000));
+        let r = rig.controls.readings();
+        assert!((r.input_lufs + 6.02).abs() < 0.05, "{r:?}");
+        assert!((r.output_lufs + 12.04).abs() < 0.05, "{r:?}");
     }
 
     #[test]

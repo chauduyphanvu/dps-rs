@@ -12,7 +12,7 @@ use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Mutex, Once, OnceLock, PoisonError};
 use std::thread::{self, ThreadId};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, MoveTo};
 use crossterm::style::{Attribute, Print, SetAttribute};
@@ -22,6 +22,7 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 
+use super::mix::Readings;
 use super::tuner::{Field, Key, Row, Tuner};
 use super::{SIG_ERR, signal};
 
@@ -90,7 +91,16 @@ const LEGEND: [&str; 2] = [
 ];
 const MAX_MESSAGE_LINES: usize = 6;
 
+/// Loudness below this shows as "--": BS.1770's absolute gate.
+const QUIET_LUFS: f32 = -70.0;
+/// How long a gain reduction's peak stays on screen.
+const HOLD: Duration = Duration::from_secs(1);
+/// A reduction's bar: this many cells of this many dB each.
+const BAR_CELLS: usize = 8;
+const BAR_CELL_DB: f32 = 1.5;
+
 /// What the screen shows.
+#[derive(Clone, Copy)]
 pub struct View<'a> {
     pub tuner: &'a Tuner,
     pub name: &'a str,
@@ -98,6 +108,7 @@ pub struct View<'a> {
     pub rate: u32,
     pub clamped: u64,
     pub dry_gain: f32,
+    pub meters: Readings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -151,11 +162,15 @@ pub fn layout(view: &View, width: u16, height: u16, top: &mut usize) -> Vec<Line
     let mut lines = vec![
         line(status, Style::Bold),
         line(output + &tail(view.name, room), Style::Plain),
-        line(
-            format!("{:-<width$}", format!("-- {}/{count} ", at + 1)),
-            Style::Plain,
-        ),
     ];
+    let leveler = tuner.profile().leveler.enabled;
+    for meters in meter_lines(&view.meters, leveler, width) {
+        lines.push(line(meters, Style::Plain));
+    }
+    lines.push(line(
+        format!("{:-<width$}", format!("-- {}/{count} ", at + 1)),
+        Style::Plain,
+    ));
 
     // The question, when there is one, is always shown, under the message.
     let prompt = tuner
@@ -232,6 +247,108 @@ pub fn layout(view: &View, width: u16, height: u16, top: &mut usize) -> Vec<Line
         },
     );
     lines
+}
+
+/// The meters in one line if it fits `width`, else two: the loudness and
+/// the leveler, then the gain reductions, with bars if they fit.
+fn meter_lines(meters: &Readings, leveler: bool, width: usize) -> Vec<String> {
+    let lufs = |v: f32| {
+        if v > QUIET_LUFS {
+            format!("{v:.1}")
+        } else {
+            "--".into()
+        }
+    };
+    let loudness = format!(
+        "in {:>5}  out {:>5} LUFS",
+        lufs(meters.input_lufs),
+        lufs(meters.output_lufs)
+    );
+    let gain = if leveler {
+        // Rounded first, and + 0.0, so a gain just under 0 shows as +0.0.
+        format!(
+            "{:+.1}",
+            (meters.chain.leveler_db * 10.0).round() / 10.0 + 0.0
+        )
+    } else {
+        "off".into()
+    };
+    let unit = if leveler { " dB" } else { "" };
+    let c = &meters.chain;
+    let reductions = [
+        ("c1", c.compressor1_db),
+        ("c2", c.compressor2_db),
+        ("lim", c.limiter_db),
+    ];
+    let barred = reductions
+        .map(|(name, db)| format!("{name:<3} {:>5} {}", reduction(db), bar(db)))
+        .join("   ")
+        + " dB";
+    let one = format!("{loudness}   leveler {gain}{unit}   {barred}");
+    if one.chars().count() <= width {
+        return vec![one];
+    }
+    if barred.chars().count() <= width {
+        return vec![format!("{loudness}   leveler {gain}{unit}"), barred];
+    }
+    let plain = reductions
+        .map(|(name, db)| format!("{name} {}", reduction(db)))
+        .join("  ")
+        + " dB";
+    vec![format!("{loudness}  lev {gain}"), plain]
+}
+
+/// A gain reduction as the change it makes, e.g. "-4.2".
+fn reduction(db: f32) -> String {
+    if db >= 0.05 {
+        format!("-{db:.1}")
+    } else {
+        "0.0".into()
+    }
+}
+
+/// A gain reduction as a bar of `BAR_CELLS` cells, in eighths of a cell.
+fn bar(db: f32) -> String {
+    const PARTS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    let eighths = (db / BAR_CELL_DB * 8.0)
+        .round()
+        .clamp(0.0, (8 * BAR_CELLS) as f32) as usize;
+    let (full, part) = (eighths / 8, eighths % 8);
+    let mut bar = "█".repeat(full);
+    if part > 0 {
+        bar.push(PARTS[part]);
+    }
+    let drawn = full + usize::from(part > 0);
+    bar + &"·".repeat(BAR_CELLS - drawn)
+}
+
+/// Holds each gain reduction's peak on screen for `HOLD`, so it can be read.
+#[derive(Default)]
+struct Hold {
+    /// Each peak and when it was reached.
+    peaks: [(f32, Option<Instant>); 3],
+}
+
+impl Hold {
+    /// `readings` with each reduction replaced by its held peak.
+    fn apply(&mut self, mut readings: Readings, now: Instant) -> Readings {
+        let c = &mut readings.chain;
+        for (value, (peak, since)) in [
+            &mut c.compressor1_db,
+            &mut c.compressor2_db,
+            &mut c.limiter_db,
+        ]
+        .into_iter()
+        .zip(&mut self.peaks)
+        {
+            let expired = since.is_none_or(|t| now.saturating_duration_since(t) >= HOLD);
+            if *value >= *peak || expired {
+                (*peak, *since) = (*value, Some(now));
+            }
+            *value = *peak;
+        }
+        readings
+    }
 }
 
 /// Moves `top` so the selected row is among the `height` rows shown, with
@@ -405,6 +522,7 @@ pub struct Screen {
     size: (u16, u16),
     top: usize,
     clear: bool,
+    hold: Hold,
 }
 
 impl Screen {
@@ -424,6 +542,7 @@ impl Screen {
             size: (80, 24),
             top: 0,
             clear: true,
+            hold: Hold::default(),
         };
         extern "C" fn on_resize(_: c_int) {
             RESIZED.store(true, Relaxed);
@@ -496,7 +615,11 @@ impl Screen {
     }
 
     pub fn draw(&mut self, view: &View) -> io::Result<()> {
-        let lines = layout(view, self.size.0, self.size.1, &mut self.top);
+        let view = View {
+            meters: self.hold.apply(view.meters, Instant::now()),
+            ..*view
+        };
+        let lines = layout(&view, self.size.0, self.size.1, &mut self.top);
         let mut frame = Vec::new();
         queue!(frame, BeginSynchronizedUpdate)?;
         let empty = frame.len();
@@ -722,6 +845,7 @@ mod tests {
             rate: 48_000,
             clamped: 0,
             dry_gain: 1.0,
+            meters: Readings::default(),
         }
     }
 
@@ -750,13 +874,115 @@ mod tests {
             text[1],
             "MacBook Pro Speakers at 48000 Hz   presets/music.toml"
         );
-        assert!(text[2].starts_with("-- 1/57 ---"));
-        assert_eq!(text[3], " Leveler");
+        assert_eq!(text[2], "in    --  out    -- LUFS   leveler off");
+        assert_eq!(
+            text[3],
+            "c1    0.0 ········   c2    0.0 ········   lim   0.0 ········ dB"
+        );
+        assert!(text[4].starts_with("-- 1/57 ---"));
+        assert_eq!(text[5], " Leveler");
         assert_eq!(selected(&lines), [">   enabled                      off "]);
-        assert_eq!(&text[22..], LEGEND);
+        assert_eq!(&text[24 - LEGEND.len()..], LEGEND);
         // The selection is marked in the text, not only by the highlight.
-        assert!(text[4].starts_with('>'));
-        assert!(text[5].starts_with(' '));
+        assert!(text[6].starts_with('>'));
+        assert!(text[7].starts_with(' '));
+    }
+
+    fn readings() -> Readings {
+        Readings {
+            input_lufs: -18.24,
+            output_lufs: -14.06,
+            chain: dps::Meters {
+                leveler_db: 3.52,
+                compressor1_db: 4.2,
+                compressor2_db: 1.0,
+                limiter_db: 0.3,
+            },
+        }
+    }
+
+    /// The meter lines laid out at `width` with the leveler on.
+    fn meters_at(meters: Readings, width: u16) -> Vec<String> {
+        let mut profile = Profile::default();
+        profile.leveler.enabled = true;
+        let tuner = Tuner::new(profile, String::new());
+        let mut top = 0;
+        let view = View {
+            meters,
+            ..view(&tuner)
+        };
+        let lines = layout(&view, width, 30, &mut top);
+        let rule = lines.iter().position(|l| l.text.starts_with("--")).unwrap();
+        lines[2..rule].iter().map(|l| l.text.clone()).collect()
+    }
+
+    #[test]
+    fn meters_show_under_the_status_lines_in_two_lines_at_80_columns() {
+        assert_eq!(
+            meters_at(readings(), 80),
+            [
+                "in -18.2  out -14.1 LUFS   leveler +3.5 dB",
+                "c1   -4.2 ██▊·····   c2   -1.0 ▋·······   lim  -0.3 ▎······· dB",
+            ]
+        );
+        // Wide enough, one line.
+        let wide = meters_at(readings(), 120);
+        assert_eq!(wide.len(), 1);
+        assert_eq!(wide[0], meters_at(readings(), 80).join("   "));
+        // Silence, no reduction, the leveler off.
+        let tuner = Tuner::new(Profile::default(), String::new());
+        let mut top = 0;
+        let lines = layout(&view(&tuner), 80, 24, &mut top);
+        assert_eq!(
+            texts(&lines)[2..4],
+            [
+                "in    --  out    -- LUFS   leveler off",
+                "c1    0.0 ········   c2    0.0 ········   lim   0.0 ········ dB",
+            ]
+        );
+    }
+
+    #[test]
+    fn meters_drop_their_bars_at_40_columns_and_are_cut_below() {
+        assert_eq!(
+            meters_at(readings(), 40),
+            [
+                "in -18.2  out -14.1 LUFS  lev +3.5",
+                "c1 -4.2  c2 -1.0  lim -0.3 dB"
+            ]
+        );
+        let narrow = meters_at(readings(), 20);
+        assert_eq!(narrow, ["in -18.2  out -14.1", "c1 -4.2  c2 -1.0  l"]);
+        // Bars fill an eighth of a cell per 0.1875 dB, up to 12 dB.
+        assert_eq!(bar(0.0), "········");
+        assert_eq!(bar(0.05), "········");
+        assert_eq!(bar(0.1), "▏·······");
+        assert_eq!(bar(0.3), "▎·······");
+        assert_eq!(bar(1.5), "█·······");
+        assert_eq!(bar(12.0), "████████");
+        assert_eq!(bar(30.0), "████████");
+        assert_eq!(reduction(0.04), "0.0");
+        assert_eq!(reduction(12.34), "-12.3");
+    }
+
+    #[test]
+    fn a_reductions_peak_holds_for_a_second() {
+        let mut hold = Hold::default();
+        let start = Instant::now();
+        let mut at = |c1: f32, lim: f32, ms: u64| {
+            let mut r = Readings::default();
+            (r.chain.compressor1_db, r.chain.limiter_db) = (c1, lim);
+            let shown = hold.apply(r, start + Duration::from_millis(ms));
+            (shown.chain.compressor1_db, shown.chain.limiter_db)
+        };
+        assert_eq!(at(6.0, 0.0, 0), (6.0, 0.0));
+        assert_eq!(at(1.0, 0.5, 500), (6.0, 0.5));
+        assert_eq!(at(2.0, 0.1, 999), (6.0, 0.5));
+        // A second after its peak, each shows what it reads now.
+        assert_eq!(at(2.0, 0.1, 1000), (2.0, 0.5));
+        assert_eq!(at(0.0, 0.0, 1500), (2.0, 0.0));
+        // A higher peak shows at once.
+        assert_eq!(at(7.0, 3.0, 1600), (7.0, 3.0));
     }
 
     #[test]
@@ -770,7 +996,7 @@ mod tests {
         }
         let lines = layout(&view(&tuner), 80, 24, &mut top);
         assert!(selected(&lines)[0].contains("true peak"));
-        assert!(texts(&lines)[2].starts_with("-- 57/57 "));
+        assert!(texts(&lines)[4].starts_with("-- 57/57 "));
         assert!(texts(&lines).contains(&" Limiter"), "{:#?}", texts(&lines));
         assert!(top > 0);
         // Back up to compressor 2's first setting: its heading shows too.
@@ -781,7 +1007,7 @@ mod tests {
         let lines = layout(&view(&tuner), 80, 24, &mut top);
         let text = texts(&lines);
         assert!(selected(&lines)[0].contains("threshold"));
-        assert_eq!(text[3], " Compressor 2");
+        assert_eq!(text[5], " Compressor 2");
     }
 
     #[test]
@@ -824,9 +1050,10 @@ mod tests {
         let lines = layout(&view(&tuner), 80, 24, &mut top);
         let text = texts(&lines);
         assert_eq!(lines.len(), 24);
-        assert_eq!(&text[22..], LEGEND);
+        let legend = 24 - LEGEND.len();
+        assert_eq!(&text[legend..], LEGEND);
         let rule = text.iter().rposition(|t| t.starts_with("-----")).unwrap();
-        let message = &text[rule + 1..22];
+        let message = &text[rule + 1..legend];
         assert!(message.len() > 1, "{message:?}");
         assert_eq!(message.join(" "), warning);
         assert!(message.iter().all(|m| m.chars().count() <= 79));
@@ -962,10 +1189,11 @@ mod tests {
         tuner
     }
 
-    /// Where the last character of each setting's value is.
+    /// Where the last character of each listed setting's value is.
     fn value_ends(lines: &[Line]) -> Vec<usize> {
         lines
             .iter()
+            .filter(|l| l.text.starts_with([' ', '>']))
             .filter_map(|l| l.text.find(" dB").map(|at| at + 2))
             .collect()
     }
@@ -1104,16 +1332,23 @@ mod tests {
         let mut top = 0;
         let lines = layout(&view(&tuner), 80, 24, &mut top);
         let text = texts(&lines);
-        assert_eq!(&text[22..], LEGEND);
-        assert_eq!(text[20], "reloaded presets/music.toml");
-        assert_eq!(text[21], "save changes to music.toml? y/n (Esc cancels)");
-        assert_eq!(lines[21].style, Style::Bold);
+        let legend = 24 - LEGEND.len();
+        assert_eq!(&text[legend..], LEGEND);
+        assert_eq!(text[legend - 2], "reloaded presets/music.toml");
+        assert_eq!(
+            text[legend - 1],
+            "save changes to music.toml? y/n (Esc cancels)"
+        );
+        assert_eq!(lines[legend - 1].style, Style::Bold);
         // A message as long as the whole area still leaves the question.
         tuner.set_message("word ".repeat(200));
         let lines = layout(&view(&tuner), 80, 24, &mut top);
         let text = texts(&lines);
-        assert_eq!(text[21], "save changes to music.toml? y/n (Esc cancels)");
-        assert!(text[20].ends_with("..."), "{}", text[20]);
+        assert_eq!(
+            text[legend - 1],
+            "save changes to music.toml? y/n (Esc cancels)"
+        );
+        assert!(text[legend - 2].ends_with("..."), "{}", text[legend - 2]);
         assert_eq!(selected(&lines).len(), 1);
     }
 
@@ -1146,6 +1381,7 @@ mod tests {
             size: (80, 24),
             top: 0,
             clear: false,
+            hold: Hold::default(),
         };
         let notice = screen.notice("waiting\x1b[2J");
         let text = &notice[notice.iter().rposition(|&b| b == b'K').unwrap() + 1..];

@@ -523,6 +523,7 @@ impl Live {
             rate,
             clamped: stats.clamped.load(Relaxed),
             dry_gain: controls.dry_gain(),
+            meters: controls.readings(),
         };
         match screen.draw(&view) {
             Ok(()) => Ok(()),
@@ -1080,6 +1081,12 @@ trait Chain {
     fn latency_frames(&self) -> usize {
         0
     }
+
+    /// The largest gain reductions since the last call, which starts them
+    /// over, and the leveler's gain now. No allocation.
+    fn meters(&mut self) -> dps::Meters {
+        dps::Meters::default()
+    }
 }
 
 impl Chain for Processor {
@@ -1093,6 +1100,10 @@ impl Chain for Processor {
 
     fn latency_frames(&self) -> usize {
         Processor::latency_frames(self)
+    }
+
+    fn meters(&mut self) -> dps::Meters {
+        Processor::meters(self)
     }
 }
 
