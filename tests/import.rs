@@ -1,14 +1,14 @@
-//! Drives `dps import` through the built binary.
+//! Drives `tonewell import` through the built binary.
 
 use std::f64::consts::PI;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use dps::Profile;
-use dps::biquad::Coefs;
-use dps::profile::{BandKind, CorrectionBand, CorrectionParams};
 use hound::{SampleFormat, WavSpec};
+use tonewell::Profile;
+use tonewell::biquad::Coefs;
+use tonewell::profile::{BandKind, CorrectionBand, CorrectionParams};
 
 const FS: f64 = 48_000.0;
 
@@ -48,7 +48,8 @@ struct TempDir {
 
 impl TempDir {
     fn new(test: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("dps-import-{}-{test}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("tonewell-import-{}-{test}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for sub in ["work", "config", "home"] {
             fs::create_dir_all(root.join(sub)).unwrap();
@@ -66,9 +67,12 @@ impl TempDir {
         path
     }
 
-    /// Where `dps` looks for its settings file here.
+    /// Where `tonewell` looks for its settings file here.
     fn settings(&self) -> PathBuf {
-        self.root.join("config").join("dps").join("profile.toml")
+        self.root
+            .join("config")
+            .join("tonewell")
+            .join("profile.toml")
     }
 
     /// Sorted names of the files in the work directory.
@@ -81,15 +85,15 @@ impl TempDir {
         names
     }
 
-    fn dps(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_dps"));
+    fn tonewell(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tonewell"));
         cmd.env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("HOME", self.root.join("home"));
         cmd
     }
 
     fn import(&self, input: &Path, profile: Option<&Path>) -> Output {
-        let mut cmd = self.dps();
+        let mut cmd = self.tonewell();
         cmd.arg("import").arg(input);
         if let Some(profile) = profile {
             cmd.arg("--profile").arg(profile);
@@ -98,7 +102,7 @@ impl TempDir {
     }
 
     fn process(&self, input: &Path, output: &Path, profile: Option<&Path>) -> Output {
-        let mut cmd = self.dps();
+        let mut cmd = self.tonewell();
         cmd.arg("process").arg(input).arg(output);
         if let Some(profile) = profile {
             cmd.arg("--profile").arg(profile);
@@ -122,7 +126,7 @@ fn stderr(out: &Output) -> String {
 }
 
 fn assert_success(out: &Output) {
-    assert!(out.status.success(), "dps failed: {}", stderr(out));
+    assert!(out.status.success(), "tonewell failed: {}", stderr(out));
 }
 
 /// Exit code 1 with one stderr line, which mentions each of `needles`.

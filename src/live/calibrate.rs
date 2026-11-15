@@ -1,4 +1,4 @@
-//! `dps calibrate`: plays the test tones of `dps::calibrate` on the default
+//! `tonewell calibrate`: plays the test tones of `tonewell::calibrate` on the default
 //! output device and records them with the default input device, one IOProc
 //! on each. The devices may run at different rates on different clocks: the
 //! analysis needs only to know how far the recording had got when the
@@ -23,8 +23,8 @@ use std::sync::atomic::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use dps::calibrate::{self, Calibration, Plan};
 use objc2_core_audio_types::{AudioBufferList, AudioTimeStamp};
+use tonewell::calibrate::{self, Calibration, Plan};
 
 use super::hal::{self, ObjectId};
 use super::render::{self, Buffers, BuffersMut};
@@ -46,7 +46,7 @@ const STALL_LIMIT: Duration = Duration::from_secs(2);
 const NOT_YET: usize = usize::MAX;
 const WAITING_FOR_PERMISSION: &str = "waiting for permission to use the microphone; answer the \
      macOS prompt, or press Ctrl-C twice to quit";
-const NO_INPUT: &str = "there is no default input device, and dps calibrate records with a \
+const NO_INPUT: &str = "there is no default input device, and tonewell calibrate records with a \
      microphone: connect one (many desktop Macs have none built in) and choose it in System \
      Settings > Sound > Input";
 
@@ -102,7 +102,7 @@ fn lock(dirs: &Dirs) -> Result<Option<LiveLock>, String> {
         Ok(lock) => Ok(Some(lock)),
         Err(holder) => {
             let fix = if holder.background {
-                "run `dps stop` first"
+                "run `tonewell stop` first"
             } else {
                 "quit it first"
             };
@@ -132,7 +132,7 @@ fn report(calibration: &Calibration, source: Option<&Source>) -> Result<(), Stri
     import::rewrite(path, &target)?;
     write_stdout(&format!(
         "wrote it into [correction] of {}, turned on; the file was rewritten, so comments in it \
-         are not kept; the next dps live or dps start uses it, and `enabled = false` under \
+         are not kept; the next tonewell live or tonewell start uses it, and `enabled = false` under \
          [correction], or the tuner, turns it off\n",
         source.name()
     ))
@@ -209,7 +209,11 @@ fn frames(duration: Duration, rate: f64) -> usize {
 
 /// Writes `message` as a line on stderr, which may have been closed.
 fn say(message: &str) {
-    let _ = writeln!(io::stderr(), "dps calibrate: {}", tui::printable(message));
+    let _ = writeln!(
+        io::stderr(),
+        "tonewell calibrate: {}",
+        tui::printable(message)
+    );
 }
 
 /// Plays the tones and records them; the recording and its anchor (see
@@ -338,9 +342,9 @@ impl Progress {
             return;
         }
         let _ = if self.terminal {
-            write!(io::stderr(), "\r\x1b[Kdps calibrate: {step}")
+            write!(io::stderr(), "\r\x1b[Ktonewell calibrate: {step}")
         } else {
-            writeln!(io::stderr(), "dps calibrate: {step}")
+            writeln!(io::stderr(), "tonewell calibrate: {step}")
         };
         self.shown = step;
     }

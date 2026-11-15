@@ -1,13 +1,13 @@
-//! `dps get` and `dps set`, and on macOS `dps bypass` and `dps use` with no
-//! dps running, through the built binary. Its home and config directories
+//! `tonewell get` and `tonewell set`, and on macOS `tonewell bypass` and `tonewell use` with no
+//! tonewell running, through the built binary. Its home and config directories
 //! are in a per-test directory, and the output devices come from
-//! `DPS_TEST_DEVICES`, so no test touches the real settings or audio system.
+//! `TONEWELL_TEST_DEVICES`, so no test touches the real settings or audio system.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use dps::Profile;
+use tonewell::Profile;
 
 struct TempDir {
     root: PathBuf,
@@ -15,7 +15,8 @@ struct TempDir {
 
 impl TempDir {
     fn new(test: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("dps-control-{}-{test}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("tonewell-control-{}-{test}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for sub in ["work", "config", "home"] {
             fs::create_dir_all(root.join(sub)).unwrap();
@@ -23,13 +24,13 @@ impl TempDir {
         Self { root }
     }
 
-    fn dps(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_dps"))
+    fn tonewell(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_tonewell"))
             .args(args)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("HOME", self.root.join("home"))
             .env(
-                "DPS_TEST_DEVICES",
+                "TONEWELL_TEST_DEVICES",
                 "*BuiltInSpeakerDevice=MacBook Pro Speakers;AA:output=AirPods Pro",
             )
             .output()
@@ -37,7 +38,7 @@ impl TempDir {
     }
 
     fn dir(&self) -> PathBuf {
-        self.root.join("config/dps")
+        self.root.join("config/tonewell")
     }
 
     fn settings(&self) -> PathBuf {
@@ -66,7 +67,7 @@ fn stderr(out: &Output) -> String {
 }
 
 fn ok(out: Output) -> String {
-    assert!(out.status.success(), "dps failed: {}", stderr(&out));
+    assert!(out.status.success(), "tonewell failed: {}", stderr(&out));
     stdout(&out)
 }
 
@@ -89,7 +90,7 @@ fn profile(path: &Path) -> Profile {
 fn set_then_get_round_trips_and_creates_a_missing_settings_file() {
     let dir = TempDir::new("round-trip");
     let settings = dir.settings();
-    let out = dir.dps(&["set", "eq.gains_db[3]", "2.5"]);
+    let out = dir.tonewell(&["set", "eq.gains_db[3]", "2.5"]);
     assert_eq!(
         stderr(&out),
         format!(
@@ -104,12 +105,12 @@ fn set_then_get_round_trips_and_creates_a_missing_settings_file() {
     let mut want = Profile::default();
     want.eq.gains_db[3] = 2.5;
     assert_eq!(profile(&settings), want);
-    assert_eq!(ok(dir.dps(&["get", "eq.gains_db[3]"])), "2.5\n");
+    assert_eq!(ok(dir.tonewell(&["get", "eq.gains_db[3]"])), "2.5\n");
 
     // The same value again leaves the file alone.
     let before = read(&settings);
     assert_eq!(
-        ok(dir.dps(&["set", "eq.gains_db[3]", "2.5"])),
+        ok(dir.tonewell(&["set", "eq.gains_db[3]", "2.5"])),
         format!("eq.gains_db[3] is already 2.5 in {}\n", settings.display())
     );
     assert_eq!(read(&settings), before);
@@ -119,13 +120,13 @@ fn set_then_get_round_trips_and_creates_a_missing_settings_file() {
         ("correction.bands", "x", ""),
         ("limiter.true_peak", "false", "false"),
     ] {
-        let out = dir.dps(&["set", key, value]);
+        let out = dir.tonewell(&["set", key, value]);
         if got.is_empty() {
             assert_eq!(out.status.code(), Some(1), "{key}");
             continue;
         }
         ok(out);
-        assert_eq!(ok(dir.dps(&["get", key])), format!("{got}\n"));
+        assert_eq!(ok(dir.tonewell(&["get", key])), format!("{got}\n"));
     }
 }
 
@@ -133,23 +134,23 @@ fn set_then_get_round_trips_and_creates_a_missing_settings_file() {
 fn by_adds_a_negative_or_positive_delta() {
     let dir = TempDir::new("by");
     let path = dir.settings().display().to_string();
-    ok(dir.dps(&["get"]));
+    ok(dir.tonewell(&["get"]));
     assert_eq!(
-        ok(dir.dps(&["set", "eq.gains_db[3]", "--by", "+2"])),
+        ok(dir.tonewell(&["set", "eq.gains_db[3]", "--by", "+2"])),
         format!("eq.gains_db[3]: 0.0 -> 2.0 in {path}\n")
     );
     assert_eq!(
-        ok(dir.dps(&["set", "eq.gains_db[3]", "--by", "-1.5"])),
+        ok(dir.tonewell(&["set", "eq.gains_db[3]", "--by", "-1.5"])),
         format!("eq.gains_db[3]: 2.0 -> 0.5 in {path}\n")
     );
     assert_eq!(
-        ok(dir.dps(&["set", "--by=-3", "output_gain_db"])),
+        ok(dir.tonewell(&["set", "--by=-3", "output_gain_db"])),
         format!("output_gain_db: 7.0 -> 4.0 in {path}\n")
     );
-    assert_eq!(ok(dir.dps(&["get", "eq.gains_db[3]"])), "0.5\n");
-    let out = dir.dps(&["set", "eq.gains_db[3]", "--by", "x"]);
+    assert_eq!(ok(dir.tonewell(&["get", "eq.gains_db[3]"])), "0.5\n");
+    let out = dir.tonewell(&["set", "eq.gains_db[3]", "--by", "x"]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
-    let out = dir.dps(&["set", "eq.gains_db[3]", "1", "--by", "1"]);
+    let out = dir.tonewell(&["set", "eq.gains_db[3]", "1", "--by", "1"]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
 }
 
@@ -157,12 +158,12 @@ fn by_adds_a_negative_or_positive_delta() {
 fn a_negative_value_is_taken_as_the_value() {
     let dir = TempDir::new("negative");
     let path = dir.settings().display().to_string();
-    ok(dir.dps(&["get"]));
+    ok(dir.tonewell(&["get"]));
     assert_eq!(
-        ok(dir.dps(&["set", "leveler.target_lufs", "-16"])),
+        ok(dir.tonewell(&["set", "leveler.target_lufs", "-16"])),
         format!("leveler.target_lufs: -14.0 -> -16.0 in {path}\n")
     );
-    assert_eq!(ok(dir.dps(&["get", "leveler.target_lufs"])), "-16.0\n");
+    assert_eq!(ok(dir.tonewell(&["get", "leveler.target_lufs"])), "-16.0\n");
 }
 
 #[test]
@@ -174,24 +175,24 @@ fn a_refused_value_leaves_the_file_byte_for_byte() {
     fs::write(&settings, text).unwrap();
     let path = settings.display();
     fails(
-        dir.dps(&["set", "eq.gains_db[3]", "30"]),
+        dir.tonewell(&["set", "eq.gains_db[3]", "30"]),
         &format!("eq.gains_db[3] = 30 is outside -24..=24; {path} was left as it was"),
     );
     fails(
-        dir.dps(&["set", "output_gain_db", "--by", "200"]),
+        dir.tonewell(&["set", "output_gain_db", "--by", "200"]),
         &format!("output_gain_db = 201 is outside -120..=120; {path} was left as it was"),
     );
     fails(
-        dir.dps(&["set", "output_gain_db", "loud"]),
+        dir.tonewell(&["set", "output_gain_db", "loud"]),
         &format!("output_gain_db is a number, so it cannot be \"loud\"; {path} was left as it was"),
     );
     fails(
-        dir.dps(&["set", "eq", "1"]),
+        dir.tonewell(&["set", "eq", "1"]),
         &format!(
             "eq is a table; set one of its keys: freqs_hz, gains_db and q; {path} was left as it was"
         ),
     );
-    let out = dir.dps(&["set", "leveler.enable", "on"]);
+    let out = dir.tonewell(&["set", "leveler.enable", "on"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
         stderr(&out)
@@ -199,7 +200,7 @@ fn a_refused_value_leaves_the_file_byte_for_byte() {
         "{}",
         stderr(&out)
     );
-    let out = dir.dps(&["get", "eq.gains_db[11]"]);
+    let out = dir.tonewell(&["get", "eq.gains_db[11]"]);
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(read(&settings), text);
 }
@@ -210,7 +211,7 @@ fn profile_names_another_file_and_a_comment_lost_is_said() {
     let mine = dir.work("mine.toml", "# for the desk\noutput_gain_db = -1.0\n");
     let mine_arg = mine.to_str().unwrap();
     assert_eq!(
-        ok(dir.dps(&["set", "-p", mine_arg, "output_gain_db", "-2"])),
+        ok(dir.tonewell(&["set", "-p", mine_arg, "output_gain_db", "-2"])),
         format!(
             "output_gain_db: -1.0 -> -2.0 in {mine_arg}\nrewrote the file, so comments in it are \
              not kept\n"
@@ -219,12 +220,12 @@ fn profile_names_another_file_and_a_comment_lost_is_said() {
     assert_eq!(profile(&mine).output_gain_db, -2.0);
     assert!(!read(&mine).contains('#'));
     assert_eq!(
-        ok(dir.dps(&["get", "--profile", mine_arg, "output_gain_db"])),
+        ok(dir.tonewell(&["get", "--profile", mine_arg, "output_gain_db"])),
         "-2.0\n"
     );
     assert!(!dir.settings().exists());
     let missing = dir.root.join("work/missing.toml");
-    let out = dir.dps(&["get", "-p", missing.to_str().unwrap()]);
+    let out = dir.tonewell(&["get", "-p", missing.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).starts_with("error: cannot read profile "));
 }
@@ -232,19 +233,19 @@ fn profile_names_another_file_and_a_comment_lost_is_said() {
 #[test]
 fn get_prints_a_table_a_list_or_the_whole_profile_as_toml() {
     let dir = TempDir::new("get");
-    let whole = ok(dir.dps(&["get"]));
-    assert_eq!(whole, ok(dir.dps(&["profile"])));
-    let leveler = ok(dir.dps(&["get", "leveler"]));
+    let whole = ok(dir.tonewell(&["get"]));
+    assert_eq!(whole, ok(dir.tonewell(&["profile"])));
+    let leveler = ok(dir.tonewell(&["get", "leveler"]));
     assert_eq!(
         leveler,
         "enabled = false\nfall_db_per_s = 4.0\nmax_boost_db = 12.0\nmax_cut_db = 12.0\n\
          rise_db_per_s = 1.0\ntarget_lufs = -14.0\n"
     );
     assert_eq!(
-        ok(dir.dps(&["get", "eq.freqs_hz"])),
+        ok(dir.tonewell(&["get", "eq.freqs_hz"])),
         "[30.0, 56.4, 106.0, 199.0, 375.0, 705.0, 1327.0, 2497.0, 4698.0, 8839.0, 16000.0]\n"
     );
-    assert_eq!(ok(dir.dps(&["get", "correction.bands"])), "[]\n");
+    assert_eq!(ok(dir.tonewell(&["get", "correction.bands"])), "[]\n");
 }
 
 #[cfg(target_os = "macos")]
@@ -263,52 +264,52 @@ fn set_writes_to_the_default_outputs_own_profile() {
     fs::write(dir.settings(), "output_gain_db = 3.0\n").unwrap();
 
     assert_eq!(
-        ok(dir.dps(&["set", "output_gain_db", "-2"])),
+        ok(dir.tonewell(&["set", "output_gain_db", "-2"])),
         format!("output_gain_db: -1.0 -> -2.0 in {}\n", speakers.display())
     );
     assert_eq!(profile(&speakers).output_gain_db, -2.0);
     assert_eq!(read(&dir.settings()), "output_gain_db = 3.0\n");
-    assert_eq!(ok(dir.dps(&["get", "output_gain_db"])), "-2.0\n");
+    assert_eq!(ok(dir.tonewell(&["get", "output_gain_db"])), "-2.0\n");
     let settings = dir.settings();
     assert_eq!(
-        ok(dir.dps(&["get", "-p", settings.to_str().unwrap(), "output_gain_db"])),
+        ok(dir.tonewell(&["get", "-p", settings.to_str().unwrap(), "output_gain_db"])),
         "3.0\n"
     );
 }
 
 #[cfg(target_os = "macos")]
 #[test]
-fn bypass_and_use_with_nothing_running_say_how_to_start_dps() {
+fn bypass_and_use_with_nothing_running_say_how_to_start_tonewell() {
     let dir = TempDir::new("not-running");
-    let not_running = "dps is not running; start it with `dps` or `dps start`";
+    let not_running = "tonewell is not running; start it with `tonewell` or `tonewell start`";
     for args in [
         &["bypass"][..],
         &["bypass", "on"],
         &["bypass", "toggle"],
         &["use", "--settings"],
     ] {
-        fails(dir.dps(args), not_running);
+        fails(dir.tonewell(args), not_running);
     }
     fails(
-        dir.dps(&["use", "night"]),
-        &format!("{not_running} (`dps start --preset night` starts it that way)"),
+        dir.tonewell(&["use", "night"]),
+        &format!("{not_running} (`tonewell start --preset night` starts it that way)"),
     );
     let mine = dir.work("mine.toml", "output_gain_db = -2.0\n");
     let canonical = fs::canonicalize(&mine).unwrap();
     fails(
-        dir.dps(&["use", mine.to_str().unwrap()]),
+        dir.tonewell(&["use", mine.to_str().unwrap()]),
         &format!(
-            "{not_running} (`dps start --profile {}` starts it that way)",
+            "{not_running} (`tonewell start --profile {}` starts it that way)",
             canonical.display()
         ),
     );
     fails(
-        dir.dps(&["use", "nite"]),
+        dir.tonewell(&["use", "nite"]),
         "nite is neither a preset (headphones, laptop-speakers, music, night and voice) nor a \
          file",
     );
     let bad = dir.work("bad.toml", "output_gain_db = \"loud\"\n");
-    let out = dir.dps(&["use", bad.to_str().unwrap()]);
+    let out = dir.tonewell(&["use", bad.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("bad.toml:1:"), "{}", stderr(&out));
     assert!(!dir.root.join("home/Library").exists());

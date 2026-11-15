@@ -1,11 +1,11 @@
-//! `dps start`, `stop` and `status`: `dps live` as a per-user launchd agent.
+//! `tonewell start`, `stop` and `status`: `tonewell live` as a per-user launchd agent.
 //!
-//! `dps start` loads a job labelled `dev.dps.live` into the user's GUI
-//! domain from a plist in dps's own folder, which launchd forgets at logout;
-//! `dps start --login` writes the plist to ~/Library/LaunchAgents instead,
-//! where launchd also loads it at every login. The job runs `dps live
+//! `tonewell start` loads a job labelled `dev.tonewell.live` into the user's GUI
+//! domain from a plist in tonewell's own folder, which launchd forgets at logout;
+//! `tonewell start --login` writes the plist to ~/Library/LaunchAgents instead,
+//! where launchd also loads it at every login. The job runs `tonewell live
 //! --service` once and never restarts it; its output goes to
-//! ~/Library/Logs/dps.log. That run writes what `dps status` shows to a
+//! ~/Library/Logs/tonewell.log. That run writes what `tonewell status` shows to a
 //! state file, and every live run, in the foreground or not, holds a lock so
 //! that two never process system audio at once.
 
@@ -24,14 +24,14 @@ use serde::{Deserialize, Serialize};
 use crate::config::{Dirs, Source};
 use crate::live::{self, BACKGROUND_PERMISSION_HINT};
 
-pub const LABEL: &str = "dev.dps.live";
+pub const LABEL: &str = "dev.tonewell.live";
 /// How long launchd waits after SIGTERM before SIGKILL. A clean stop takes
 /// well under a second; only a start blocked on the permission prompt
 /// ignores SIGTERM.
 const EXIT_TIMEOUT_SECS: u32 = 5;
-/// How long `dps start` waits for the service to start audio or fail.
+/// How long `tonewell start` waits for the service to start audio or fail.
 const START_WAIT: Duration = Duration::from_secs(10);
-/// How long `dps start` then waits to hear sound while other apps play;
+/// How long `tonewell start` then waits to hear sound while other apps play;
 /// longer than the service takes to give up on a silent tap.
 const HEAR_WAIT: Duration = Duration::from_secs(5);
 const STOP_WAIT: Duration = Duration::from_secs(EXIT_TIMEOUT_SECS as u64 + 5);
@@ -41,22 +41,22 @@ const POLL: Duration = Duration::from_millis(100);
 pub struct Paths {
     /// launchd loads this one at every login.
     pub login_plist: PathBuf,
-    /// The job for a plain `dps start`, which launchd never loads by itself.
+    /// The job for a plain `tonewell start`, which launchd never loads by itself.
     pub plist: PathBuf,
     pub log: PathBuf,
     pub lock: PathBuf,
     pub state: PathBuf,
-    /// Where every live run takes `dps bypass` and `dps use`.
+    /// Where every live run takes `tonewell bypass` and `tonewell use`.
     pub control: PathBuf,
 }
 
 impl Paths {
     pub fn new(home: &Path) -> Self {
-        let own = home.join("Library/Application Support/dps");
+        let own = home.join("Library/Application Support/tonewell");
         Self {
             login_plist: home.join(format!("Library/LaunchAgents/{LABEL}.plist")),
             plist: own.join(format!("{LABEL}.plist")),
-            log: home.join("Library/Logs/dps.log"),
+            log: home.join("Library/Logs/tonewell.log"),
             lock: own.join("live.lock"),
             state: own.join("live.state"),
             control: own.join("control.sock"),
@@ -250,7 +250,8 @@ impl Launchctl {
         let uid = unsafe { getuid() };
         Self {
             // Tests point this at a stand-in; it is not meant for users.
-            program: std::env::var_os("DPS_LAUNCHCTL").unwrap_or_else(|| "/bin/launchctl".into()),
+            program: std::env::var_os("TONEWELL_LAUNCHCTL")
+                .unwrap_or_else(|| "/bin/launchctl".into()),
             domain: format!("gui/{uid}"),
         }
     }
@@ -312,7 +313,7 @@ fn alive(pid: u32) -> bool {
 /// Whether apps other than the service at `pid` are playing sound.
 fn others_playing(pid: u32) -> bool {
     // Tests answer for the audio system here; it is not meant for users.
-    match std::env::var("DPS_TEST_OTHERS_PLAYING") {
+    match std::env::var("TONEWELL_TEST_OTHERS_PLAYING") {
         Ok(answer) => answer == "1",
         Err(_) => live::others_playing(pid).unwrap_or(false),
     }
@@ -394,7 +395,7 @@ impl StateFile {
         if let Err(e) = fs::write(&temp, text).and_then(|()| fs::rename(&temp, &self.path)) {
             let _ = writeln!(
                 io::stderr(),
-                "dps live: cannot write {}: {e}",
+                "tonewell live: cannot write {}: {e}",
                 self.path.display()
             );
         }
@@ -470,9 +471,9 @@ impl Holder {
     pub fn describe(&self) -> String {
         let pid = self.pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
         if self.background {
-            format!("dps is already running in the background{pid}")
+            format!("tonewell is already running in the background{pid}")
         } else {
-            format!("dps live is already running in the foreground{pid}")
+            format!("tonewell live is already running in the foreground{pid}")
         }
     }
 }
@@ -531,7 +532,7 @@ impl LiveLock {
     }
 }
 
-/// For a foreground `dps live`: the lock, or an error naming who has it.
+/// For a foreground `tonewell live`: the lock, or an error naming who has it.
 pub fn lock_foreground(dirs: &Dirs) -> Result<Option<LiveLock>, String> {
     // Without a home there can be no background run to clash with.
     let Ok(paths) = Paths::from_dirs(dirs) else {
@@ -540,7 +541,7 @@ pub fn lock_foreground(dirs: &Dirs) -> Result<Option<LiveLock>, String> {
     match LiveLock::take(&paths.lock, false)? {
         Ok(lock) => Ok(Some(lock)),
         Err(holder) if holder.background => {
-            Err(format!("{}; run `dps stop` first", holder.describe()))
+            Err(format!("{}; run `tonewell stop` first", holder.describe()))
         }
         Err(holder) => Err(format!("{}; quit it first", holder.describe())),
     }
@@ -552,7 +553,7 @@ fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// `dps live --service`: the run launchd starts. `live` runs audio until it
+/// `tonewell live --service`: the run launchd starts. `live` runs audio until it
 /// is stopped.
 pub fn serve(
     source: Source,
@@ -595,7 +596,7 @@ pub fn serve(
     result
 }
 
-/// Everything `dps status` and `dps doctor` look at.
+/// Everything `tonewell status` and `tonewell doctor` look at.
 pub struct Snapshot {
     pub loaded: Option<Loaded>,
     /// The state of the run launchd has now, or had last.
@@ -605,14 +606,14 @@ pub struct Snapshot {
     pub unreadable_state: Option<PathBuf>,
     /// The login plist's ProgramArguments, if it exists.
     pub login: Option<Vec<String>>,
-    /// This dps, by its canonical path.
+    /// This tonewell, by its canonical path.
     pub exe: Option<PathBuf>,
 }
 
 impl Snapshot {
     pub fn read(paths: &Paths, launchctl: &Launchctl) -> Result<Self, String> {
         let loaded = launchctl.print()?;
-        // A state file from a run that a later `dps stop` ended is stale.
+        // A state file from a run that a later `tonewell stop` ended is stale.
         let state = loaded.as_ref().and_then(|_| State::read(&paths.state));
         let unreadable_state = match &loaded {
             Some(loaded) if loaded.running && loaded.pid.is_some() => {
@@ -644,7 +645,7 @@ impl Snapshot {
         self.state.as_ref().filter(|s| s.pid == pid)
     }
 
-    /// What the service is doing, as a phrase after "dps is", and whether
+    /// What the service is doing, as a phrase after "tonewell is", and whether
     /// that is healthy.
     pub fn service(&self, log: &Path) -> (bool, String) {
         const NOT_RUNNING: &str = "not running in the background";
@@ -684,8 +685,8 @@ impl Snapshot {
                     false,
                     format!(
                         "running in the background{pid} with {settings}, but its state file {} \
-                         is missing or unreadable, so how it is doing is unknown; fix: `dps \
-                         stop`, then `dps start`",
+                         is missing or unreadable, so how it is doing is unknown; fix: `tonewell \
+                         stop`, then `tonewell start`",
                         path.display()
                     ),
                 );
@@ -727,14 +728,14 @@ impl Snapshot {
             Some(program) => (
                 false,
                 format!(
-                    "on, but it runs {}, which no longer exists; fix: `dps start --login` \
-                     with this dps, or `dps stop --login`",
+                    "on, but it runs {}, which no longer exists; fix: `tonewell start --login` \
+                     with this tonewell, or `tonewell stop --login`",
                     program.display()
                 ),
             ),
             None => (
                 false,
-                "on, but its plist is unreadable; fix: `dps start --login` again, or `dps \
+                "on, but its plist is unreadable; fix: `tonewell start --login` again, or `tonewell \
                  stop --login`"
                     .into(),
             ),
@@ -746,15 +747,15 @@ impl Snapshot {
         let program = PathBuf::from(self.loaded.as_ref()?.arguments.first()?);
         if !program.exists() {
             return Some(format!(
-                "note: the background dps is {}, which no longer exists; `dps stop` then \
-                 `dps start` runs this one",
+                "note: the background tonewell is {}, which no longer exists; `tonewell stop` then \
+                 `tonewell start` runs this one",
                 program.display()
             ));
         }
         let exe = self.exe.as_ref()?;
         (fs::canonicalize(&program).ok().as_ref() != Some(exe)).then(|| {
             format!(
-                "note: the background dps is {}, not this one ({}); `dps stop` then `dps \
+                "note: the background tonewell is {}, not this one ({}); `tonewell stop` then `tonewell \
                  start` runs this one",
                 program.display(),
                 exe.display()
@@ -762,13 +763,13 @@ impl Snapshot {
         })
     }
 
-    /// What `dps status` prints: a line, for a running service one for its
+    /// What `tonewell status` prints: a line, for a running service one for its
     /// latency and one for the apps it leaves alone, and another for any
     /// warning.
     pub fn status(&self, log: &Path) -> String {
         let (_, service) = self.service(log);
         let (_, login) = self.login();
-        let mut out = format!("dps is {service}; start at login is {login}\n");
+        let mut out = format!("tonewell is {service}; start at login is {login}\n");
         if let Some(state) = self.current_state().filter(|s| s.phase == Phase::Running) {
             if let Some(latency) = &state.latency {
                 out += &format!("{latency}\n");
@@ -794,7 +795,7 @@ impl Snapshot {
     }
 }
 
-/// What `dps start` makes of the service while it waits.
+/// What `tonewell start` makes of the service while it waits.
 #[derive(Debug, PartialEq)]
 enum Outcome {
     Pending,
@@ -860,7 +861,7 @@ fn write_plist(path: &Path, job: &Job) -> Result<(), String> {
     fs::write(path, job.plist()).map_err(cannot)
 }
 
-/// `dps start`.
+/// `tonewell start`.
 pub fn start(source: Source, login: bool, dirs: &Dirs) -> Result<(), String> {
     let paths = Paths::from_dirs(dirs)?;
     let launchctl = Launchctl::new();
@@ -868,7 +869,7 @@ pub fn start(source: Source, login: bool, dirs: &Dirs) -> Result<(), String> {
     source.load()?;
     let exe = std::env::current_exe()
         .and_then(fs::canonicalize)
-        .map_err(|e| format!("cannot find the dps binary: {e}"))?;
+        .map_err(|e| format!("cannot find the tonewell binary: {e}"))?;
     let job = Job::new(&exe, &source, dirs, &paths)?;
     let at_login = if login {
         format!("; it also starts at every login with {}", source.name())
@@ -890,7 +891,7 @@ pub fn start(source: Source, login: bool, dirs: &Dirs) -> Result<(), String> {
             }) = state
             {
                 return Err(format!(
-                    "dps is already running in the background but is waiting for permission to \
+                    "tonewell is already running in the background but is waiting for permission to \
                      record system audio: click Allow in the macOS prompt (if no prompt shows, \
                      {BACKGROUND_PERMISSION_HINT})"
                 ));
@@ -903,7 +904,7 @@ pub fn start(source: Source, login: bool, dirs: &Dirs) -> Result<(), String> {
                 write_plist(&paths.login_plist, &job)?;
             }
             println!(
-                "dps is already running in the background with {running_with}; `dps stop` stops \
+                "tonewell is already running in the background with {running_with}; `tonewell stop` stops \
                  it{at_login}"
             );
             return Ok(());
@@ -956,21 +957,21 @@ pub fn start(source: Source, login: bool, dirs: &Dirs) -> Result<(), String> {
             Outcome::Running(state) => break state,
             Outcome::WaitingForPermission => {
                 return Err(format!(
-                    "dps started in the background but macOS is asking whether dps may record \
-                     system audio: click Allow in that prompt and dps starts processing (if no \
+                    "tonewell started in the background but macOS is asking whether tonewell may record \
+                     system audio: click Allow in that prompt and tonewell starts processing (if no \
                      prompt shows, {BACKGROUND_PERMISSION_HINT})"
                 ));
             }
             Outcome::Failed(reason) => {
                 return Err(undo_login(format!(
-                    "dps could not start in the background: {reason} (log: {})",
+                    "tonewell could not start in the background: {reason} (log: {})",
                     paths.log.display()
                 )));
             }
             Outcome::Pending if Instant::now() >= deadline => {
                 return Err(format!(
-                    "dps started in the background but has not started processing audio after \
-                     {} s; see `dps status` and {}",
+                    "tonewell started in the background but has not started processing audio after \
+                     {} s; see `tonewell status` and {}",
                     START_WAIT.as_secs(),
                     paths.log.display()
                 ));
@@ -994,7 +995,7 @@ pub fn start(source: Source, login: bool, dirs: &Dirs) -> Result<(), String> {
             Outcome::Running(now) => state = now,
             Outcome::Failed(reason) => {
                 return Err(undo_login(format!(
-                    "dps could not start in the background: {reason}"
+                    "tonewell could not start in the background: {reason}"
                 )));
             }
             _ => break,
@@ -1002,7 +1003,7 @@ pub fn start(source: Source, login: bool, dirs: &Dirs) -> Result<(), String> {
     }
 
     println!(
-        "dps is running in the background on {} at {} Hz with {}; `dps stop` stops it{at_login}",
+        "tonewell is running in the background on {} at {} Hz with {}; `tonewell stop` stops it{at_login}",
         state.device.as_deref().unwrap_or("the default output"),
         state.rate.unwrap_or(0),
         state.profile()
@@ -1010,7 +1011,7 @@ pub fn start(source: Source, login: bool, dirs: &Dirs) -> Result<(), String> {
     Ok(())
 }
 
-/// `dps stop`.
+/// `tonewell stop`.
 pub fn stop(login: bool, dirs: &Dirs) -> Result<(), String> {
     let paths = Paths::from_dirs(dirs)?;
     let launchctl = Launchctl::new();
@@ -1021,12 +1022,12 @@ pub fn stop(login: bool, dirs: &Dirs) -> Result<(), String> {
             wait_until_gone(&launchctl, loaded.pid, &paths.lock)?;
             match (loaded.running, state) {
                 (true, Some(state)) => format!(
-                    "stopped dps, which ran in the background since {} with {}",
+                    "stopped tonewell, which ran in the background since {} with {}",
                     local_time(state.started),
                     state.profile()
                 ),
-                (true, None) => "stopped dps in the background".into(),
-                (false, _) => "dps was not running in the background".into(),
+                (true, None) => "stopped tonewell in the background".into(),
+                (false, _) => "tonewell was not running in the background".into(),
             }
         }
         // launchd may have unloaded a run that has not exited yet, as after a
@@ -1041,11 +1042,11 @@ pub fn stop(login: bool, dirs: &Dirs) -> Result<(), String> {
                     )
                 });
                 return Err(format!(
-                    "dps in the background{pid} is still running although launchd has unloaded \
-                     it; run `dps stop` again once it has stopped{kill}"
+                    "tonewell in the background{pid} is still running although launchd has unloaded \
+                     it; run `tonewell stop` again once it has stopped{kill}"
                 ));
             }
-            _ => "dps is not running in the background".into(),
+            _ => "tonewell is not running in the background".into(),
         },
     };
     remove(&paths.plist)?;
@@ -1057,7 +1058,7 @@ pub fn stop(login: bool, dirs: &Dirs) -> Result<(), String> {
             "; start at login was already off"
         };
     } else if paths.login_plist.exists() {
-        message += "; start at login is still on (`dps stop --login` turns it off)";
+        message += "; start at login is still on (`tonewell stop --login` turns it off)";
     }
     println!("{message}");
     Ok(())
@@ -1077,7 +1078,7 @@ fn wait_until_gone(launchctl: &Launchctl, pid: Option<u32>, lock: &Path) -> Resu
         if Instant::now() >= deadline {
             let pid = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
             return Err(format!(
-                "dps in the background{pid} did not stop within {} s",
+                "tonewell in the background{pid} did not stop within {} s",
                 STOP_WAIT.as_secs()
             ));
         }
@@ -1085,7 +1086,7 @@ fn wait_until_gone(launchctl: &Launchctl, pid: Option<u32>, lock: &Path) -> Resu
     }
 }
 
-/// `dps status`.
+/// `tonewell status`.
 pub fn status(dirs: &Dirs) -> Result<(), String> {
     let paths = Paths::from_dirs(dirs)?;
     let snapshot = Snapshot::read(&paths, &Launchctl::new())?;
@@ -1140,7 +1141,7 @@ mod tests {
         Job {
             arguments: arguments.iter().map(|&a| a.into()).collect(),
             environment: vec![("HOME".into(), "/Users/a".into())],
-            log: "/Users/a/Library/Logs/dps.log".into(),
+            log: "/Users/a/Library/Logs/tonewell.log".into(),
         }
     }
 
@@ -1149,24 +1150,24 @@ mod tests {
         let p = Paths::new(Path::new("/Users/a"));
         assert_eq!(
             p.login_plist,
-            Path::new("/Users/a/Library/LaunchAgents/dev.dps.live.plist")
+            Path::new("/Users/a/Library/LaunchAgents/dev.tonewell.live.plist")
         );
         assert_eq!(
             p.plist,
-            Path::new("/Users/a/Library/Application Support/dps/dev.dps.live.plist")
+            Path::new("/Users/a/Library/Application Support/tonewell/dev.tonewell.live.plist")
         );
-        assert_eq!(p.log, Path::new("/Users/a/Library/Logs/dps.log"));
+        assert_eq!(p.log, Path::new("/Users/a/Library/Logs/tonewell.log"));
         assert_eq!(
             p.lock,
-            Path::new("/Users/a/Library/Application Support/dps/live.lock")
+            Path::new("/Users/a/Library/Application Support/tonewell/live.lock")
         );
         assert_eq!(
             p.state,
-            Path::new("/Users/a/Library/Application Support/dps/live.state")
+            Path::new("/Users/a/Library/Application Support/tonewell/live.state")
         );
         assert_eq!(
             p.control,
-            Path::new("/Users/a/Library/Application Support/dps/control.sock")
+            Path::new("/Users/a/Library/Application Support/tonewell/control.sock")
         );
     }
 
@@ -1175,7 +1176,7 @@ mod tests {
         let dir = TestDir::new("service-job");
         let dirs = dir.dirs();
         let paths = Paths::new(&dirs.home().unwrap());
-        let exe = Path::new("/opt/bin/dps");
+        let exe = Path::new("/opt/bin/tonewell");
         let mine = dir.0.join("mine.toml");
         fs::write(&mine, "").unwrap();
         let canonical = fs::canonicalize(&mine).unwrap();
@@ -1197,7 +1198,13 @@ mod tests {
         let job = Job::new(exe, &source, &dirs, &paths).unwrap();
         assert_eq!(
             job.arguments,
-            ["/opt/bin/dps", "live", "--service", "--profile", canonical]
+            [
+                "/opt/bin/tonewell",
+                "live",
+                "--service",
+                "--profile",
+                canonical
+            ]
         );
         assert_eq!(job.environment, environment);
         assert_eq!(job.log, paths.log.to_str().unwrap());
@@ -1207,12 +1214,18 @@ mod tests {
         let job = Job::new(exe, &source, &dirs, &paths).unwrap();
         assert_eq!(
             job.arguments,
-            ["/opt/bin/dps", "live", "--service", "--preset", "music"]
+            [
+                "/opt/bin/tonewell",
+                "live",
+                "--service",
+                "--preset",
+                "music"
+            ]
         );
 
         let source = Source::new(None, None, &dirs).unwrap();
         let job = Job::new(exe, &source, &dirs, &paths).unwrap();
-        assert_eq!(job.arguments, ["/opt/bin/dps", "live", "--service"]);
+        assert_eq!(job.arguments, ["/opt/bin/tonewell", "live", "--service"]);
 
         // An empty or relative XDG_CONFIG_HOME is left to the default.
         for ignored in ["", "config"] {
@@ -1241,16 +1254,16 @@ mod tests {
 
     #[test]
     fn plist_runs_once_without_restarts_and_logs_both_streams() {
-        let text = job(&["/opt/bin/dps", "live", "--service"]).plist();
+        let text = job(&["/opt/bin/tonewell", "live", "--service"]).plist();
         assert!(text.starts_with("<?xml version=\"1.0\""), "{text}");
         for want in [
-            "<key>Label</key>\n\t<string>dev.dps.live</string>",
+            "<key>Label</key>\n\t<string>dev.tonewell.live</string>",
             "<key>RunAtLoad</key>\n\t<true/>",
             "<key>KeepAlive</key>\n\t<false/>",
             "<key>ProcessType</key>\n\t<string>Interactive</string>",
             "<key>ExitTimeOut</key>\n\t<integer>5</integer>",
-            "<key>StandardOutPath</key>\n\t<string>/Users/a/Library/Logs/dps.log</string>",
-            "<key>StandardErrorPath</key>\n\t<string>/Users/a/Library/Logs/dps.log</string>",
+            "<key>StandardOutPath</key>\n\t<string>/Users/a/Library/Logs/tonewell.log</string>",
+            "<key>StandardErrorPath</key>\n\t<string>/Users/a/Library/Logs/tonewell.log</string>",
             "<key>HOME</key>\n\t\t<string>/Users/a</string>",
         ] {
             assert!(text.contains(want), "{want} not in\n{text}");
@@ -1260,7 +1273,7 @@ mod tests {
 
     #[test]
     fn plist_arguments_round_trip_with_markup_characters() {
-        let arguments = ["/a b/dps", "live", "--profile", "/x/<&>'\".toml"];
+        let arguments = ["/a b/tonewell", "live", "--profile", "/x/<&>'\".toml"];
         let text = job(&arguments).plist();
         assert!(
             text.contains("<string>/x/&lt;&amp;&gt;'\".toml</string>"),
@@ -1274,28 +1287,40 @@ mod tests {
     fn settings_are_named_from_the_arguments() {
         let args = |a: &[&str]| a.iter().map(|&s| s.to_owned()).collect::<Vec<_>>();
         assert_eq!(
-            settings_of(&args(&["dps", "live", "--service", "--profile", "/p.toml"])),
+            settings_of(&args(&[
+                "tonewell",
+                "live",
+                "--service",
+                "--profile",
+                "/p.toml"
+            ])),
             "/p.toml"
         );
         assert_eq!(
-            settings_of(&args(&["dps", "live", "--service", "--preset", "voice"])),
+            settings_of(&args(&[
+                "tonewell",
+                "live",
+                "--service",
+                "--preset",
+                "voice"
+            ])),
             "preset voice"
         );
         assert_eq!(
-            settings_of(&args(&["dps", "live", "--service"])),
+            settings_of(&args(&["tonewell", "live", "--service"])),
             "the settings file"
         );
     }
 
-    const RUNNING: &str = "gui/501/dev.dps.live = {
+    const RUNNING: &str = "gui/501/dev.tonewell.live = {
 \tactive count = 1
-\tpath = /Users/a/Library/Application Support/dps/dev.dps.live.plist
+\tpath = /Users/a/Library/Application Support/tonewell/dev.tonewell.live.plist
 \ttype = LaunchAgent
 \tstate = running
 
-\tprogram = /opt/bin/dps
+\tprogram = /opt/bin/tonewell
 \targuments = {
-\t\t/opt/bin/dps
+\t\t/opt/bin/tonewell
 \t\tlive
 \t\t--service
 \t\t--preset
@@ -1329,9 +1354,15 @@ mod tests {
                 running: true,
                 pid: Some(4242),
                 last_exit: None,
-                arguments: ["/opt/bin/dps", "live", "--service", "--preset", "music"]
-                    .map(String::from)
-                    .to_vec(),
+                arguments: [
+                    "/opt/bin/tonewell",
+                    "live",
+                    "--service",
+                    "--preset",
+                    "music"
+                ]
+                .map(String::from)
+                .to_vec(),
             }
         );
         assert!(!loaded.failed());
@@ -1448,7 +1479,7 @@ mod tests {
         assert!(
             holder
                 .describe()
-                .starts_with("dps is already running in the background (pid ")
+                .starts_with("tonewell is already running in the background (pid ")
         );
         drop(lock);
         assert_eq!(LiveLock::holder(&path).unwrap(), None);
@@ -1459,15 +1490,15 @@ mod tests {
         assert!(
             holder
                 .describe()
-                .starts_with("dps live is already running in the foreground")
+                .starts_with("tonewell live is already running in the foreground")
         );
         assert_eq!(
             Holder::parse("").describe(),
-            "dps live is already running in the foreground"
+            "tonewell live is already running in the foreground"
         );
     }
 
-    /// This test binary, which exists, stands in for the job's dps.
+    /// This test binary, which exists, stands in for the job's tonewell.
     fn this_exe() -> PathBuf {
         fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
     }
@@ -1486,7 +1517,7 @@ mod tests {
 
     #[test]
     fn start_waits_for_the_services_own_report() {
-        let log = Path::new("/nonexistent/dps.log");
+        let log = Path::new("/nonexistent/tonewell.log");
         let up = loaded(true, Some(9), None);
         assert_eq!(outcome(Some(&up), None, log), Outcome::Pending);
         // A state from another process is not this run's.
@@ -1528,8 +1559,12 @@ mod tests {
     #[test]
     fn a_failed_start_quotes_the_last_line_of_the_log() {
         let dir = TestDir::new("service-log");
-        let log = dir.0.join("dps.log");
-        fs::write(&log, "dps live: starting\nerror: cannot read profile x\n\n").unwrap();
+        let log = dir.0.join("tonewell.log");
+        fs::write(
+            &log,
+            "tonewell live: starting\nerror: cannot read profile x\n\n",
+        )
+        .unwrap();
         let ended = loaded(false, None, Some("exit code 1"));
         assert_eq!(
             outcome(Some(&ended), None, &log),
@@ -1549,12 +1584,12 @@ mod tests {
 
     #[test]
     fn status_says_how_the_service_is_doing() {
-        let log = Path::new("/l/dps.log");
+        let log = Path::new("/l/tonewell.log");
         let status = |s: Snapshot| s.status(log);
 
         assert_eq!(
             status(snapshot(None, None, None)),
-            "dps is not running in the background; start at login is off\n"
+            "tonewell is not running in the background; start at login is off\n"
         );
 
         let running = state(9, Phase::Running);
@@ -1567,7 +1602,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "dps is running in the background since {since} (pid 9) with preset music on \
+                "tonewell is running in the background since {since} (pid 9) with preset music on \
                  Speakers at 48000 Hz; start at login is off\n"
             )
         );
@@ -1650,7 +1685,7 @@ mod tests {
         assert!(!ok);
         assert_eq!(
             line,
-            "not running in the background: it ended with signal Killed: 9; see /l/dps.log"
+            "not running in the background: it ended with signal Killed: 9; see /l/tonewell.log"
         );
 
         let (ok, line) =
@@ -1662,7 +1697,7 @@ mod tests {
     #[test]
     fn status_shows_start_at_login_and_a_missing_binary() {
         let dir = TestDir::new("service-login");
-        let exe = dir.0.join("dps");
+        let exe = dir.0.join("tonewell");
         fs::write(&exe, "").unwrap();
         let exe = exe.to_str().unwrap();
         let s = snapshot(
@@ -1672,7 +1707,7 @@ mod tests {
         );
         assert_eq!(s.login(), (true, "on, with preset voice".into()));
 
-        let gone = dir.0.join("gone/dps");
+        let gone = dir.0.join("gone/tonewell");
         let gone = gone.to_str().unwrap();
         let s = snapshot(None, None, Some(&[gone, "live", "--service"]));
         let (ok, line) = s.login();
@@ -1688,16 +1723,16 @@ mod tests {
             snapshot(Some(running), Some(state(9, Phase::Running)), None).status(Path::new("/l"));
         assert!(
             text.contains(&format!(
-                "\nnote: the background dps is {gone}, which no longer exists"
+                "\nnote: the background tonewell is {gone}, which no longer exists"
             )),
             "{text}"
         );
 
         let mut elsewhere = snapshot(Some(loaded(true, Some(9), None)), None, None);
         elsewhere.loaded.as_mut().unwrap().arguments[0] = exe.into();
-        elsewhere.exe = Some("/other/dps".into());
+        elsewhere.exe = Some("/other/tonewell".into());
         let note = elsewhere.binary_note().unwrap();
-        assert!(note.contains("not this one (/other/dps)"), "{note}");
+        assert!(note.contains("not this one (/other/tonewell)"), "{note}");
         elsewhere.exe = Some(fs::canonicalize(exe).unwrap());
         assert_eq!(elsewhere.binary_note(), None);
     }

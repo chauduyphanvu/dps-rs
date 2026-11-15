@@ -191,7 +191,7 @@ pub fn silence(output: &mut impl BuffersMut) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dps::{Processor, Profile};
+    use tonewell::{Processor, Profile};
 
     /// Buffers as (channels, samples); `None` samples is a disabled stream.
     struct List(Vec<(usize, Option<Vec<f32>>)>);

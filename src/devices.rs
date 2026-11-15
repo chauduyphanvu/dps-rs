@@ -1,4 +1,4 @@
-//! `dps devices`: the output devices, the profile live mode uses on each,
+//! `tonewell devices`: the output devices, the profile live mode uses on each,
 //! and giving one a profile of its own.
 //!
 //! Live mode with the settings file follows the output device: a device
@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
-use dps::Profile;
+use tonewell::Profile;
 
 use crate::config::{Config, DeviceEntry, Dirs, Source, load_profile};
 use crate::presets::{self, Preset};
@@ -27,7 +27,7 @@ pub enum Action {
     /// profile the device uses now unless --preset or --from says otherwise,
     /// and maps the device to it in config.toml. A file that is already
     /// there is kept, unless --force replaces it with --preset or --from.
-    /// A running dps switches to it on its own when that device plays.
+    /// A running tonewell switches to it on its own when that device plays.
     Assign {
         #[command(flatten)]
         device: DeviceArg,
@@ -57,7 +57,7 @@ pub struct DeviceArg {
     device: Option<String>,
 }
 
-/// An output device as `dps devices` sees it.
+/// An output device as `tonewell devices` sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Device {
     pub uid: String,
@@ -101,7 +101,7 @@ pub fn run(action: Option<Action>, dirs: &Dirs) -> Result<(), String> {
 fn connected() -> Result<Vec<Device>, String> {
     // Tests list the devices here, as `uid=name` entries separated by `;`,
     // the default one marked with a leading `*`; it is not meant for users.
-    if let Some(list) = std::env::var_os("DPS_TEST_DEVICES") {
+    if let Some(list) = std::env::var_os("TONEWELL_TEST_DEVICES") {
         return Ok(list
             .to_string_lossy()
             .split(';')
@@ -209,7 +209,7 @@ fn config_dir(config_path: &Path) -> &Path {
     config_path.parent().unwrap_or(Path::new("."))
 }
 
-/// What `dps devices` prints: one line per device, the default marked,
+/// What `tonewell devices` prints: one line per device, the default marked,
 /// with the profile it uses.
 fn listing(devices: &[Device], config: &Config, config_path: &Path) -> String {
     let dir = config_dir(config_path);
@@ -262,7 +262,7 @@ fn listing(devices: &[Device], config: &Config, config_path: &Path) -> String {
         out += "  (no output devices)\n";
     }
     out += &format!(
-        "\n* default output. Profile paths are relative to {}; `dps devices assign` gives a \
+        "\n* default output. Profile paths are relative to {}; `tonewell devices assign` gives a \
          device a profile of its own.\n",
         dir.display()
     );
@@ -275,7 +275,7 @@ fn listing(devices: &[Device], config: &Config, config_path: &Path) -> String {
 fn choose<'a>(devices: &'a [Device], query: Option<&str>) -> Result<&'a Device, String> {
     let Some(query) = query else {
         return devices.iter().find(|d| d.default).ok_or_else(|| {
-            "there is no default output device; name one with --device (`dps devices` lists \
+            "there is no default output device; name one with --device (`tonewell devices` lists \
              them)"
                 .into()
         });
@@ -306,7 +306,7 @@ fn choose<'a>(devices: &'a [Device], query: Option<&str>) -> Result<&'a Device, 
         }
     }
     Err(format!(
-        "no output device matches --device {query:?}; `dps devices` lists them"
+        "no output device matches --device {query:?}; `tonewell devices` lists them"
     ))
 }
 
@@ -339,7 +339,7 @@ enum Start {
     Current,
 }
 
-/// `dps devices assign`; what to print.
+/// `tonewell devices assign`; what to print.
 fn assign(
     device: &Device,
     start: Start,
@@ -401,7 +401,7 @@ fn assign(
     config.save(config_path)?;
     out += &format!(
         "{} ({}) now uses it in live mode; rewrote {} (comments in it are not kept); a running \
-         dps switches on its own\n",
+         tonewell switches on its own\n",
         device.name,
         device.uid,
         config_path.display()
@@ -431,7 +431,7 @@ fn write_new(path: &Path, text: &str) -> Result<(), String> {
     pending.persist(path)
 }
 
-/// `dps devices unassign`; what to print.
+/// `tonewell devices unassign`; what to print.
 fn unassign(device: &Device, mut config: Config, config_path: &Path) -> Result<String, String> {
     let Some(entry) = config.devices.remove(&device.uid) else {
         return Ok(format!(
@@ -442,7 +442,7 @@ fn unassign(device: &Device, mut config: Config, config_path: &Path) -> Result<S
     config.save(config_path)?;
     Ok(format!(
         "{} ({}) uses the settings file again; kept {}; rewrote {} (comments in it are not \
-         kept); a running dps switches on its own\n",
+         kept); a running tonewell switches on its own\n",
         device.name,
         device.uid,
         config_dir(config_path).join(&entry.profile).display(),
@@ -502,7 +502,7 @@ mod tests {
         let e = chosen(&devices, Some("HDMI")).unwrap_err();
         assert_eq!(
             e,
-            "no output device matches --device \"HDMI\"; `dps devices` lists them"
+            "no output device matches --device \"HDMI\"; `tonewell devices` lists them"
         );
         let e = chosen(&devices[1..], None).unwrap_err();
         assert!(e.starts_with("there is no default output device"), "{e}");
@@ -575,7 +575,7 @@ mod tests {
   Studio DAC               USB-1                 devices/studio-dac.toml (missing, so the settings file)
   Old DAC (not connected)  GONE                  devices/old-dac.toml (missing, so the settings file)
 
-* default output. Profile paths are relative to {}; `dps devices assign` gives a device a profile of its own.
+* default output. Profile paths are relative to {}; `tonewell devices assign` gives a device a profile of its own.
 ",
             dir.0.display()
         );
@@ -593,12 +593,12 @@ mod tests {
                 profile: "devices/airpods-pro.toml".into(),
             },
         );
-        let path = Path::new("/c/dps/config.toml");
+        let path = Path::new("/c/tonewell/config.toml");
         let devices = rig();
         assert_eq!(
             device_profile(&config, path, Some(&devices[1])),
             (
-                Some(PathBuf::from("/c/dps/devices/airpods-pro.toml")),
+                Some(PathBuf::from("/c/tonewell/devices/airpods-pro.toml")),
                 "that is the profile of the default output device, AirPods Pro".into()
             )
         );

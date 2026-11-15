@@ -1,4 +1,4 @@
-//! Ctrl-C, SIGTERM and SIGHUP while `dps process` runs: each long step checks
+//! Ctrl-C, SIGTERM and SIGHUP while `tonewell process` runs: each long step checks
 //! `check`, so the run stops at the next block or ffmpeg poll and its
 //! temporary files are removed on the way out.
 
@@ -20,7 +20,7 @@ pub fn install() -> Result<(), String> {
 
     extern "C" fn on_signal(signum: c_int) {
         SIGNAL.store(signum, Relaxed);
-        // A second signal ends dps at once, in case stopping hangs.
+        // A second signal ends tonewell at once, in case stopping hangs.
         // SAFETY: signal() is async-signal-safe.
         unsafe { signal(signum, SIG_DFL) };
     }
@@ -31,7 +31,7 @@ pub fn install() -> Result<(), String> {
         if previous == SIG_ERR {
             return Err("cannot install the Ctrl-C handler".into());
         }
-        // A signal ignored when dps started, as under nohup, stays ignored.
+        // A signal ignored when tonewell started, as under nohup, stays ignored.
         if previous == SIG_IGN {
             // SAFETY: SIG_IGN installs no code.
             unsafe { signal(signum, SIG_IGN) };

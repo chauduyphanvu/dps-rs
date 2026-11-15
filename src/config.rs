@@ -7,8 +7,8 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use dps::Profile;
 use serde::{Deserialize, Serialize};
+use tonewell::Profile;
 
 use crate::PendingFile;
 use crate::presets::Preset;
@@ -27,7 +27,7 @@ impl Dirs {
         }
     }
 
-    /// `$XDG_CONFIG_HOME/dps/profile.toml`, or `~/.config/dps/profile.toml`
+    /// `$XDG_CONFIG_HOME/tonewell/profile.toml`, or `~/.config/tonewell/profile.toml`
     /// when that variable is unset, empty or relative (which the XDG spec
     /// says to ignore).
     pub fn settings_file(&self) -> Result<PathBuf, String> {
@@ -49,7 +49,7 @@ impl Dirs {
             Some(xdg) if Path::new(xdg).is_absolute() => PathBuf::from(xdg),
             _ => self.home()?.join(".config"),
         };
-        Ok(config.join("dps"))
+        Ok(config.join("tonewell"))
     }
 
     /// The home directory, where the settings file and the background
@@ -143,7 +143,7 @@ pub(crate) fn create_default(path: &Path) -> Result<bool, String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(cannot)?;
     }
-    // create_new also settles a race with another dps creating it.
+    // create_new also settles a race with another tonewell creating it.
     let mut file = match File::create_new(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
@@ -178,7 +178,7 @@ fn parse_error(path: &Path, text: &str, e: &toml::de::Error) -> String {
 }
 
 /// `config.toml`: what live mode does whatever the profile. Live mode and
-/// `dps devices` read and write it, and they are macOS only.
+/// `tonewell devices` read and write it, and they are macOS only.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -214,7 +214,7 @@ impl Config {
     }
 
     /// Replaces the file at `path` through a temporary file beside it, so a
-    /// running dps never reads it half written; a symlink stays. The
+    /// running tonewell never reads it half written; a symlink stays. The
     /// directory is created if needed.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let cannot = |e: &dyn std::fmt::Display| format!("cannot write {}: {e}", path.display());
@@ -260,7 +260,8 @@ pub mod tests {
 
     impl TestDir {
         pub fn new(test: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("dps-unit-{}-{test}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("tonewell-unit-{}-{test}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             Self(dir)
@@ -292,21 +293,24 @@ pub mod tests {
         let file = |d: Dirs| d.settings_file().map(|p| p.display().to_string());
         assert_eq!(
             file(dirs(Some("/x"), Some("/h"))).unwrap(),
-            "/x/dps/profile.toml"
+            "/x/tonewell/profile.toml"
         );
         // The XDG spec says to ignore a relative path.
         for ignored in ["", "x", "./x", "x/../y"] {
             assert_eq!(
                 file(dirs(Some(ignored), Some("/h"))).unwrap(),
-                "/h/.config/dps/profile.toml",
+                "/h/.config/tonewell/profile.toml",
                 "{ignored:?}"
             );
         }
         assert_eq!(
             file(dirs(None, Some("/h"))).unwrap(),
-            "/h/.config/dps/profile.toml"
+            "/h/.config/tonewell/profile.toml"
         );
-        assert_eq!(file(dirs(Some("/x"), None)).unwrap(), "/x/dps/profile.toml");
+        assert_eq!(
+            file(dirs(Some("/x"), None)).unwrap(),
+            "/x/tonewell/profile.toml"
+        );
         for d in [
             dirs(None, None),
             dirs(Some(""), Some("")),
@@ -339,7 +343,7 @@ pub mod tests {
         assert!(matches!(s, Source::Preset(p) if p.name == "music"));
         assert_eq!(s.name(), "preset music");
         let s = Source::new(None, None, &d).unwrap();
-        assert!(matches!(&s, Source::Settings(p) if p == Path::new("/x/dps/profile.toml")));
+        assert!(matches!(&s, Source::Settings(p) if p == Path::new("/x/tonewell/profile.toml")));
         // Only the settings file needs the variables.
         assert!(Source::new(Some("a.toml".into()), None, &dirs(None, None)).is_ok());
         assert!(Source::new(None, Some(music), &dirs(None, None)).is_ok());
@@ -350,11 +354,11 @@ pub mod tests {
     fn config_file_is_beside_the_settings_file() {
         assert_eq!(
             dirs(Some("/x"), None).config_file().unwrap(),
-            Path::new("/x/dps/config.toml")
+            Path::new("/x/tonewell/config.toml")
         );
         assert_eq!(
             dirs(None, Some("/h")).config_file().unwrap(),
-            Path::new("/h/.config/dps/config.toml")
+            Path::new("/h/.config/tonewell/config.toml")
         );
         assert_eq!(
             dirs(None, None).config_file().unwrap_err(),
@@ -363,7 +367,7 @@ pub mod tests {
     }
 
     const EXAMPLE: &str = r#"
-# Apps whose audio dps leaves alone.
+# Apps whose audio tonewell leaves alone.
 exclude = ["us.zoom.xos"]
 
 [devices."BuiltInSpeakerDevice"]
@@ -443,10 +447,10 @@ profile = "/elsewhere/airpods.toml"
     #[test]
     fn profile_for_makes_a_relative_profile_absolute_against_the_config_dir() {
         let config: Config = toml::from_str(EXAMPLE).unwrap();
-        let dir = Path::new("/c/dps");
+        let dir = Path::new("/c/tonewell");
         assert_eq!(
             config.profile_for("BuiltInSpeakerDevice", dir).unwrap(),
-            Path::new("/c/dps/devices/macbook-pro-speakers.toml")
+            Path::new("/c/tonewell/devices/macbook-pro-speakers.toml")
         );
         assert_eq!(
             config.profile_for("AA-BB:output", dir).unwrap(),

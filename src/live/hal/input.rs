@@ -1,4 +1,4 @@
-//! The HAL calls `dps calibrate` makes beyond those of `dps live`.
+//! The HAL calls `tonewell calibrate` makes beyond those of `tonewell live`.
 
 use objc2_core_audio::{
     kAudioDevicePropertyTransportType, kAudioDeviceTransportTypeVirtual,

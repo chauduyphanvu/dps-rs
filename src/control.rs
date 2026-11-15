@@ -1,13 +1,13 @@
-//! Command-line control of the settings and of a running dps.
+//! Command-line control of the settings and of a running tonewell.
 //!
-//! `dps get` and `dps set` read and change one value of a profile file by
-//! its key path, such as `eq.gains_db[3]`; a running dps picks a change up
+//! `tonewell get` and `tonewell set` read and change one value of a profile file by
+//! its key path, such as `eq.gains_db[3]`; a running tonewell picks a change up
 //! through its watch on the file. The paths are those of the profile's
 //! TOML, so there is no list of keys here to keep up to date.
 //!
-//! On macOS every live run also listens on `control.sock` in dps's own
-//! folder for what belongs to the run rather than to a file: `dps bypass`
-//! and `dps use`. A client connects, writes one request line and reads one
+//! On macOS every live run also listens on `control.sock` in tonewell's own
+//! folder for what belongs to the run rather than to a file: `tonewell bypass`
+//! and `tonewell use`. A client connects, writes one request line and reads one
 //! reply line, both UTF-8 and ending in a newline; the run answers one
 //! request per connection and closes it. The requests:
 //!
@@ -34,14 +34,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dps::Profile;
 use toml::Value;
+use tonewell::Profile;
 
 use crate::config::{Dirs, Source};
 #[cfg(target_os = "macos")]
 use crate::{config::load_profile, presets, service::Paths};
 
-/// A profile is checked at one rate, as `dps import` checks one; bands too
+/// A profile is checked at one rate, as `tonewell import` checks one; bands too
 /// high for another are skipped there, not refused.
 const CHECK_RATE: u32 = 48_000;
 
@@ -97,7 +97,7 @@ fn parse_key(key: &str) -> Result<Vec<Step>, String> {
 /// widen 56.4 to 56.400001525878906.
 fn document(profile: &Profile) -> Value {
     let text = toml::to_string(profile).expect("a profile always serializes");
-    Value::Table(text.parse().expect("dps reads the TOML it writes"))
+    Value::Table(text.parse().expect("tonewell reads the TOML it writes"))
 }
 
 /// What a value is, as messages say it.
@@ -193,7 +193,7 @@ fn find<'a>(document: &'a mut Value, steps: &[Step]) -> Result<&'a mut Value, St
     Ok(here)
 }
 
-/// A single value as `dps get` prints it: a name without its quotes.
+/// A single value as `tonewell get` prints it: a name without its quotes.
 fn scalar(value: &Value) -> String {
     match value {
         Value::String(name) => name.clone(),
@@ -201,7 +201,7 @@ fn scalar(value: &Value) -> String {
     }
 }
 
-/// What `dps get` prints for `key` in `profile`: the whole profile without
+/// What `tonewell get` prints for `key` in `profile`: the whole profile without
 /// a key, a table or a list as TOML, a single value as it is.
 pub fn lookup(profile: &Profile, key: Option<&str>) -> Result<String, String> {
     let Some(key) = key else {
@@ -216,7 +216,7 @@ pub fn lookup(profile: &Profile, key: Option<&str>) -> Result<String, String> {
     })
 }
 
-/// What `dps set` does to a value.
+/// What `tonewell set` does to a value.
 pub enum Edit {
     /// Replace it with this, read as the kind of value it is.
     To(String),
@@ -228,7 +228,7 @@ pub enum Edit {
 #[derive(Debug)]
 pub struct Change {
     pub profile: Profile,
-    /// The value before and after, as `dps get` prints them.
+    /// The value before and after, as `tonewell get` prints them.
     pub old: String,
     pub new: String,
 }
@@ -243,7 +243,7 @@ pub fn finite(text: &str) -> Result<f64, String> {
 }
 
 /// `profile` with the value at `key` changed by `change`, checked as a
-/// running dps would check it.
+/// running tonewell would check it.
 pub fn edit(profile: &Profile, key: &str, change: &Edit) -> Result<Change, String> {
     let steps = parse_key(key)?;
     let mut tree = document(profile);
@@ -285,7 +285,10 @@ pub fn edit(profile: &Profile, key: &str, change: &Edit) -> Result<Change, Strin
             ));
         }
         (old, Edit::To(_)) => {
-            return Err(format!("{key} is {}, which dps set cannot set", kind(old)));
+            return Err(format!(
+                "{key} is {}, which tonewell set cannot set",
+                kind(old)
+            ));
         }
     };
     let changed: Profile = tree
@@ -300,7 +303,7 @@ pub fn edit(profile: &Profile, key: &str, change: &Edit) -> Result<Change, Strin
     })
 }
 
-/// The profile file `dps get` and `dps set` work on: `profile`, else the
+/// The profile file `tonewell get` and `tonewell set` work on: `profile`, else the
 /// settings file, created with the default profile if missing.
 fn target(profile: Option<PathBuf>, dirs: &Dirs) -> Result<(PathBuf, Profile), String> {
     let source = Source::new(profile, None, dirs)?;
@@ -311,13 +314,13 @@ fn target(profile: Option<PathBuf>, dirs: &Dirs) -> Result<(PathBuf, Profile), S
     Ok((path, loaded))
 }
 
-/// `dps get`: prints the value of `key` in `profile`, else the settings file.
+/// `tonewell get`: prints the value of `key` in `profile`, else the settings file.
 pub fn get(key: Option<&str>, profile: Option<PathBuf>, dirs: &Dirs) -> Result<(), String> {
     let (_, loaded) = target(profile, dirs)?;
     crate::write_stdout(&lookup(&loaded, key)?)
 }
 
-/// `dps set`: changes the value of `key` in `profile`, else the settings
+/// `tonewell set`: changes the value of `key` in `profile`, else the settings
 /// file, and says how.
 pub fn set(key: &str, change: Edit, profile: Option<PathBuf>, dirs: &Dirs) -> Result<(), String> {
     let (path, loaded) = target(profile, dirs)?;
@@ -349,9 +352,9 @@ const REPLY_WAIT: Duration = Duration::from_secs(5);
 const MAX_LINE: usize = 4096;
 
 #[cfg(target_os = "macos")]
-const NOT_RUNNING: &str = "dps is not running; start it with `dps` or `dps start`";
+const NOT_RUNNING: &str = "tonewell is not running; start it with `tonewell` or `tonewell start`";
 
-/// What `dps bypass` asks for.
+/// What `tonewell bypass` asks for.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
 pub enum Switch {
@@ -425,7 +428,7 @@ fn parse_reply(line: &str) -> Result<String, String> {
         "ok" => Ok(text.into()),
         "error" => Err(text.into()),
         _ => Err(format!(
-            "the running dps answered {line:?}, which this dps does not understand; is it another \
+            "the running tonewell answered {line:?}, which this tonewell does not understand; is it another \
              version?"
         )),
     }
@@ -542,7 +545,7 @@ fn read_request(mut stream: &UnixStream) -> Result<String, String> {
 }
 
 /// Sends `request` to the live run listening at `path` and returns its
-/// answer; `start`, if given, is how to start dps doing it instead when
+/// answer; `start`, if given, is how to start tonewell doing it instead when
 /// none is running.
 #[cfg(target_os = "macos")]
 fn send(path: &Path, request: &Request, start: Option<&str>) -> Result<String, String> {
@@ -566,7 +569,7 @@ fn send(path: &Path, request: &Request, start: Option<&str>) -> Result<String, S
         }
         Err(e) => {
             return Err(format!(
-                "cannot reach the running dps at {}: {e}",
+                "cannot reach the running tonewell at {}: {e}",
                 path.display()
             ));
         }
@@ -577,12 +580,12 @@ fn send(path: &Path, request: &Request, start: Option<&str>) -> Result<String, S
             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
         ) {
             format!(
-                "the running dps did not answer within {} s; it may be restarting audio or \
+                "the running tonewell did not answer within {} s; it may be restarting audio or \
                  waiting for permission to record; try again",
                 REPLY_WAIT.as_secs()
             )
         } else {
-            format!("cannot talk to the running dps: {e}")
+            format!("cannot talk to the running tonewell: {e}")
         }
     };
     stream.set_read_timeout(Some(REPLY_WAIT)).map_err(cannot)?;
@@ -606,13 +609,13 @@ fn ask(request: &Request, start: Option<&str>, dirs: &Dirs) -> Result<(), String
     crate::write_stdout(&format!("{text}\n"))
 }
 
-/// `dps bypass`.
+/// `tonewell bypass`.
 #[cfg(target_os = "macos")]
 pub fn bypass(switch: Switch, dirs: &Dirs) -> Result<(), String> {
     ask(&Request::Bypass(switch), None, dirs)
 }
 
-/// `dps use`: plays the preset or profile file `target` names, or with no
+/// `tonewell use`: plays the preset or profile file `target` names, or with no
 /// target the settings file, in the live run.
 #[cfg(target_os = "macos")]
 pub fn play(target: Option<PathBuf>, dirs: &Dirs) -> Result<(), String> {
@@ -620,7 +623,7 @@ pub fn play(target: Option<PathBuf>, dirs: &Dirs) -> Result<(), String> {
         return ask(&Request::Settings, None, dirs);
     };
     if let Some(preset) = target.to_str().and_then(presets::find) {
-        let start = format!("dps start --preset {}", preset.name);
+        let start = format!("tonewell start --preset {}", preset.name);
         return ask(&Request::Preset(preset.name.into()), Some(&start), dirs);
     }
     let path = fs::canonicalize(&target).map_err(|e| {
@@ -638,18 +641,18 @@ pub fn play(target: Option<PathBuf>, dirs: &Dirs) -> Result<(), String> {
     load_profile(&path)?;
     let Some(text) = path.to_str().filter(|p| !p.contains(['\n', '\r'])) else {
         return Err(format!(
-            "{} cannot be sent to the running dps: only a UTF-8 path without line breaks can",
+            "{} cannot be sent to the running tonewell: only a UTF-8 path without line breaks can",
             path.display()
         ));
     };
-    let start = format!("dps start --profile {text}");
+    let start = format!("tonewell start --profile {text}");
     ask(&Request::File(path), Some(&start), dirs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dps::profile::{BandKind, CorrectionBand};
+    use tonewell::profile::{BandKind, CorrectionBand};
 
     fn steps(key: &str) -> Vec<Step> {
         parse_key(key).unwrap_or_else(|e| panic!("{key}: {e}"))
@@ -756,7 +759,7 @@ mod tests {
         );
         let leveler = get(&p, "leveler");
         assert_eq!(
-            toml::from_str::<dps::profile::LevelerParams>(&leveler).unwrap(),
+            toml::from_str::<tonewell::profile::LevelerParams>(&leveler).unwrap(),
             p.leveler,
             "{leveler}"
         );
@@ -773,7 +776,7 @@ mod tests {
         );
         let correction = get(&p, "correction");
         assert_eq!(
-            toml::from_str::<dps::profile::CorrectionParams>(&correction).unwrap(),
+            toml::from_str::<tonewell::profile::CorrectionParams>(&correction).unwrap(),
             p.correction,
             "{correction}"
         );
@@ -1204,21 +1207,21 @@ mod socket_tests {
     }
 
     #[test]
-    fn with_nothing_listening_the_client_says_how_to_start_dps() {
+    fn with_nothing_listening_the_client_says_how_to_start_tonewell() {
         let dir = TestDir::new("none");
         let path = dir.0.join("control.sock");
         assert_eq!(
             send(&path, &Request::Bypass(Switch::On), None),
-            Err("dps is not running; start it with `dps` or `dps start`".into())
+            Err("tonewell is not running; start it with `tonewell` or `tonewell start`".into())
         );
         assert_eq!(
             send(
                 &path,
                 &Request::Preset("night".into()),
-                Some("dps start --preset night")
+                Some("tonewell start --preset night")
             ),
             Err(
-                "dps is not running; start it with `dps` or `dps start` (`dps start --preset \
+                "tonewell is not running; start it with `tonewell` or `tonewell start` (`tonewell start --preset \
                  night` starts it that way)"
                     .into()
             )

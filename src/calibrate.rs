@@ -1,4 +1,4 @@
-//! `dps calibrate` without the hardware: the test tones, the analysis of
+//! `tonewell calibrate` without the hardware: the test tones, the analysis of
 //! their recording, and the correction fitted to it.
 //!
 //! Each third-octave band from 100 Hz to 8 kHz gets a warble tone, a sine
@@ -329,7 +329,7 @@ impl fmt::Display for Error {
                 f,
                 "the microphone recorded nothing but exact silence, which is what macOS gives \
                  an app not allowed to use it: allow your terminal app in System Settings > \
-                 Privacy & Security > Microphone, then run dps calibrate again"
+                 Privacy & Security > Microphone, then run tonewell calibrate again"
             ),
             Self::TooQuiet { usable, level_db } => write!(
                 f,

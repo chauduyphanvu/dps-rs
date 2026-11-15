@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.1
+
+dps is now tonewell, so that it no longer shares a name with the commercial product its core is based on. The command, the settings folder (`~/.config/tonewell`), the log (`~/Library/Logs/tonewell.log`), the background job (`dev.tonewell.live`) and the output names (`song.tonewell.flac`) all change with it. Nothing else changed.
+
+If you installed 0.1.0:
+- Run `dps stop --login` so the old background job and login item are gone.
+- Move your settings: `mv ~/.config/dps ~/.config/tonewell`.
+- With Homebrew: `brew uninstall dps && brew untap chauduyphanvu/dps`, then `brew install chauduyphanvu/tonewell/tonewell`. Otherwise delete the old `dps` binary and install tonewell the same way you installed dps.
+- macOS asks once again to let `tonewell` record system audio for `tonewell start`, since it is a new program to the permission system.
+
 ## 0.1.0
 
 dps is a system-wide audio processor for macOS that needs no virtual audio driver: it levels, shapes and limits everything your Mac plays, with a profile for each output device, and the same chain processes audio files on any platform. Its core is a reimplementation of the "Digital Power Station" processing chain, rebuilt from the published patents; this project is not affiliated with or endorsed by Bongiovi Acoustics.

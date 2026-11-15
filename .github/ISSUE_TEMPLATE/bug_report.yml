@@ -1,5 +1,5 @@
 name: Bug report
-description: Something dps does that it should not, or does not do that it should
+description: Something tonewell does that it should not, or does not do that it should
 labels: ["bug"]
 body:
   - type: textarea
@@ -23,8 +23,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: "`dps --version` output"
-      placeholder: dps 0.1.0
+      label: "`tonewell --version` output"
+      placeholder: tonewell 0.1.1
     validations:
       required: true
   - type: input
@@ -37,8 +37,8 @@ body:
   - type: textarea
     id: doctor
     attributes:
-      label: "`dps doctor` output"
-      description: "Run `dps doctor` and paste the output; it lists the output device and the apps playing audio, so remove anything you'd rather not share."
+      label: "`tonewell doctor` output"
+      description: "Run `tonewell doctor` and paste the output; it lists the output device and the apps playing audio, so remove anything you'd rather not share."
       render: text
   - type: input
     id: output-device

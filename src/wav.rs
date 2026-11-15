@@ -314,7 +314,10 @@ mod tests {
     }
 
     fn temp_path(test: &str, bits: u16) -> PathBuf {
-        std::env::temp_dir().join(format!("dps-wav-{}-{test}-{bits}.wav", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "tonewell-wav-{}-{test}-{bits}.wav",
+            std::process::id()
+        ))
     }
 
     fn write_ints(test: &str, bits: u16, samples: &[f32]) -> (u64, Vec<i32>) {

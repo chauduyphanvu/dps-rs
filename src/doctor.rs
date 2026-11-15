@@ -1,4 +1,4 @@
-//! `dps doctor`: checks what dps needs here and says how to fix what is
+//! `tonewell doctor`: checks what tonewell needs here and says how to fix what is
 //! missing.
 
 use std::io::{self, Write};
@@ -79,7 +79,7 @@ fn settings_check(source: &Result<Source, String>, rate: u32) -> Check {
                 "settings",
                 true,
                 format!(
-                    "{} does not exist yet; dps creates it with the default profile",
+                    "{} does not exist yet; tonewell creates it with the default profile",
                     path.display()
                 ),
             );
@@ -89,7 +89,9 @@ fn settings_check(source: &Result<Source, String>, rate: u32) -> Check {
     };
     let fix = match source {
         Source::Preset(_) => String::new(),
-        _ => format!("; fix: correct {name} (`dps profile` prints the default with every key)"),
+        _ => {
+            format!("; fix: correct {name} (`tonewell profile` prints the default with every key)")
+        }
     };
     match profile {
         Ok(profile) => match profile.validate(rate) {
@@ -252,11 +254,11 @@ mod macos {
     /// The apps playing audio now, by bundle ID, for config.toml's
     /// `exclude`, and those it leaves alone. Live mode works without it.
     pub fn apps_check(dirs: &Dirs) -> Check {
-        // Tests that stand in for the audio system with DPS_TEST_OUTPUT list
+        // Tests that stand in for the audio system with TONEWELL_TEST_OUTPUT list
         // the apps here, comma-separated, a `+` after each one playing; it
         // is not meant for users.
-        let apps = match std::env::var_os("DPS_TEST_OUTPUT") {
-            Some(_) => Ok(std::env::var("DPS_TEST_APPS")
+        let apps = match std::env::var_os("TONEWELL_TEST_OUTPUT") {
+            Some(_) => Ok(std::env::var("TONEWELL_TEST_APPS")
                 .unwrap_or_default()
                 .split(',')
                 .filter(|a| !a.is_empty())
@@ -408,7 +410,7 @@ mod macos {
                 false,
                 format!(
                     "{head}; the default output, {}, should play with its own, but {e}, so live \
-                     mode plays the settings file; fix: correct it, or `dps devices unassign`",
+                     mode plays the settings file; fix: correct it, or `tonewell devices unassign`",
                     device.name
                 ),
             ),
@@ -419,7 +421,7 @@ mod macos {
     pub fn default_output() -> Result<(String, u32), String> {
         // Tests name the device here, as `name@rate` or else an error; it is
         // not meant for users.
-        let Some(test) = std::env::var_os("DPS_TEST_OUTPUT") else {
+        let Some(test) = std::env::var_os("TONEWELL_TEST_OUTPUT") else {
             return live::default_output();
         };
         let test = test.to_string_lossy();
@@ -460,8 +462,8 @@ mod macos {
     }
 
     pub fn capture_verdict(capture: Capture) -> Check {
-        const FROM_HERE: &str = "(for apps started from here; the background service needs dps \
-                                 itself allowed, which `dps start` checks)";
+        const FROM_HERE: &str = "(for apps started from here; the background service needs tonewell \
+                                 itself allowed, which `tonewell start` checks)";
         match capture {
             Capture::Ran { heard: true, .. } => Check::new(
                 "capture",
@@ -495,7 +497,7 @@ mod macos {
                 "capture",
                 false,
                 "macOS is asking for permission to record system audio; fix: answer the \
-                 prompt, then run dps doctor again",
+                 prompt, then run tonewell doctor again",
             ),
             Capture::Failed(e) => Check::new(
                 "capture",
@@ -519,7 +521,10 @@ mod macos {
         let fix = if ok || service.contains("fix: ") {
             String::new()
         } else {
-            format!("; fix: see {}, then `dps start` again", paths.log.display())
+            format!(
+                "; fix: see {}, then `tonewell start` again",
+                paths.log.display()
+            )
         };
         let (login_ok, login) = snapshot.login();
         vec![
@@ -601,7 +606,7 @@ mod tests {
         assert!(
             check
                 .text
-                .ends_with("does not exist yet; dps creates it with the default profile")
+                .ends_with("does not exist yet; tonewell creates it with the default profile")
         );
         assert!(!settings.exists(), "the doctor creates nothing");
 
@@ -613,7 +618,7 @@ mod tests {
         assert!(check.text.contains("output_gain_db"), "{}", check.text);
         assert!(
             check.text.ends_with(
-                "; fix: correct {} (`dps profile` prints the default with every key)"
+                "; fix: correct {} (`tonewell profile` prints the default with every key)"
                     .replace("{}", &settings.display().to_string())
                     .as_str()
             ),
@@ -636,7 +641,7 @@ mod tests {
         assert!(
             check
                 .text
-                .ends_with("(`dps profile` prints the default with every key)")
+                .ends_with("(`tonewell profile` prints the default with every key)")
         );
 
         // The top EQ bands do not fit under 4 kHz, so they are skipped.
@@ -737,7 +742,7 @@ mod tests {
         assert!(
             check
                 .text
-                .ends_with("fix: correct it, or `dps devices unassign`")
+                .ends_with("fix: correct it, or `tonewell devices unassign`")
         );
 
         std::fs::create_dir_all(own.parent().unwrap()).unwrap();

@@ -71,12 +71,12 @@ jobs:
 
           ---
 
-          Install with `brew install chauduyphanvu/dps/dps`, or see [Install](https://github.com/chauduyphanvu/dps-rs#install) for the zip below and for building from source.
+          Install with `brew install chauduyphanvu/tonewell/tonewell`, or see [Install](https://github.com/chauduyphanvu/tonewell#install) for the zip below and for building from source.
           EOF
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       # scripts/release.sh signs with the identity it finds in the keychain
-      # search list and notarises with the dps-notary profile from the default
+      # search list and notarises with the tonewell-notary profile from the default
       # keychain, so the temporary keychain becomes both.
       - name: Put the signing certificate and notary key in a temporary keychain
         env:
@@ -99,7 +99,7 @@ jobs:
           security list-keychains -d user -s "$keychain"
           security default-keychain -d user -s "$keychain"
           printf '%s\n' "$NOTARY_KEY_P8" > "$RUNNER_TEMP/notary-key.p8"
-          xcrun notarytool store-credentials dps-notary --key "$RUNNER_TEMP/notary-key.p8" \
+          xcrun notarytool store-credentials tonewell-notary --key "$RUNNER_TEMP/notary-key.p8" \
             --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID"
           rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/notary-key.p8"
 
@@ -114,9 +114,9 @@ jobs:
           TAG: ${{ github.ref_name }}
           VERSION: ${{ steps.check.outputs.version }}
         run: |
-          archive="dist/dps-$VERSION-macos-universal.zip"
+          archive="dist/tonewell-$VERSION-macos-universal.zip"
           gh release create "$TAG" "$archive" "$archive.sha256" --verify-tag \
-            --title "dps $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+            --title "tonewell $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
           echo "sha256=$(cut -d ' ' -f 1 "$archive.sha256")" >> "$GITHUB_OUTPUT"
 
       - name: Remove the keychain and key files
@@ -135,28 +135,28 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Update Formula/dps.rb in chauduyphanvu/homebrew-dps
+      - name: Update Formula/tonewell.rb in chauduyphanvu/homebrew-tonewell
         env:
           GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
           VERSION: ${{ needs.release.outputs.version }}
           SHA256: ${{ needs.release.outputs.sha256 }}
         run: |
-          formula="$RUNNER_TEMP/dps.rb"
-          sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHA256@/$SHA256/g" packaging/homebrew/dps.rb > "$formula"
+          formula="$RUNNER_TEMP/tonewell.rb"
+          sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHA256@/$SHA256/g" packaging/homebrew/tonewell.rb > "$formula"
           ruby -c "$formula" > /dev/null
           url=$(sed -n 's/^  url "\(.*\)"$/\1/p' "$formula")
           if [ -z "$url" ] || ! grep -qx "  sha256 \"$SHA256\"" "$formula"; then
-            echo "::error::packaging/homebrew/dps.rb did not render a url and sha256"
+            echo "::error::packaging/homebrew/tonewell.rb did not render a url and sha256"
             exit 1
           fi
-          curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/dps.zip" "$url"
-          downloaded=$(sha256sum "$RUNNER_TEMP/dps.zip" | cut -d ' ' -f 1)
+          curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/tonewell.zip" "$url"
+          downloaded=$(sha256sum "$RUNNER_TEMP/tonewell.zip" | cut -d ' ' -f 1)
           if [ "$downloaded" != "$SHA256" ]; then
             echo "::error::$url has sha256 $downloaded, not the $SHA256 the release job built"
             exit 1
           fi
-          path=repos/chauduyphanvu/homebrew-dps/contents/Formula/dps.rb
-          args=(-f "message=dps $VERSION" -f "content=$(base64 -w 0 "$formula")")
+          path=repos/chauduyphanvu/homebrew-tonewell/contents/Formula/tonewell.rb
+          args=(-f "message=tonewell $VERSION" -f "content=$(base64 -w 0 "$formula")")
           if sha=$(gh api "$path" --jq .sha 2> /dev/null); then
             args+=(-f "sha=$sha")
           fi

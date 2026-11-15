@@ -1,15 +1,15 @@
-# dps
+# tonewell
 
-[![CI](https://github.com/chauduyphanvu/dps-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/chauduyphanvu/dps-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/chauduyphanvu/tonewell/actions/workflows/ci.yml/badge.svg)](https://github.com/chauduyphanvu/tonewell/actions/workflows/ci.yml)
 
 A system-wide audio processor for macOS that needs no virtual audio driver:
 it levels, shapes and limits everything your Mac plays, with a profile for
 each output device. The same chain processes audio files on any platform.
 
-The core of the chain is a reimplementation of the "Digital Power Station"
-processing chain. This project is not affiliated with or endorsed by Bongiovi
-Acoustics. There is no public source for their product, so that core is
-rebuilt from the published patents (the US 8,284,955 family, and US 9,398,394
+The core of the chain is reimplemented from Bongiovi Acoustics' published
+patents. This project is not affiliated with or endorsed by Bongiovi
+Acoustics, and it is not their product or a copy of their code, which is not
+public. The core follows the patents (the US 8,284,955 family, and US 9,398,394
 for the stereo block). The patents publish no tuning values, so the default
 profile and the presets are this project's own starting points and will not
 sound like the commercial product. The leveler, bass harmonics, contour,
@@ -51,7 +51,7 @@ leveler → input gain → low shelf cut → high shelf boost → compressor
 - Live mode: macOS 14.2 or later, and your terminal allowed under System
   Settings > Privacy & Security > Screen & System Audio Recording.
 - `ffmpeg` and `ffprobe` on `PATH` for files other than WAV.
-- `dps calibrate`: a microphone, and your terminal allowed under Privacy &
+- `tonewell calibrate`: a microphone, and your terminal allowed under Privacy &
   Security > Microphone.
 
 File processing builds on other platforms; live mode is macOS only.
@@ -61,21 +61,21 @@ File processing builds on other platforms; live mode is macOS only.
 **Homebrew**, on macOS 14 or later:
 
 ```sh
-brew install chauduyphanvu/dps/dps
+brew install chauduyphanvu/tonewell/tonewell
 ```
 
-**From a release**: each [release](https://github.com/chauduyphanvu/dps-rs/releases)
-has `dps-<version>-macos-universal.zip`, holding one `dps` binary for Apple
+**From a release**: each [release](https://github.com/chauduyphanvu/tonewell/releases)
+has `tonewell-<version>-macos-universal.zip`, holding one `tonewell` binary for Apple
 silicon and Intel Macs, signed and notarised, and a `.sha256` file to check it
 against. Set `v` to the release you want:
 
 ```sh
 v=0.1.0
-base=https://github.com/chauduyphanvu/dps-rs/releases/download/v$v
-curl -fL -O "$base/dps-$v-macos-universal.zip" -O "$base/dps-$v-macos-universal.zip.sha256"
-shasum -a 256 -c "dps-$v-macos-universal.zip.sha256"
-unzip "dps-$v-macos-universal.zip"
-sudo install -d /usr/local/bin && sudo install dps /usr/local/bin/
+base=https://github.com/chauduyphanvu/tonewell/releases/download/v$v
+curl -fL -O "$base/tonewell-$v-macos-universal.zip" -O "$base/tonewell-$v-macos-universal.zip.sha256"
+shasum -a 256 -c "tonewell-$v-macos-universal.zip.sha256"
+unzip "tonewell-$v-macos-universal.zip"
+sudo install -d /usr/local/bin && sudo install tonewell /usr/local/bin/
 ```
 
 `/usr/local/bin` is on the `PATH` macOS sets up; any other directory on your
@@ -84,13 +84,13 @@ sudo install -d /usr/local/bin && sudo install dps /usr/local/bin/
 **From source**, on any platform (live mode is macOS only):
 
 ```sh
-cargo install --git https://github.com/chauduyphanvu/dps-rs --locked
+cargo install --git https://github.com/chauduyphanvu/tonewell --locked
 ```
 
 or `cargo install --path . --locked` in a clone.
 
-On macOS, the background service (`dps start`) is asked for audio-recording
-consent as `dps` itself, and macOS ties that consent to the code signature. The
+On macOS, the background service (`tonewell start`) is asked for audio-recording
+consent as `tonewell` itself, and macOS ties that consent to the code signature. The
 Homebrew and release binaries are signed with the same Developer ID every
 time, so one approval lasts across upgrades. A build from source gets a new
 signature on every rebuild, so the prompt returns each time, unless you install
@@ -98,23 +98,23 @@ it from a clone with `scripts/install.sh`, which signs it with a Developer ID
 certificate from your keychain. Switching between a release and your own build
 asks again.
 
-Run `dps doctor` to check that everything live mode needs is in place.
+Run `tonewell doctor` to check that everything live mode needs is in place.
 
 ## Use
 
 ```sh
-dps                       # process system audio live with your settings file
-dps --preset music        # the same, starting from a built-in preset
-dps process song.flac     # write song.dps.flac
-dps start                 # run live in the background (dps status, dps stop)
-dps start --login         # also start at every login
-dps devices               # list the outputs and the profile each plays with
-dps import hd650.txt      # import a headphone correction
-dps calibrate             # measure your speakers and correct them
-dps set eq.gains_db[3] --by +2   # change one setting from a script
-dps bypass                # toggle bypass in the running dps
-dps presets               # list the built-in presets
-dps profile               # print the default profile as TOML
+tonewell                       # process system audio live with your settings file
+tonewell --preset music        # the same, starting from a built-in preset
+tonewell process song.flac     # write song.tonewell.flac
+tonewell start                 # run live in the background (tonewell status, tonewell stop)
+tonewell start --login         # also start at every login
+tonewell devices               # list the outputs and the profile each plays with
+tonewell import hd650.txt      # import a headphone correction
+tonewell calibrate             # measure your speakers and correct them
+tonewell set eq.gains_db[3] --by +2   # change one setting from a script
+tonewell bypass                # toggle bypass in the running tonewell
+tonewell presets               # list the built-in presets
+tonewell profile               # print the default profile as TOML
 ```
 
 ### Tuning while it plays
@@ -156,12 +156,12 @@ preferred and whether a split that lopsided could be chance.
 
 ### Settings
 
-Settings live in `~/.config/dps/profile.toml` (or under `$XDG_CONFIG_HOME`),
+Settings live in `~/.config/tonewell/profile.toml` (or under `$XDG_CONFIG_HOME`),
 created with the default profile on first use. While live mode runs, saving
 the file applies it within a moment. `--profile FILE` or `--preset NAME` use
 something else for one run.
 
-A profile is plain TOML; `dps profile` prints every key. The EQ is three lists
+A profile is plain TOML; `tonewell profile` prints every key. The EQ is three lists
 of eleven values, one position per band:
 
 ```toml
@@ -175,30 +175,30 @@ A band at or above half the sample rate is skipped rather than rejected.
 
 ### Scripting
 
-`dps get` and `dps set` read and change one value of the profile; a running
-dps picks a change up as it does any save.
+`tonewell get` and `tonewell set` read and change one value of the profile; a running
+tonewell picks a change up as it does any save.
 
 ```sh
-dps get eq.gains_db[3]            # one value; a table or a list prints as TOML
-dps set eq.gains_db[3] --by +2    # add to a number (--by -1.5 works too)
-dps set leveler.target_lufs -16   # a number, true/false or on/off
+tonewell get eq.gains_db[3]            # one value; a table or a list prints as TOML
+tonewell set eq.gains_db[3] --by +2    # add to a number (--by -1.5 works too)
+tonewell set leveler.target_lufs -16   # a number, true/false or on/off
 ```
 
-Keys are paths into the profile's TOML (`dps profile` prints every key), with
+Keys are paths into the profile's TOML (`tonewell profile` prints every key), with
 `[N]` for a position in a list. A value out of range changes nothing; otherwise
-the file is rewritten, so its comments are not kept. A running dps, in a
-terminal or from `dps start`, also takes:
+the file is rewritten, so its comments are not kept. A running tonewell, in a
+terminal or from `tonewell start`, also takes:
 
 ```sh
-dps bypass            # toggle the level-matched bypass (or: on, off)
-dps use night         # play a preset or profile file until that run ends
-dps use --settings    # back to the settings file and per-device profiles
+tonewell bypass            # toggle the level-matched bypass (or: on, off)
+tonewell use night         # play a preset or profile file until that run ends
+tonewell use --settings    # back to the settings file and per-device profiles
 ```
 
 ### A profile for each output
 
-Speakers and headphones want different settings. `dps devices` lists the
-outputs; `dps devices assign` gives the default output (or `--device NAME`) a
+Speakers and headphones want different settings. `tonewell devices` lists the
+outputs; `tonewell devices assign` gives the default output (or `--device NAME`) a
 profile file of its own, a copy of what it plays with now, or `--preset NAME`.
 Live mode with the settings file then follows the output: when you plug in
 headphones it switches to their profile, and the tuner edits and saves that
@@ -217,17 +217,17 @@ name = "MacBook Pro Speakers"
 profile = "devices/macbook-pro-speakers.toml"
 ```
 
-`dps doctor` lists the bundle IDs of the apps playing audio now.
+`tonewell doctor` lists the bundle IDs of the apps playing audio now.
 
 ### Correcting the output device
 
 The `[correction]` table holds a measured correction for the device, applied
 last before the limiter and kept apart from the EQ.
 
-- **Headphones:** `dps import ParametricEQ.txt` reads the parametric EQ files
+- **Headphones:** `tonewell import ParametricEQ.txt` reads the parametric EQ files
   the AutoEQ project publishes for each headphone model (Equalizer APO
   format).
-- **Speakers:** `dps calibrate` plays a quiet warble tone for each third of an
+- **Speakers:** `tonewell calibrate` plays a quiet warble tone for each third of an
   octave from 100 Hz to 8 kHz, records it with the default input device, and
   fits up to 8 filters that flatten what it heard, with at most 6 dB of boost.
   It takes about 35 s. Put the microphone where you listen. `--level` sets how
@@ -305,7 +305,7 @@ stands for wherever you keep each one. Run the `gh` commands in a clone.
    file that zsh deletes when the command ends:
 
    ```sh
-   xcrun notarytool store-credentials dps-notary \
+   xcrun notarytool store-credentials tonewell-notary \
      --key =(op read 'op://<vault>/<item>/<key file>') \
      --key-id "$(op read 'op://<vault>/<item>/<key id>')" \
      --issuer "$(op read 'op://<vault>/<item>/<issuer id>')"
@@ -317,10 +317,10 @@ stands for wherever you keep each one. Run the `gh` commands in a clone.
 4. A `release` environment that only `v*` tags can use, holding the secrets:
 
    ```sh
-   gh api -X PUT repos/chauduyphanvu/dps-rs/environments/release \
+   gh api -X PUT repos/chauduyphanvu/tonewell/environments/release \
      -F 'deployment_branch_policy[protected_branches]=false' \
      -F 'deployment_branch_policy[custom_branch_policies]=true'
-   gh api -X POST repos/chauduyphanvu/dps-rs/environments/release/deployment-branch-policies \
+   gh api -X POST repos/chauduyphanvu/tonewell/environments/release/deployment-branch-policies \
      -f name='v*' -f type=tag
    op read -n 'op://<vault>/<item>/<p12 file>' | base64 | gh secret set DEVELOPER_ID_P12_BASE64 --env release
    op read -n 'op://<vault>/<item>/<p12 password>' | gh secret set DEVELOPER_ID_P12_PASSWORD --env release
@@ -330,9 +330,9 @@ stands for wherever you keep each one. Run the `gh` commands in a clone.
    ```
 
 5. The tap. Create it with
-   `gh repo create chauduyphanvu/homebrew-dps --public --add-readme`. Then, under
+   `gh repo create chauduyphanvu/homebrew-tonewell --public --add-readme`. Then, under
    GitHub Settings > Developer settings > Personal access tokens > Fine-grained
-   tokens, create a token with access to `chauduyphanvu/homebrew-dps` only and
+   tokens, create a token with access to `chauduyphanvu/homebrew-tonewell` only and
    its Contents permission set to Read and write, keep it in 1Password, and:
 
    ```sh
@@ -354,9 +354,9 @@ non-empty `## X.Y.Z` section, and stops there if not. It puts the certificate
 and the notary key in a temporary keychain, runs `scripts/release.sh`, and
 publishes the release `vX.Y.Z` with the zip, its `.sha256` and the changelog
 section. Last, it downloads the published zip, checks it against the sha256 of
-the one it built, and commits `Formula/dps.rb`, rendered from
-`packaging/homebrew/dps.rb` with the new `url` and `sha256`, to the tap as
-`dps X.Y.Z`.
+the one it built, and commits `Formula/tonewell.rb`, rendered from
+`packaging/homebrew/tonewell.rb` with the new `url` and `sha256`, to the tap as
+`tonewell X.Y.Z`.
 
 Nothing is public until the release is published. If a run fails before that
 for a reason outside the code (a secret, Apple's service), re-run it; for a fix
@@ -365,9 +365,9 @@ and tag the fixed commit. If only the tap update fails, fix the cause and
 re-run the failed job.
 
 `scripts/release.sh` also runs on a Mac with a clean tree: it builds, signs
-and notarises `dist/dps-<version>-macos-universal.zip` and writes its
+and notarises `dist/tonewell-<version>-macos-universal.zip` and writes its
 `.sha256`, using the Developer ID certificate in your keychain and the
-`dps-notary` profile. It publishes nothing.
+`tonewell-notary` profile. It publishes nothing.
 
 ## License
 

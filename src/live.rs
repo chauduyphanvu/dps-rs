@@ -1,4 +1,4 @@
-//! `dps live`: runs all system audio through the chain in real time.
+//! `tonewell live`: runs all system audio through the chain in real time.
 //!
 //! A private process tap mixes every other process to stereo and mutes them
 //! while it is being read. A private aggregate device combines it with the
@@ -10,8 +10,8 @@
 //! When stdin and stderr are both terminals and the run is in the
 //! terminal's foreground, a keyboard tuner takes over the terminal once
 //! audio runs; otherwise messages are plain lines on stderr. A background
-//! run (`dps start`) also reports its progress for `dps status`. Every run
-//! takes `dps bypass` and `dps use` on its control socket (`control`).
+//! run (`tonewell start`) also reports its progress for `tonewell status`. Every run
+//! takes `tonewell bypass` and `tonewell use` on its control socket (`control`).
 
 mod calibrate;
 mod hal;
@@ -40,13 +40,13 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use dps::limiter::Limiter;
-use dps::{Processor, Profile};
 use objc2_core_audio_types::{
     AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp,
     kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved,
     kAudioFormatFlagIsPacked, kAudioFormatLinearPCM,
 };
+use tonewell::limiter::Limiter;
+use tonewell::{Processor, Profile};
 
 use crate::config::{Config, create_default};
 use crate::control::{self, Request, Switch};
@@ -91,11 +91,11 @@ const VOLUME_POLL: Duration = Duration::from_secs(2);
 const APPS_REBUILD_GAP: Duration = Duration::from_secs(5);
 
 pub const PERMISSION_HINT: &str = "allow your terminal app in System Settings > Privacy & Security > \
-     Screen & System Audio Recording > System Audio Recording Only, then run dps live again";
-/// launchd starts the background run, so macOS asks about dps itself rather
+     Screen & System Audio Recording > System Audio Recording Only, then run tonewell live again";
+/// launchd starts the background run, so macOS asks about tonewell itself rather
 /// than a terminal app.
-pub const BACKGROUND_PERMISSION_HINT: &str = "allow dps in System Settings > Privacy & Security > \
-     Screen & System Audio Recording > System Audio Recording Only, then run dps start again";
+pub const BACKGROUND_PERMISSION_HINT: &str = "allow tonewell in System Settings > Privacy & Security > \
+     Screen & System Audio Recording > System Audio Recording Only, then run tonewell start again";
 const WAITING_FOR_PERMISSION: &str =
     "waiting for permission to record system audio; answer the macOS prompt";
 
@@ -141,19 +141,19 @@ pub struct Options {
     pub save_path: PathBuf,
     /// config.toml, watched for changes.
     pub config: Option<PathBuf>,
-    /// The settings file, which `dps use --settings` goes back to.
+    /// The settings file, which `tonewell use --settings` goes back to.
     pub settings_file: Option<PathBuf>,
     /// Each output device plays with the profile config.toml assigns it, or
     /// else with `settings_file`.
     pub follow_devices: bool,
-    /// Where to listen for `dps bypass` and `dps use`; the run holds the
+    /// Where to listen for `tonewell bypass` and `tonewell use`; the run holds the
     /// live lock, so whatever is there is left over and is replaced.
     pub control: Option<PathBuf>,
     /// Set for a background run, which has no terminal and reports here.
     pub background: Option<Arc<dyn Report>>,
 }
 
-/// What a background run tells `dps status` and `dps start` about itself.
+/// What a background run tells `tonewell status` and `tonewell start` about itself.
 pub trait Report: Send + Sync {
     /// Starting audio is blocked on the macOS permission prompt.
     fn waiting_for_permission(&self);
@@ -171,7 +171,7 @@ pub trait Report: Send + Sync {
 }
 
 pub fn run(options: Options) -> Result<(), String> {
-    // A process in the background (`dps live &`) that changed the terminal's
+    // A process in the background (`tonewell live &`) that changed the terminal's
     // mode would be stopped with its tap still muting every other app.
     let interactive = options.background.is_none()
         && io::stdin().is_terminal()
@@ -286,7 +286,7 @@ pub fn run(options: Options) -> Result<(), String> {
         };
         if !rebuilds.record(Instant::now()) {
             return Err(format!(
-                "dps live had to restart more than {REBUILD_LIMIT} times within {} s, most \
+                "tonewell live had to restart more than {REBUILD_LIMIT} times within {} s, most \
                  recently because {reason}, so it stopped",
                 REBUILD_WINDOW.as_secs()
             ));
@@ -301,7 +301,7 @@ pub fn run(options: Options) -> Result<(), String> {
     // Not eprintln!, which panics when the terminal has been closed.
     let _ = writeln!(
         io::stderr(),
-        "dps live: stopped after {}:{:02}:{:02}; {} samples clamped, {} callbacks short of input, {} overloads",
+        "tonewell live: stopped after {}:{:02}:{:02}; {} samples clamped, {} callbacks short of input, {} overloads",
         secs / 3600,
         secs / 60 % 60,
         secs % 60,
@@ -447,7 +447,7 @@ struct Live {
     /// Each output device plays with the profile config.toml assigns it,
     /// and every other device with the settings file.
     follow_devices: bool,
-    /// Where `dps bypass` and `dps use` reach this run.
+    /// Where `tonewell bypass` and `tonewell use` reach this run.
     server: Option<control::Server>,
     /// The output device of the session: its UID and name.
     device: Option<(String, String)>,
@@ -490,14 +490,14 @@ impl Live {
         match server {
             Some(Ok(server)) => live.server = Some(server),
             Some(Err(e)) => live.warn(format!(
-                "{e}; `dps bypass` and `dps use` cannot reach this run"
+                "{e}; `tonewell bypass` and `tonewell use` cannot reach this run"
             )),
             None => {}
         }
         live
     }
 
-    /// Says a problem that does not end the run, and reports it to `dps
+    /// Says a problem that does not end the run, and reports it to `tonewell
     /// status`.
     fn warn(&mut self, message: String) {
         if let Some(report) = &self.background {
@@ -653,7 +653,7 @@ impl Live {
     }
 
     /// Which apps are left alone, as a message, if that changed since it
-    /// was last said; reported to `dps status` too.
+    /// was last said; reported to `tonewell status` too.
     fn apps_note(&mut self) -> Option<String> {
         if !mem::take(&mut self.apps.unsaid) {
             return None;
@@ -707,7 +707,7 @@ impl Live {
         }
     }
 
-    /// Reports the tap's first sound to `dps status`.
+    /// Reports the tap's first sound to `tonewell status`.
     fn check_heard(&mut self, stats: &Stats) {
         if !self.heard && stats.heard.load(Relaxed) {
             self.heard = true;
@@ -732,10 +732,12 @@ impl Live {
         match &self.screen {
             Some(screen) => screen.notice(WAITING_FOR_PERMISSION),
             None if self.background.is_some() => {
-                format!("dps live: {WAITING_FOR_PERMISSION}\n").into_bytes()
+                format!("tonewell live: {WAITING_FOR_PERMISSION}\n").into_bytes()
             }
-            None => format!("dps live: {WAITING_FOR_PERMISSION}, or press Ctrl-C twice to quit\n")
-                .into_bytes(),
+            None => {
+                format!("tonewell live: {WAITING_FOR_PERMISSION}, or press Ctrl-C twice to quit\n")
+                    .into_bytes()
+            }
         }
     }
 
@@ -870,7 +872,7 @@ impl Live {
         }
     }
 
-    /// Acts on a request from `dps bypass` or `dps use`, and returns what to
+    /// Acts on a request from `tonewell bypass` or `tonewell use`, and returns what to
     /// answer; done, it is said here too. What it changes reaches the audio
     /// through `sync`.
     fn control(&mut self, request: &Request, rate: u32) -> Result<String, String> {
@@ -1259,14 +1261,14 @@ fn watch(
         if stats.non_finite.load(Relaxed) {
             return Err(
                 "the processed signal became NaN or infinite; the output was \
-                 silenced and dps live stopped; check the profile"
+                 silenced and tonewell live stopped; check the profile"
                     .into(),
             );
         }
         if stats.panicked.load(Relaxed) {
             return Err(
                 "internal error in the audio callback; the output was silenced \
-                 and dps live stopped"
+                 and tonewell live stopped"
                     .into(),
             );
         }
@@ -1314,10 +1316,10 @@ fn watch(
                 // would leave every other app muted, so it stops instead.
                 if live.background.is_some() {
                     return Err(format!(
-                        "{seen}, so dps stopped to let them play normally; the System Audio \
+                        "{seen}, so tonewell stopped to let them play normally; the System Audio \
                          Recording permission is probably missing: {BACKGROUND_PERMISSION_HINT} \
-                         (if dps is already allowed there, an app was holding its output open \
-                         while silent; run dps start again)"
+                         (if tonewell is already allowed there, an app was holding its output open \
+                         while silent; run tonewell start again)"
                     ));
                 }
                 // Only a warning: an app can hold its output open while
@@ -1647,7 +1649,7 @@ impl Session {
         hint: &str,
         on_slow_start: impl FnOnce() + Send,
     ) -> Result<Self, String> {
-        let tap = hal::Tap::global_stereo_excluding(exclude, "dps live", true)
+        let tap = hal::Tap::global_stereo_excluding(exclude, "tonewell live", true)
             .map_err(|e| format!("{e}; if this is a permission problem, {hint}"))?;
         let aggregate = hal::Aggregate::new(&target.uid, &tap.uid()?)?;
         let tap_channels = Layout::read(&aggregate, &tap, target)?.tap;
@@ -1763,15 +1765,17 @@ impl Session {
     /// the listeners that would report it.
     fn mismatch(&self, target: &Target, rate: u32) -> Result<Option<String>, String> {
         if !Target::current()?.same_as(target) {
-            return Ok(Some("the output changed while dps live started".into()));
+            return Ok(Some(
+                "the output changed while tonewell live started".into(),
+            ));
         }
         if !hal::is_running(self.aggregate.id)? {
-            return Ok(Some("audio IO stopped while dps live started".into()));
+            return Ok(Some("audio IO stopped while tonewell live started".into()));
         }
         Ok(match Layout::read(&self.aggregate, &self.tap, target) {
             Err(e) => Some(e),
             Ok(layout) if layout.tap != self.tap_channels => {
-                Some("the audio device's streams changed while dps live started".into())
+                Some("the audio device's streams changed while tonewell live started".into())
             }
             Ok(layout) => layout
                 .rates
@@ -1915,8 +1919,8 @@ trait Chain {
     fn set_volume_db(&mut self, _volume_db: Option<f32>) {}
     /// The largest gain reductions since the last call, which starts them
     /// over, and the leveler's gain now. No allocation.
-    fn meters(&mut self) -> dps::Meters {
-        dps::Meters::default()
+    fn meters(&mut self) -> tonewell::Meters {
+        tonewell::Meters::default()
     }
 }
 
@@ -1937,7 +1941,7 @@ impl Chain for Processor {
         Processor::set_volume_db(self, volume_db);
     }
 
-    fn meters(&mut self) -> dps::Meters {
+    fn meters(&mut self) -> tonewell::Meters {
         Processor::meters(self)
     }
 }
@@ -1991,7 +1995,7 @@ fn run_capture_check() -> Result<Capture, String> {
     let own = hal::process_object(std::process::id() as i32)?
         .ok_or("cannot find this process's Core Audio object to exclude it from the tap")?;
     let target = Target::current()?;
-    let tap = hal::Tap::global_stereo_excluding(&[own], "dps doctor", false)?;
+    let tap = hal::Tap::global_stereo_excluding(&[own], "tonewell doctor", false)?;
     let aggregate = hal::Aggregate::new(&target.uid, &tap.uid()?)?;
     let tap_channels = Layout::read(&aggregate, &tap, &target)?.tap;
     let stats = Arc::new(Stats::default());
@@ -2278,7 +2282,7 @@ const STDIN: c_int = 0;
 /// Writes `message` as a line on stderr; not eprintln!, which panics when
 /// the terminal has been closed.
 fn print_line(message: &str) {
-    let _ = writeln!(io::stderr(), "dps live: {}", tui::printable(message));
+    let _ = writeln!(io::stderr(), "tonewell live: {}", tui::printable(message));
 }
 
 /// Whether this process is in the foreground of the terminal on `fd`, so
@@ -2357,7 +2361,6 @@ impl Drop for NoSuspend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dps::profile::{CompressorParams, LimiterParams};
     use objc2_core_audio_types::{
         kAudioFormatFlagIsAlignedHigh, kAudioFormatFlagIsSignedInteger, kAudioFormatMPEG4AAC,
     };
@@ -2365,6 +2368,7 @@ mod tests {
     use std::mem;
     use std::mem::{align_of, offset_of};
     use std::os::fd::AsRawFd;
+    use tonewell::profile::{CompressorParams, LimiterParams};
 
     /// Every stage at unity and the limiter off, so the chain passes samples
     /// through exactly.
@@ -2652,7 +2656,7 @@ mod tests {
     #[test]
     fn profile_file_reports_each_save_once() {
         let path =
-            std::env::temp_dir().join(format!("dps-live-profile-{}.toml", std::process::id()));
+            std::env::temp_dir().join(format!("tonewell-live-profile-{}.toml", std::process::id()));
         let save = |text: &str, age_secs: u64| {
             std::fs::write(&path, text).unwrap();
             let time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + age_secs);
@@ -2685,7 +2689,8 @@ mod tests {
     fn an_empty_profile_file_waits_for_the_next_save() {
         // An editor that truncates before it writes leaves an empty or blank
         // file for a moment; that is not a profile of all defaults.
-        let path = std::env::temp_dir().join(format!("dps-live-blank-{}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("tonewell-live-blank-{}.toml", std::process::id()));
         let save = |text: &str, secs: u64| {
             fs::write(&path, text).unwrap();
             let time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + secs);
@@ -2714,7 +2719,8 @@ mod tests {
 
     impl Scratch {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("dps-live-{name}-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("tonewell-live-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             Self(dir)
@@ -3420,7 +3426,7 @@ mod tests {
         assert_eq!(live.name, "preset night");
         assert_eq!(live.save_path, settings);
         assert!(live.profile_file.is_none());
-        // `dps status` shows it, with the chain's latency for the preset.
+        // `tonewell status` shows it, with the chain's latency for the preset.
         let latency = Latency {
             chain: Processor::new(&night, 48_000, 2).latency_frames(),
             ..speakers_latency()
@@ -3669,7 +3675,7 @@ mod tests {
         assert!(
             live.tuner
                 .message()
-                .ends_with("; `dps bypass` and `dps use` cannot reach this run")
+                .ends_with("; `tonewell bypass` and `tonewell use` cannot reach this run")
         );
     }
 
@@ -3886,7 +3892,7 @@ mod tests {
     #[test]
     #[ignore = "run by only_the_terminals_foreground_gets_the_tuner"]
     fn foreground_child() {
-        let Some(want) = std::env::var_os("DPS_FOREGROUND_CHILD") else {
+        let Some(want) = std::env::var_os("TONEWELL_FOREGROUND_CHILD") else {
             return;
         };
         if want == "leader" {
@@ -3896,7 +3902,7 @@ mod tests {
             let mut child = std::process::Command::new(me);
             child
                 .args(["--exact", "live::tests::foreground_child", "--ignored"])
-                .env("DPS_FOREGROUND_CHILD", "background");
+                .env("TONEWELL_FOREGROUND_CHILD", "background");
             // SAFETY: setpgid() is async-signal-safe.
             unsafe {
                 std::os::unix::process::CommandExt::pre_exec(&mut child, || {
@@ -3913,14 +3919,14 @@ mod tests {
 
     #[test]
     fn only_the_terminals_foreground_gets_the_tuner() {
-        // `dps live &` from an interactive shell runs in a process group
+        // `tonewell live &` from an interactive shell runs in a process group
         // that is not the terminal's foreground one.
         let (master, slave) = tui::pty();
         let me = std::env::current_exe().unwrap();
         let mut child = std::process::Command::new(me);
         child
             .args(["--exact", "live::tests::foreground_child", "--ignored"])
-            .env("DPS_FOREGROUND_CHILD", "leader")
+            .env("TONEWELL_FOREGROUND_CHILD", "leader")
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave.try_clone().unwrap());
@@ -4020,7 +4026,7 @@ mod tests {
     #[test]
     #[ignore = "run by a_second_signal_puts_the_terminal_back_before_the_process_ends"]
     fn second_signal_child() {
-        if std::env::var_os("DPS_SECOND_SIGNAL_CHILD").is_none() {
+        if std::env::var_os("TONEWELL_SECOND_SIGNAL_CHILD").is_none() {
             return;
         }
         install_signal_handlers().unwrap();
@@ -4040,7 +4046,7 @@ mod tests {
         let me = std::env::current_exe().unwrap();
         let mut child = std::process::Command::new(me)
             .args(["--exact", "live::tests::second_signal_child", "--ignored"])
-            .env("DPS_SECOND_SIGNAL_CHILD", "1")
+            .env("TONEWELL_SECOND_SIGNAL_CHILD", "1")
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave.try_clone().unwrap())

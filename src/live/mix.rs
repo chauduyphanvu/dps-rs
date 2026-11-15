@@ -43,9 +43,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
-use dps::Meters;
-use dps::limiter::Limiter;
-use dps::loudness::{KWeighting, Meter};
+use tonewell::Meters;
+use tonewell::limiter::Limiter;
+use tonewell::loudness::{KWeighting, Meter};
 
 use super::{Chain, Handoff, Offer};
 
@@ -821,11 +821,11 @@ fn power(frame: &[f32]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dps::loudness::integrated_lufs;
-    use dps::profile::{CompressorParams, LimiterParams, StereoParams};
-    use dps::{Processor, Profile};
     use std::f64::consts::PI;
     use std::mem;
+    use tonewell::loudness::integrated_lufs;
+    use tonewell::profile::{CompressorParams, LimiterParams, StereoParams};
+    use tonewell::{Processor, Profile};
 
     const RATE: u32 = 48_000;
     /// 30 ms at 48 kHz.

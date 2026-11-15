@@ -1,4 +1,4 @@
-//! Drives the built `dps` binary end to end.
+//! Drives the built `tonewell` binary end to end.
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use dps::{Processor, Profile};
 use hound::{SampleFormat, WavSpec};
+use tonewell::{Processor, Profile};
 
 /// Mirrors `BLOCK_FRAMES` in src/main.rs.
 const BLOCK_FRAMES: usize = 4096;
@@ -49,10 +49,10 @@ enabled = false
 const LAUNCHCTL_STUB: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin
 dir=$(dirname "$0")
-state="$HOME/Library/Application Support/dps/live.state"
+state="$HOME/Library/Application Support/tonewell/live.state"
 echo "$*" >> "$dir/launchctl.calls"
 mode=$(cat "$dir/$1.mode" 2>/dev/null)
-missing='Could not find service "dev.dps.live" in domain for user gui: 501'
+missing='Could not find service "dev.tonewell.live" in domain for user gui: 501'
 case "$1" in
 print)
     [ "$mode" = broken ] && { echo "Bad request." >&2; exit 5; }
@@ -87,7 +87,7 @@ exit 64
 
 /// A per-test directory: test files go in `work`, and the binary runs with
 /// its settings file, home and temp directory beside it, so no test touches
-/// the real `~/.config/dps`, and with a stand-in for launchctl, so none
+/// the real `~/.config/tonewell`, and with a stand-in for launchctl, so none
 /// touches the real launchd.
 struct TempDir {
     root: PathBuf,
@@ -96,7 +96,7 @@ struct TempDir {
 
 impl TempDir {
     fn new(test: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("dps-cli-{}-{test}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("tonewell-cli-{}-{test}", std::process::id()));
         for sub in ["work", "config", "home", "tmp", "empty"] {
             fs::create_dir_all(root.join(sub)).unwrap();
         }
@@ -126,14 +126,17 @@ impl TempDir {
         names_in(&self.work)
     }
 
-    /// Sorted names of what dps left in its temp directory.
+    /// Sorted names of what tonewell left in its temp directory.
     fn temp_names(&self) -> Vec<String> {
         names_in(&self.root.join("tmp"))
     }
 
-    /// Where `dps` looks for its settings file in this directory.
+    /// Where `tonewell` looks for its settings file in this directory.
     fn settings(&self) -> PathBuf {
-        self.root.join("config").join("dps").join("profile.toml")
+        self.root
+            .join("config")
+            .join("tonewell")
+            .join("profile.toml")
     }
 
     fn write_settings(&self, contents: &str) {
@@ -146,21 +149,21 @@ impl TempDir {
         self.root.join("empty")
     }
 
-    fn dps(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_dps"));
+    fn tonewell(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tonewell"));
         // No test reaches the real audio system: the doctor's output device
         // and whether other apps play come from these.
         cmd.env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("HOME", self.root.join("home"))
             .env("TMPDIR", self.root.join("tmp"))
-            .env("DPS_LAUNCHCTL", self.root.join("launchctl"))
-            .env("DPS_TEST_OUTPUT", "Test Out@48000")
-            .env("DPS_TEST_OTHERS_PLAYING", "0");
+            .env("TONEWELL_LAUNCHCTL", self.root.join("launchctl"))
+            .env("TONEWELL_TEST_OUTPUT", "Test Out@48000")
+            .env("TONEWELL_TEST_OTHERS_PLAYING", "0");
         cmd
     }
 
     fn process(&self, input: &Path, output: &Path, profile: Option<&Path>) -> Output {
-        let mut cmd = self.dps();
+        let mut cmd = self.tonewell();
         cmd.arg("process").arg(input).arg(output);
         if let Some(profile) = profile {
             cmd.arg("--profile").arg(profile);
@@ -193,7 +196,7 @@ fn stdout(out: &Output) -> String {
 }
 
 fn assert_success(out: &Output) {
-    assert!(out.status.success(), "dps failed: {}", stderr(out));
+    assert!(out.status.success(), "tonewell failed: {}", stderr(out));
     assert!(
         out.stdout.is_empty(),
         "unexpected stdout: {}",
@@ -343,7 +346,7 @@ fn processed(profile: &Profile, sample_rate: u32, channels: usize, samples: &[f3
 
 fn preset_profile(dir: &TempDir, name: &str) -> Profile {
     let out = dir
-        .dps()
+        .tonewell()
         .args(["profile", "--preset", name])
         .output()
         .unwrap();
@@ -593,7 +596,7 @@ fn stereo_on_non_stereo_input_warns_once() {
 #[test]
 fn printed_profile_is_the_default_and_loads_back() {
     let dir = TempDir::new("print-profile");
-    let out = dir.dps().arg("profile").output().unwrap();
+    let out = dir.tonewell().arg("profile").output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(out.stderr.is_empty());
     let text = String::from_utf8(out.stdout).unwrap();
@@ -719,7 +722,7 @@ fn eq_bands_too_high_for_the_rate_are_skipped_with_a_warning() {
     let input = dir.join("call.wav");
     write_wav(&input, int_spec(1, 16_000, 16), &signal(16_000, 1));
     let out = dir
-        .dps()
+        .tonewell()
         .args(["process", path_str(&input), path_str(&output)])
         .args(["--preset", "voice"])
         .output()
@@ -873,7 +876,7 @@ fn settings_file_is_created_on_first_use_and_then_reused() {
         note.contains(&dir.settings().display().to_string()),
         "{note}"
     );
-    let printed = dir.dps().arg("profile").output().unwrap();
+    let printed = dir.tonewell().arg("profile").output().unwrap();
     assert_eq!(fs::read(dir.settings()).unwrap(), printed.stdout);
     let want = processed(&Profile::default(), 48_000, 2, &samples);
     assert_close(&read_wav(&output).1, &want, 0.0, "default profile");
@@ -890,10 +893,10 @@ fn settings_file_falls_back_to_home_config() {
     let dir = TempDir::new("settings-home");
     let input = dir.join("in.wav");
     write_wav(&input, int_spec(1, 44_100, 16), &signal(100, 1));
-    let in_home = dir.root.join("home/.config/dps/profile.toml");
+    let in_home = dir.root.join("home/.config/tonewell/profile.toml");
 
     let out = dir
-        .dps()
+        .tonewell()
         .env("XDG_CONFIG_HOME", "")
         .args(["process", path_str(&input), path_str(&dir.join("a.wav"))])
         .output()
@@ -904,7 +907,7 @@ fn settings_file_falls_back_to_home_config() {
     assert!(!dir.settings().exists());
 
     let out = dir
-        .dps()
+        .tonewell()
         .env_remove("XDG_CONFIG_HOME")
         .args(["process", path_str(&input), path_str(&dir.join("b.wav"))])
         .output()
@@ -944,7 +947,7 @@ fn preset_flag_beats_the_settings_file() {
     let want = processed(&music, 44_100, 2, &samples);
 
     let run = || {
-        dir.dps()
+        dir.tonewell()
             .args(["process", path_str(&input), path_str(&output)])
             .args(["--preset", "music"])
             .output()
@@ -971,7 +974,7 @@ fn profile_and_preset_together_are_rejected() {
     write_wav(&input, int_spec(1, 44_100, 16), &signal(100, 1));
 
     let out = dir
-        .dps()
+        .tonewell()
         .args(["process", path_str(&input), path_str(&output)])
         .args(["--profile", path_str(&identity), "--preset", "music"])
         .output()
@@ -989,13 +992,13 @@ fn unknown_preset_is_rejected_with_the_valid_names() {
     write_wav(&input, int_spec(1, 44_100, 16), &signal(100, 1));
 
     let process = dir
-        .dps()
+        .tonewell()
         .args(["process", path_str(&input), path_str(&output)])
         .args(["--preset", "rock"])
         .output()
         .unwrap();
     let profile = dir
-        .dps()
+        .tonewell()
         .args(["profile", "--preset", "rock"])
         .output()
         .unwrap();
@@ -1010,7 +1013,7 @@ fn unknown_preset_is_rejected_with_the_valid_names() {
 #[test]
 fn presets_lists_each_preset_with_a_description() {
     let dir = TempDir::new("presets-list");
-    let out = dir.dps().arg("presets").output().unwrap();
+    let out = dir.tonewell().arg("presets").output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(out.stderr.is_empty());
     let text = stdout(&out);
@@ -1023,7 +1026,7 @@ fn presets_lists_each_preset_with_a_description() {
     assert_eq!(lines[PRESETS.len()], "");
     let note = lines[PRESETS.len() + 1..].join(" ");
     assert!(note.contains("not Bongiovi's"), "{note}");
-    assert!(note.contains("dps profile --preset NAME"), "{note}");
+    assert!(note.contains("tonewell profile --preset NAME"), "{note}");
 }
 
 #[test]
@@ -1212,7 +1215,7 @@ fn presets_do_not_clip_loud_full_scale_material() {
                 scope.spawn(move || {
                     let output = dir.join(&format!("{name}-{rate}.wav"));
                     let out = dir
-                        .dps()
+                        .tonewell()
                         .args(["process", path_str(&input), path_str(&output)])
                         .args(["--preset", name])
                         .output()
@@ -1548,17 +1551,20 @@ fn night_narrows_the_gap_between_quiet_and_loud_passages() {
 // Output naming and formats other than WAV.
 
 #[test]
-fn default_output_is_beside_the_input_with_dps_before_the_extension() {
+fn default_output_is_beside_the_input_with_tonewell_before_the_extension() {
     let dir = TempDir::new("default-output");
     let identity = dir.write("identity.toml", IDENTITY);
     let spec = int_spec(2, 44_100, 16);
     let stored = write_wav(&dir.join("song.wav"), spec, &signal(800, 2));
     fs::copy(dir.join("song.wav"), dir.join("take")).unwrap();
 
-    for (input, output) in [("song.wav", "song.dps.wav"), ("take", "take.dps.wav")] {
+    for (input, output) in [
+        ("song.wav", "song.tonewell.wav"),
+        ("take", "take.tonewell.wav"),
+    ] {
         // Without ffmpeg on PATH: WAV to WAV never needs it.
         let out = dir
-            .dps()
+            .tonewell()
             .env("PATH", dir.empty())
             .args(["process", path_str(&dir.join(input)), "-p"])
             .arg(&identity)
@@ -1572,13 +1578,13 @@ fn default_output_is_beside_the_input_with_dps_before_the_extension() {
 
     // A relative input names its output relative to the same directory.
     let out = dir
-        .dps()
+        .tonewell()
         .current_dir(&dir.work)
         .args(["process", "song.wav", "--preset", "voice"])
         .output()
         .unwrap();
     assert_quiet_success(&out);
-    let (_, samples) = read_wav(&dir.join("song.dps.wav"));
+    let (_, samples) = read_wav(&dir.join("song.tonewell.wav"));
     assert_eq!(samples.len(), stored.len());
     assert!(
         samples.iter().zip(&stored).any(|(a, b)| a != b),
@@ -1593,17 +1599,17 @@ fn default_output_that_is_the_input_is_refused() {
     let input = dir.join("in.wav");
     write_wav(&input, int_spec(2, 44_100, 16), &signal(300, 2));
     let before = fs::read(&input).unwrap();
-    std::os::unix::fs::symlink(&input, dir.join("in.dps.wav")).unwrap();
+    std::os::unix::fs::symlink(&input, dir.join("in.tonewell.wav")).unwrap();
 
     let out = dir
-        .dps()
+        .tonewell()
         .args(["process", path_str(&input), "--preset", "music"])
         .output()
         .unwrap();
     assert_user_error(&out, "is the input file");
-    assert!(stderr(&out).contains("in.dps.wav"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("in.tonewell.wav"), "{}", stderr(&out));
     assert_eq!(fs::read(&input).unwrap(), before);
-    assert_eq!(dir.names(), ["in.dps.wav", "in.wav"]);
+    assert_eq!(dir.names(), ["in.tonewell.wav", "in.wav"]);
 }
 
 #[test]
@@ -1621,17 +1627,17 @@ fn flac_round_trip_is_sample_exact_and_keeps_format_and_tags() {
             "-metadata",
             "title=Test Tone",
             "-metadata",
-            "artist=dps",
+            "artist=tonewell",
             path_str(&flac),
         ]);
 
         assert_quiet_success(
-            &dir.dps()
+            &dir.tonewell()
                 .args(["process", path_str(&flac), "-p", path_str(&identity)])
                 .output()
                 .unwrap(),
         );
-        let output = dir.join(&format!("song-{bits}.dps.flac"));
+        let output = dir.join(&format!("song-{bits}.tonewell.flac"));
         let info = ffprobe(
             &output,
             "stream=codec_name,sample_fmt,sample_rate,channels,bits_per_raw_sample:format_tags",
@@ -1642,7 +1648,7 @@ fn flac_round_trip_is_sample_exact_and_keeps_format_and_tags() {
         assert_eq!(info["sample_rate"], "44100");
         assert_eq!(info["channels"], "2");
         assert_eq!(info["title"], "Test Tone");
-        assert_eq!(info["artist"], "dps");
+        assert_eq!(info["artist"], "tonewell");
 
         let codec = if bits == 16 { "pcm_s16le" } else { "pcm_s24le" };
         let (spec, samples) = decode(&output, codec);
@@ -1683,12 +1689,12 @@ fn lossy_round_trips_keep_duration_rate_channels_bit_rate_and_tags() {
         ]);
 
         assert_quiet_success(
-            &dir.dps()
+            &dir.tonewell()
                 .args(["process", path_str(&input), "-p", path_str(&identity)])
                 .output()
                 .unwrap(),
         );
-        let output = dir.join(&format!("song.dps.{extension}"));
+        let output = dir.join(&format!("song.tonewell.{extension}"));
         let entries = "stream=codec_name,sample_rate,channels,bit_rate:format=duration:format_tags";
         let before = ffprobe(&input, entries);
         let after = ffprobe(&output, entries);
@@ -1757,12 +1763,12 @@ fn channel_layouts_survive_ffmpeg() {
             layout
         );
         assert_quiet_success(
-            &dir.dps()
+            &dir.tonewell()
                 .args(["process", path_str(&input), "-p", path_str(&identity)])
                 .output()
                 .unwrap(),
         );
-        let output = dir.join(&format!("in.dps.{extension}"));
+        let output = dir.join(&format!("in.tonewell.{extension}"));
         assert_eq!(
             ffprobe(&output, "stream=channel_layout")["channel_layout"],
             layout
@@ -1831,7 +1837,7 @@ fn missing_ffmpeg_gives_the_install_hint() {
 
     for (input, output) in [(&flac, dir.join("out.flac")), (&wav, dir.join("out.mp3"))] {
         let out = dir
-            .dps()
+            .tonewell()
             .env("PATH", dir.empty())
             .args(["process", path_str(input), path_str(&output)])
             .args(["-p", path_str(&identity)])
@@ -1895,7 +1901,7 @@ fn unreadable_input_is_reported() {
     for name in ["notes.flac", "notes.mp3"] {
         let input = dir.write(name, "these are notes, not audio\n");
         let out = dir
-            .dps()
+            .tonewell()
             .args(["process", path_str(&input), "--preset", "music"])
             .output()
             .unwrap();
@@ -1909,7 +1915,7 @@ fn unreadable_input_is_reported() {
 #[cfg(target_os = "macos")]
 impl TempDir {
     fn run(&self, args: &[&str]) -> Output {
-        self.dps().args(args).output().unwrap()
+        self.tonewell().args(args).output().unwrap()
     }
 
     fn home(&self, path: &str) -> PathBuf {
@@ -1918,7 +1924,7 @@ impl TempDir {
 
     /// The service's own folder under the test's home.
     fn support(&self, name: &str) -> PathBuf {
-        self.home("Library/Application Support/dps").join(name)
+        self.home("Library/Application Support/tonewell").join(name)
     }
 
     /// Sets what the launchctl stand-in answers or does; see LAUNCHCTL_STUB.
@@ -1950,14 +1956,14 @@ impl TempDir {
 fn service_target() -> String {
     let out = Command::new("id").arg("-u").output().unwrap();
     format!(
-        "gui/{}/dev.dps.live",
+        "gui/{}/dev.tonewell.live",
         String::from_utf8(out.stdout).unwrap().trim()
     )
 }
 
 #[cfg(target_os = "macos")]
-fn this_dps() -> String {
-    fs::canonicalize(env!("CARGO_BIN_EXE_dps"))
+fn this_tonewell() -> String {
+    fs::canonicalize(env!("CARGO_BIN_EXE_tonewell"))
         .unwrap()
         .to_str()
         .unwrap()
@@ -1973,7 +1979,7 @@ fn launchd_print(pid: Option<u32>, last_exit: &str, args: &[&str]) -> String {
         "not running"
     };
     let mut text = format!(
-        "gui/501/dev.dps.live = {{\n\tactive count = 1\n\ttype = LaunchAgent\n\tstate = {state}\n\n\
+        "gui/501/dev.tonewell.live = {{\n\tactive count = 1\n\ttype = LaunchAgent\n\tstate = {state}\n\n\
          \tprogram = {}\n\targuments = {{\n",
         args[0]
     );
@@ -2032,7 +2038,7 @@ fn alive(pid: u32) -> bool {
 
 #[cfg(target_os = "macos")]
 fn stdout_line(out: &Output) -> String {
-    assert!(out.status.success(), "dps failed: {}", stderr(out));
+    assert!(out.status.success(), "tonewell failed: {}", stderr(out));
     assert!(out.stderr.is_empty(), "unexpected stderr: {}", stderr(out));
     stdout(out)
 }
@@ -2044,15 +2050,15 @@ fn background_commands_with_nothing_running_change_nothing() {
     let target = service_target();
     assert_eq!(
         stdout_line(&dir.run(&["status"])),
-        "dps is not running in the background; start at login is off\n"
+        "tonewell is not running in the background; start at login is off\n"
     );
     assert_eq!(
         stdout_line(&dir.run(&["stop"])),
-        "dps is not running in the background\n"
+        "tonewell is not running in the background\n"
     );
     assert_eq!(
         stdout_line(&dir.run(&["stop", "--login"])),
-        "dps is not running in the background; start at login was already off\n"
+        "tonewell is not running in the background; start at login was already off\n"
     );
     assert_eq!(dir.launchctl_calls(), vec![format!("print {target}"); 3]);
     assert!(names_in(&dir.home("")).is_empty());
@@ -2080,10 +2086,10 @@ fn start_refuses_settings_that_do_not_load_before_touching_launchd() {
 fn start_loads_the_canonical_binary_and_reports_a_service_that_fails() {
     let dir = TempDir::new("bg-fails");
     let target = service_target();
-    let exe = this_dps();
+    let exe = this_tonewell();
     let args = [&*exe, "live", "--service", "--preset", "voice"];
     dir.stub("on-bootstrap.print", &launchd_print(None, "1", &args));
-    let log = dir.home("Library/Logs/dps.log");
+    let log = dir.home("Library/Logs/tonewell.log");
     fs::create_dir_all(log.parent().unwrap()).unwrap();
     fs::write(
         &log,
@@ -2095,12 +2101,12 @@ fn start_loads_the_canonical_binary_and_reports_a_service_that_fails() {
     assert_user_error(
         &out,
         &format!(
-            "dps could not start in the background: it ended with exit code 1: error: preset \
+            "tonewell could not start in the background: it ended with exit code 1: error: preset \
              voice does not fit Test Out at 8000 Hz (log: {})",
             log.display()
         ),
     );
-    let plist = dir.support("dev.dps.live.plist");
+    let plist = dir.support("dev.tonewell.live.plist");
     let calls = dir.launchctl_calls();
     assert_eq!(
         calls[..2],
@@ -2108,7 +2114,7 @@ fn start_loads_the_canonical_binary_and_reports_a_service_that_fails() {
             format!("print {target}"),
             format!(
                 "bootstrap {} {}",
-                &target[..target.len() - 13],
+                target.strip_suffix("/dev.tonewell.live").unwrap(),
                 plist.display()
             )
         ]
@@ -2126,7 +2132,7 @@ fn start_loads_the_canonical_binary_and_reports_a_service_that_fails() {
     assert_eq!(
         strings,
         [
-            "dev.dps.live",
+            "dev.tonewell.live",
             &*exe,
             "live",
             "--service",
@@ -2146,14 +2152,14 @@ fn start_loads_the_canonical_binary_and_reports_a_service_that_fails() {
     assert_eq!(
         stdout_line(&dir.run(&["status"])),
         format!(
-            "dps is not running in the background: it ended with exit code 1; see {}; start at \
+            "tonewell is not running in the background: it ended with exit code 1; see {}; start at \
              login is off\n",
             log.display()
         )
     );
     assert_eq!(
         stdout_line(&dir.run(&["stop"])),
-        "dps was not running in the background\n"
+        "tonewell was not running in the background\n"
     );
     assert!(dir.launchctl_calls().contains(&format!("bootout {target}")));
     assert!(!plist.exists());
@@ -2162,9 +2168,12 @@ fn start_loads_the_canonical_binary_and_reports_a_service_that_fails() {
     let out = dir.run(&["start", "--login", "--preset", "voice"]);
     assert_user_error(
         &out,
-        "dps could not start in the background: it ended with exit code 1",
+        "tonewell could not start in the background: it ended with exit code 1",
     );
-    assert!(!dir.home("Library/LaunchAgents/dev.dps.live.plist").exists());
+    assert!(
+        !dir.home("Library/LaunchAgents/dev.tonewell.live.plist")
+            .exists()
+    );
     assert!(stdout_line(&dir.run(&["status"])).ends_with("; start at login is off\n"));
 }
 
@@ -2172,7 +2181,7 @@ fn start_loads_the_canonical_binary_and_reports_a_service_that_fails() {
 #[test]
 fn start_reports_the_running_service_and_stop_ends_it() {
     let dir = TempDir::new("bg-runs");
-    let exe = this_dps();
+    let exe = this_tonewell();
     let pid = orphan_sleeper();
     let args = [&*exe, "live", "--service", "--preset", "music"];
     dir.stub(
@@ -2183,12 +2192,12 @@ fn start_reports_the_running_service_and_stop_ends_it() {
 
     assert_eq!(
         stdout_line(&dir.run(&["start", "--preset", "music"])),
-        "dps is running in the background on Test Out at 48000 Hz with preset music; `dps stop` \
+        "tonewell is running in the background on Test Out at 48000 Hz with preset music; `tonewell stop` \
          stops it\n"
     );
     assert_eq!(
         stdout_line(&dir.run(&["start", "--preset", "voice"])),
-        "dps is already running in the background with preset music; `dps stop` stops it\n"
+        "tonewell is already running in the background with preset music; `tonewell stop` stops it\n"
     );
     let bootstraps = |dir: &TempDir| {
         dir.launchctl_calls()
@@ -2200,7 +2209,7 @@ fn start_reports_the_running_service_and_stop_ends_it() {
 
     let status = stdout_line(&dir.run(&["status"]));
     assert!(
-        status.starts_with("dps is running in the background since 20"),
+        status.starts_with("tonewell is running in the background since 20"),
         "{status}"
     );
     assert!(
@@ -2212,16 +2221,16 @@ fn start_reports_the_running_service_and_stop_ends_it() {
 
     let stopped = stdout_line(&dir.run(&["stop"]));
     assert!(
-        stopped.starts_with("stopped dps, which ran in the background since 20"),
+        stopped.starts_with("stopped tonewell, which ran in the background since 20"),
         "{stopped}"
     );
     assert!(stopped.ends_with(" with preset music\n"), "{stopped}");
     assert!(!alive(pid));
     assert!(!dir.support("live.state").exists());
-    assert!(!dir.support("dev.dps.live.plist").exists());
+    assert!(!dir.support("dev.tonewell.live.plist").exists());
     assert_eq!(
         stdout_line(&dir.run(&["status"])),
-        "dps is not running in the background; start at login is off\n"
+        "tonewell is not running in the background; start at login is off\n"
     );
 }
 
@@ -2230,7 +2239,7 @@ fn start_reports_the_running_service_and_stop_ends_it() {
 fn start_at_login_is_installed_and_removed() {
     let dir = TempDir::new("bg-login");
     let target = service_target();
-    let exe = this_dps();
+    let exe = this_tonewell();
     let pid = orphan_sleeper();
     let args = [&*exe, "live", "--service", "--preset", "voice"];
     dir.stub(
@@ -2238,14 +2247,14 @@ fn start_at_login_is_installed_and_removed() {
         &launchd_print(Some(pid), "(never exited)", &args),
     );
     dir.stub("on-bootstrap.state", &running_state(pid, "preset voice"));
-    let agent = dir.home("Library/LaunchAgents/dev.dps.live.plist");
+    let agent = dir.home("Library/LaunchAgents/dev.tonewell.live.plist");
 
     assert_eq!(
         stdout_line(&dir.run(&["start", "--login", "--preset", "voice"])),
-        "dps is running in the background on Test Out at 48000 Hz with preset voice; `dps stop` \
+        "tonewell is running in the background on Test Out at 48000 Hz with preset voice; `tonewell stop` \
          stops it; it also starts at every login with preset voice\n"
     );
-    let domain = &target[..target.len() - "/dev.dps.live".len()];
+    let domain = &target[..target.len() - "/dev.tonewell.live".len()];
     assert!(
         dir.launchctl_calls()
             .contains(&format!("bootstrap {domain} {}", agent.display()))
@@ -2255,7 +2264,7 @@ fn start_at_login_is_installed_and_removed() {
             .unwrap()
             .contains("<string>voice</string>")
     );
-    assert!(!dir.support("dev.dps.live.plist").exists());
+    assert!(!dir.support("dev.tonewell.live.plist").exists());
     let status = stdout_line(&dir.run(&["status"]));
     assert!(
         status.ends_with("; start at login is on, with preset voice\n"),
@@ -2264,18 +2273,18 @@ fn start_at_login_is_installed_and_removed() {
 
     let stopped = stdout_line(&dir.run(&["stop"]));
     assert!(
-        stopped.ends_with("; start at login is still on (`dps stop --login` turns it off)\n"),
+        stopped.ends_with("; start at login is still on (`tonewell stop --login` turns it off)\n"),
         "{stopped}"
     );
     assert!(agent.exists());
     assert!(!alive(pid));
     assert_eq!(
         stdout_line(&dir.run(&["status"])),
-        "dps is not running in the background; start at login is on, with preset voice\n"
+        "tonewell is not running in the background; start at login is on, with preset voice\n"
     );
     assert_eq!(
         stdout_line(&dir.run(&["stop", "--login"])),
-        "dps is not running in the background; start at login is now off\n"
+        "tonewell is not running in the background; start at login is now off\n"
     );
     assert!(!agent.exists());
 }
@@ -2289,15 +2298,17 @@ fn live_refuses_to_run_beside_another_live_run() {
     let pid = std::process::id();
     {
         let _lock = dir.hold_live_lock("background");
-        let want =
-            format!("dps is already running in the background (pid {pid}); run `dps stop` first");
+        let want = format!(
+            "tonewell is already running in the background (pid {pid}); run `tonewell stop` first"
+        );
         assert_user_error(&dir.run(&["live", "--profile", path_str(&bad)]), &want);
         assert_user_error(&dir.run(&["--profile", path_str(&bad)]), &want);
     }
     {
         let _lock = dir.hold_live_lock("foreground");
-        let want =
-            format!("dps live is already running in the foreground (pid {pid}); quit it first");
+        let want = format!(
+            "tonewell live is already running in the foreground (pid {pid}); quit it first"
+        );
         assert_user_error(&dir.run(&["live", "--profile", path_str(&bad)]), &want);
         assert_user_error(&dir.run(&["start", "--preset", "music"]), &want);
     }
@@ -2314,13 +2325,13 @@ fn live_refuses_to_run_beside_another_live_run() {
 #[test]
 fn a_login_agent_whose_binary_is_gone_is_reported() {
     let dir = TempDir::new("bg-stale");
-    let gone = dir.root.join("moved/dps");
-    let agent = dir.home("Library/LaunchAgents/dev.dps.live.plist");
+    let gone = dir.root.join("moved/tonewell");
+    let agent = dir.home("Library/LaunchAgents/dev.tonewell.live.plist");
     fs::create_dir_all(agent.parent().unwrap()).unwrap();
     fs::write(
         &agent,
         format!(
-            "<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>dev.dps.live</string>\n\
+            "<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>dev.tonewell.live</string>\n\
              \t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>{}</string>\n\
              \t\t<string>live</string>\n\t\t<string>--service</string>\n\t</array>\n</dict>\n</plist>\n",
             gone.display()
@@ -2328,14 +2339,14 @@ fn a_login_agent_whose_binary_is_gone_is_reported() {
     )
     .unwrap();
     let want = format!(
-        "start at login is on, but it runs {}, which no longer exists; fix: `dps start --login` \
-         with this dps, or `dps stop --login`",
+        "start at login is on, but it runs {}, which no longer exists; fix: `tonewell start --login` \
+         with this tonewell, or `tonewell stop --login`",
         gone.display()
     );
     let status = stdout_line(&dir.run(&["status"]));
     assert!(status.contains(&want), "{status}");
 
-    // A held lock stands in for a running dps, so the doctor makes no tap.
+    // A held lock stands in for a running tonewell, so the doctor makes no tap.
     let _lock = dir.hold_live_lock("foreground");
     let out = dir.run(&["doctor", "--preset", "music"]);
     assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
@@ -2358,7 +2369,7 @@ fn doctor_reports_each_check_and_fails_only_on_what_live_mode_needs() {
     let pid = std::process::id();
 
     let out = dir
-        .dps()
+        .tonewell()
         .args(["doctor", "--profile", path_str(&bad)])
         .env("PATH", dir.empty())
         .output()
@@ -2390,13 +2401,13 @@ fn doctor_reports_each_check_and_fails_only_on_what_live_mode_needs() {
     assert!(lines[2].starts_with("problem  settings: "), "{report}");
     assert!(lines[2].contains("nonsense"), "{report}");
     assert!(
-        lines[2].ends_with("(`dps profile` prints the default with every key)"),
+        lines[2].ends_with("(`tonewell profile` prints the default with every key)"),
         "{report}"
     );
     assert_eq!(
         lines[3],
         format!(
-            "ok       capture: not checked: dps live is already running in the foreground (pid \
+            "ok       capture: not checked: tonewell live is already running in the foreground (pid \
              {pid}), and a second tap would hear its output"
         )
     );
@@ -2410,7 +2421,7 @@ fn doctor_reports_each_check_and_fails_only_on_what_live_mode_needs() {
 
     // Without ffmpeg, which live mode does not need, all is well.
     let out = dir
-        .dps()
+        .tonewell()
         .args(["doctor", "--preset", "music"])
         .env("PATH", dir.empty())
         .output()
@@ -2429,8 +2440,8 @@ fn help_lists_the_background_commands() {
         "stop",
         "status",
         "doctor",
-        "dps start ",
-        "dps doctor ",
+        "tonewell start ",
+        "tonewell doctor ",
     ] {
         assert!(help.contains(want), "{want} not in\n{help}");
     }
@@ -2451,7 +2462,7 @@ fn wait_for_exit(mut child: std::process::Child, limit: Duration) -> Output {
         }
         if Instant::now() > deadline {
             let _ = child.kill();
-            panic!("dps did not exit within {limit:?}");
+            panic!("tonewell did not exit within {limit:?}");
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -2571,7 +2582,7 @@ fn a_signal_stops_process_and_removes_its_files() {
     let flac = dir.join("in.flac");
     ffmpeg(&["-i", path_str(&wav), path_str(&flac)]);
     fs::remove_file(&wav).unwrap();
-    let output = dir.write("in.dps.flac", "an older file in the way");
+    let output = dir.write("in.tonewell.flac", "an older file in the way");
     let path = format!(
         "{}:{}",
         stalling_ffmpeg(&dir).display(),
@@ -2587,7 +2598,7 @@ fn a_signal_stops_process_and_removes_its_files() {
     ] {
         let _ = fs::remove_file(&pid_file);
         let child = dir
-            .dps()
+            .tonewell()
             .env("PATH", &path)
             .env("STALL_ON", stage)
             .env("STALL_PID", &pid_file)
@@ -2612,7 +2623,10 @@ fn a_signal_stops_process_and_removes_its_files() {
         assert_user_error(&out, &format!("stopped by {name}; nothing was written"));
         assert!(!alive(ffmpeg_pid), "{stage}: ffmpeg is still running");
         assert!(dir.temp_names().is_empty(), "{:?}", dir.temp_names());
-        assert_eq!(dir.names(), ["identity.toml", "in.dps.flac", "in.flac"]);
+        assert_eq!(
+            dir.names(),
+            ["identity.toml", "in.flac", "in.tonewell.flac"]
+        );
         assert_eq!(fs::read(&output).unwrap(), b"an older file in the way");
     }
 }
@@ -2693,7 +2707,7 @@ fn pcm_formats_keep_the_sample_format_and_a_lower_one_is_reported() {
         assert_eq!(info["bits_per_raw_sample"], bits, "{extension}");
     }
 
-    // FLAC as ffmpeg writes it holds 24 bits, and dps works in 32-bit float.
+    // FLAC as ffmpeg writes it holds 24 bits, and tonewell works in 32-bit float.
     let s32 = dir.join("s32.wav");
     write_wav(&s32, int_spec(2, 48_000, 32), &signal(4800, 2));
     let flac = dir.join("deep.flac");
@@ -2717,12 +2731,12 @@ fn pcm_formats_keep_the_sample_format_and_a_lower_one_is_reported() {
     for (input, output, want) in [
         (
             &flac,
-            dir.join("deep.dps.flac"),
+            dir.join("deep.tonewell.flac"),
             "has 24-bit integer samples, less than the 32-bit integer samples of",
         ),
         (
             &f64_wav,
-            dir.join("double.dps.wav"),
+            dir.join("double.tonewell.wav"),
             "has 32-bit float samples, less than the 64-bit float samples of",
         ),
     ] {
@@ -2779,7 +2793,7 @@ fn cover_art_is_kept_where_the_format_holds_it_and_drops_are_reported() {
         ffmpeg(&args);
         assert_eq!(pictures(&input), "png,1\n", "{extension}");
 
-        let output = dir.join(&format!("song.dps.{extension}"));
+        let output = dir.join(&format!("song.tonewell.{extension}"));
         assert_quiet_success(&dir.process(&input, &output, Some(&identity)));
         assert_eq!(pictures(&output), "png,1\n", "{extension}");
     }
@@ -2828,12 +2842,12 @@ fn only_the_first_audio_stream_is_processed_and_the_rest_reported() {
         path_str(&input),
     ]);
     let out = dir
-        .dps()
+        .tonewell()
         .args(["process", path_str(&input), "-p", path_str(&identity)])
         .output()
         .unwrap();
     assert_success(&out);
-    let output = dir.join("two.dps.mka");
+    let output = dir.join("two.tonewell.mka");
     assert_eq!(
         stderr(&out),
         format!(
@@ -2929,14 +2943,14 @@ fn the_same_extension_keeps_the_codec_and_its_bit_rate() {
         (&flac_mka, "flac"),
     ] {
         let out = dir
-            .dps()
+            .tonewell()
             .args(["process", path_str(input), "-p", path_str(&identity)])
             .output()
             .unwrap();
         assert_quiet_success(&out);
         let name = input.file_name().unwrap().to_str().unwrap();
         let (stem, extension) = name.split_once('.').unwrap();
-        let output = dir.join(&format!("{stem}.dps.{extension}"));
+        let output = dir.join(&format!("{stem}.tonewell.{extension}"));
         assert_eq!(
             ffprobe(&output, "stream=codec_name")["codec_name"],
             codec,
@@ -2954,7 +2968,7 @@ fn the_same_extension_keeps_the_codec_and_its_bit_rate() {
         }
     }
     // Ogg keeps its tags on the stream.
-    let output = dir.join("in.dps.opus");
+    let output = dir.join("in.tonewell.opus");
     let tags = Command::new("ffprobe")
         .args([
             "-v",
@@ -2993,13 +3007,13 @@ fn awkward_file_names_reach_ffmpeg_as_files() {
             path_str(&input),
         ]);
         let out = dir
-            .dps()
+            .tonewell()
             .current_dir(&dir.work)
             .args(["process", "-p", path_str(&identity), "--", name])
             .output()
             .unwrap();
         assert_quiet_success(&out);
-        let output = dir.join(&name.replace(".flac", ".dps.flac"));
+        let output = dir.join(&name.replace(".flac", ".tonewell.flac"));
         assert_eq!(
             ffprobe(&output, "format_tags=title")["title"],
             "Odd",
@@ -3034,21 +3048,21 @@ fn non_finite_input_is_reported_as_the_inputs_problem() {
 }
 
 #[test]
-fn an_input_named_like_dps_output_needs_an_output_name() {
-    let dir = TempDir::new("dps-dps");
+fn an_input_named_like_tonewell_output_needs_an_output_name() {
+    let dir = TempDir::new("tonewell-tonewell");
     let identity = dir.write("identity.toml", IDENTITY);
-    let input = dir.join("song.dps.wav");
+    let input = dir.join("song.tonewell.wav");
     write_wav(&input, int_spec(2, 44_100, 16), &signal(441, 2));
     let out = dir
-        .dps()
+        .tonewell()
         .args(["process", path_str(&input), "-p", path_str(&identity)])
         .output()
         .unwrap();
     assert_user_error(
         &out,
-        "looks like dps output already; to process it again, name the output",
+        "looks like tonewell output already; to process it again, name the output",
     );
-    assert_eq!(dir.names(), ["identity.toml", "song.dps.wav"]);
+    assert_eq!(dir.names(), ["identity.toml", "song.tonewell.wav"]);
     let again = dir.join("song.again.wav");
     assert_quiet_success(&dir.process(&input, &again, Some(&identity)));
 }
@@ -3056,7 +3070,7 @@ fn an_input_named_like_dps_output_needs_an_output_name() {
 #[test]
 fn process_help_states_what_is_kept() {
     let dir = TempDir::new("help-process");
-    let help = stdout(&dir.dps().args(["process", "--help"]).output().unwrap());
+    let help = stdout(&dir.tonewell().args(["process", "--help"]).output().unwrap());
     for want in [
         "channel layout",
         "decoding error stops the run",
@@ -3075,7 +3089,7 @@ fn a_settings_file_that_cannot_be_created_is_reported() {
     let dir = TempDir::new("settings-unwritable");
     let input = dir.join("in.wav");
     write_wav(&input, int_spec(1, 44_100, 16), &signal(100, 1));
-    let config = dir.root.join("config/dps");
+    let config = dir.root.join("config/tonewell");
     fs::create_dir_all(&config).unwrap();
     #[cfg(unix)]
     {
@@ -3099,9 +3113,9 @@ fn a_relative_config_home_is_ignored_and_a_relative_home_refused() {
     let dir = TempDir::new("relative-dirs");
     let input = dir.join("in.wav");
     write_wav(&input, int_spec(1, 44_100, 16), &signal(100, 1));
-    let in_home = dir.root.join("home/.config/dps/profile.toml");
+    let in_home = dir.root.join("home/.config/tonewell/profile.toml");
     let out = dir
-        .dps()
+        .tonewell()
         .current_dir(&dir.work)
         .env("XDG_CONFIG_HOME", "config")
         .args(["process", "in.wav", "a.wav"])
@@ -3117,7 +3131,7 @@ fn a_relative_config_home_is_ignored_and_a_relative_home_refused() {
     assert!(!dir.work.join("config").exists());
 
     let out = dir
-        .dps()
+        .tonewell()
         .current_dir(&dir.root)
         .env("HOME", "home")
         .env_remove("XDG_CONFIG_HOME")
@@ -3145,7 +3159,7 @@ fn state_in(pid: u32, phase: &str, extra: &str) -> String {
 /// `launchctl print` for a running job with the music preset.
 #[cfg(target_os = "macos")]
 fn running_print(pid: u32) -> String {
-    let exe = this_dps();
+    let exe = this_tonewell();
     launchd_print(
         Some(pid),
         "(never exited)",
@@ -3159,8 +3173,8 @@ fn doctor_reports_the_output_it_is_told_about_not_this_machines() {
     let dir = TempDir::new("doctor-output");
     let _lock = dir.hold_live_lock("foreground");
     let out = dir
-        .dps()
-        .env("DPS_TEST_OUTPUT", "there is no default output device")
+        .tonewell()
+        .env("TONEWELL_TEST_OUTPUT", "there is no default output device")
         .args(["doctor", "--preset", "voice"])
         .output()
         .unwrap();
@@ -3180,8 +3194,8 @@ fn doctor_reports_the_output_it_is_told_about_not_this_machines() {
 
     // A low rate skips EQ bands, which is not a problem.
     let out = dir
-        .dps()
-        .env("DPS_TEST_OUTPUT", "Phone Line@8000")
+        .tonewell()
+        .env("TONEWELL_TEST_OUTPUT", "Phone Line@8000")
         .args(["doctor", "--preset", "voice"])
         .output()
         .unwrap();
@@ -3214,7 +3228,7 @@ fn doctor_reports_an_ffmpeg_that_does_not_run() {
         fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
     }
     let out = dir
-        .dps()
+        .tonewell()
         .env("PATH", &bin)
         .args(["doctor", "--preset", "music"])
         .output()
@@ -3238,7 +3252,7 @@ fn doctor_without_home_says_how_to_fix_it() {
     let dir = TempDir::new("doctor-no-home");
     let fix = "HOME is not set; set HOME to your home directory";
     let out = dir
-        .dps()
+        .tonewell()
         .env_remove("HOME")
         .args(["doctor", "--preset", "music"])
         .output()
@@ -3260,7 +3274,7 @@ fn doctor_without_home_says_how_to_fix_it() {
     assert!(dir.launchctl_calls().is_empty());
 
     let out = dir
-        .dps()
+        .tonewell()
         .env_remove("HOME")
         .env_remove("XDG_CONFIG_HOME")
         .arg("doctor")
@@ -3289,14 +3303,15 @@ fn the_service_run_refuses_to_start_beside_another_live_run() {
         let out = dir.run(&["live", "--service", "--profile", path_str(&bad)]);
         assert_user_error(
             &out,
-            &format!("dps is already running in the background (pid {pid})"),
+            &format!("tonewell is already running in the background (pid {pid})"),
         );
         // That run owns the state file.
         assert!(!state.exists());
     }
     let _lock = dir.hold_live_lock("foreground");
     let out = dir.run(&["live", "--service", "--profile", path_str(&bad)]);
-    let want = format!("dps live is already running in the foreground (pid {pid}); quit it first");
+    let want =
+        format!("tonewell live is already running in the foreground (pid {pid}); quit it first");
     assert_user_error(&out, &want);
     let text = fs::read_to_string(&state).unwrap();
     assert!(text.contains("phase = \"failed\""), "{text}");
@@ -3315,13 +3330,13 @@ fn start_waits_for_the_service_to_start_audio() {
     let started = Instant::now();
     assert_eq!(
         stdout_line(&dir.run(&["start", "--preset", "music"])),
-        "dps is running in the background on Test Out at 48000 Hz with preset music; `dps stop` \
+        "tonewell is running in the background on Test Out at 48000 Hz with preset music; `tonewell stop` \
          stops it\n"
     );
     assert!(started.elapsed() >= Duration::from_millis(900));
     assert_eq!(
         stdout_line(&dir.run(&["stop"])).split_once(',').unwrap().0,
-        "stopped dps"
+        "stopped tonewell"
     );
     assert!(!alive(pid));
 }
@@ -3338,9 +3353,9 @@ fn start_gives_up_on_a_service_that_never_starts_audio() {
     assert_user_error(
         &out,
         &format!(
-            "dps started in the background but has not started processing audio after 10 s; see \
-             `dps status` and {}",
-            dir.home("Library/Logs/dps.log").display()
+            "tonewell started in the background but has not started processing audio after 10 s; see \
+             `tonewell status` and {}",
+            dir.home("Library/Logs/tonewell.log").display()
         ),
     );
     assert!(started.elapsed() >= Duration::from_secs(10));
@@ -3351,7 +3366,7 @@ fn start_gives_up_on_a_service_that_never_starts_audio() {
 #[test]
 fn start_waits_to_hear_sound_while_other_apps_play() {
     let dir = TempDir::new("bg-hear");
-    let agent = dir.home("Library/LaunchAgents/dev.dps.live.plist");
+    let agent = dir.home("Library/LaunchAgents/dev.tonewell.live.plist");
     fs::create_dir_all(agent.parent().unwrap()).unwrap();
     let earlier = "<plist>an earlier start at login that worked</plist>\n";
     fs::write(&agent, earlier).unwrap();
@@ -3368,14 +3383,14 @@ fn start_waits_to_hear_sound_while_other_apps_play() {
         &state_in(pid, "failed", "problem = \"the tap heard only silence\"\n"),
     );
     let out = dir
-        .dps()
-        .env("DPS_TEST_OTHERS_PLAYING", "1")
+        .tonewell()
+        .env("TONEWELL_TEST_OTHERS_PLAYING", "1")
         .args(["start", "--login", "--preset", "music"])
         .output()
         .unwrap();
     assert_user_error(
         &out,
-        "dps could not start in the background: the tap heard only silence; the earlier start at \
+        "tonewell could not start in the background: the tap heard only silence; the earlier start at \
          login was kept",
     );
     assert_eq!(fs::read_to_string(&agent).unwrap(), earlier);
@@ -3392,12 +3407,12 @@ fn start_waits_to_hear_sound_while_other_apps_play() {
     dir.stub("later.state", &state_in(pid, "running", "heard = true\n"));
     let started = Instant::now();
     let out = dir
-        .dps()
-        .env("DPS_TEST_OTHERS_PLAYING", "1")
+        .tonewell()
+        .env("TONEWELL_TEST_OTHERS_PLAYING", "1")
         .args(["start", "--preset", "music"])
         .output()
         .unwrap();
-    assert!(stdout_line(&out).starts_with("dps is running in the background on Test Out"));
+    assert!(stdout_line(&out).starts_with("tonewell is running in the background on Test Out"));
     assert!(started.elapsed() >= Duration::from_millis(900));
     let _ = Command::new("/bin/kill").arg(pid.to_string()).status();
 }
@@ -3406,10 +3421,10 @@ fn start_waits_to_hear_sound_while_other_apps_play() {
 #[test]
 fn a_failed_start_at_login_keeps_the_earlier_one() {
     let dir = TempDir::new("bg-login-kept");
-    let exe = this_dps();
+    let exe = this_tonewell();
     let args = [&*exe, "live", "--service", "--preset", "voice"];
     dir.stub("on-bootstrap.print", &launchd_print(None, "1", &args));
-    let agent = dir.home("Library/LaunchAgents/dev.dps.live.plist");
+    let agent = dir.home("Library/LaunchAgents/dev.tonewell.live.plist");
     fs::create_dir_all(agent.parent().unwrap()).unwrap();
     let earlier = launchd_print(
         None,
@@ -3422,7 +3437,7 @@ fn a_failed_start_at_login_keeps_the_earlier_one() {
     let err = stderr(&out);
     assert_user_error(
         &out,
-        "dps could not start in the background: it ended with exit code 1",
+        "tonewell could not start in the background: it ended with exit code 1",
     );
     assert!(
         err.ends_with("; the earlier start at login was kept\n"),
@@ -3436,7 +3451,7 @@ fn a_failed_start_at_login_keeps_the_earlier_one() {
 fn start_unloads_a_job_that_has_ended_before_loading_it_again() {
     let dir = TempDir::new("bg-ended");
     let target = service_target();
-    let exe = this_dps();
+    let exe = this_tonewell();
     let args = [&*exe, "live", "--service", "--preset", "music"];
     dir.stub("launchctl.print", &launchd_print(None, "0", &args));
     let pid = orphan_sleeper();
@@ -3445,7 +3460,7 @@ fn start_unloads_a_job_that_has_ended_before_loading_it_again() {
 
     assert!(
         stdout_line(&dir.run(&["start", "--preset", "music"]))
-            .starts_with("dps is running in the background on Test Out at 48000 Hz")
+            .starts_with("tonewell is running in the background on Test Out at 48000 Hz")
     );
     let calls = dir.launchctl_calls();
     let bootout = calls.iter().position(|c| *c == format!("bootout {target}"));
@@ -3466,7 +3481,7 @@ fn start_says_when_the_running_service_waits_for_permission() {
     let out = dir.run(&["start", "--preset", "music"]);
     assert_user_error(
         &out,
-        "dps is already running in the background but is waiting for permission to record \
+        "tonewell is already running in the background but is waiting for permission to record \
          system audio: click Allow in the macOS prompt",
     );
     assert!(
@@ -3486,8 +3501,8 @@ fn status_tells_a_starting_service_from_an_unreadable_state_file() {
     let state = dir.support("live.state");
     fs::create_dir_all(state.parent().unwrap()).unwrap();
     let unreadable = format!(
-        "dps is running in the background (pid {pid}) with preset music, but its state file {} \
-         is missing or unreadable, so how it is doing is unknown; fix: `dps stop`, then `dps \
+        "tonewell is running in the background (pid {pid}) with preset music, but its state file {} \
+         is missing or unreadable, so how it is doing is unknown; fix: `tonewell stop`, then `tonewell \
          start`; start at login is off\n",
         state.display()
     );
@@ -3496,7 +3511,7 @@ fn status_tells_a_starting_service_from_an_unreadable_state_file() {
     assert_eq!(
         stdout_line(&dir.run(&["status"])),
         format!(
-            "dps is starting in the background (pid {pid}) with preset music; start at login is off\n"
+            "tonewell is starting in the background (pid {pid}) with preset music; start at login is off\n"
         )
     );
     {
@@ -3518,7 +3533,7 @@ fn stop_waits_for_the_process_to_exit() {
     dir.stub("bootout.mode", "leave-process");
     assert_eq!(
         stdout_line(&dir.run(&["stop"])),
-        "stopped dps in the background\n"
+        "stopped tonewell in the background\n"
     );
     assert!(!alive(pid));
 }
@@ -3532,7 +3547,7 @@ fn a_stop_that_times_out_keeps_the_files_until_the_run_exits() {
     dir.stub("launchctl.print", &running_print(pid));
     dir.stub("bootout.mode", "leave-process");
     let state = dir.support("live.state");
-    let plist = dir.support("dev.dps.live.plist");
+    let plist = dir.support("dev.tonewell.live.plist");
     fs::create_dir_all(state.parent().unwrap()).unwrap();
     fs::write(&state, running_state(pid, "preset music")).unwrap();
     fs::write(&plist, "<plist/>").unwrap();
@@ -3540,15 +3555,15 @@ fn a_stop_that_times_out_keeps_the_files_until_the_run_exits() {
 
     assert_user_error(
         &dir.run(&["stop"]),
-        &format!("dps in the background (pid {pid}) did not stop within 10 s"),
+        &format!("tonewell in the background (pid {pid}) did not stop within 10 s"),
     );
     assert!(state.exists() && plist.exists());
     // launchd has let go of it, but it still runs.
     assert_user_error(
         &dir.run(&["stop"]),
         &format!(
-            "dps in the background (pid {me}) is still running although launchd has unloaded \
-             it; run `dps stop` again once it has stopped, or end it with `kill {me}`"
+            "tonewell in the background (pid {me}) is still running although launchd has unloaded \
+             it; run `tonewell stop` again once it has stopped, or end it with `kill {me}`"
         ),
     );
     assert!(state.exists() && plist.exists());
@@ -3557,7 +3572,7 @@ fn a_stop_that_times_out_keeps_the_files_until_the_run_exits() {
     drop(lock);
     assert_eq!(
         stdout_line(&dir.run(&["stop"])),
-        "dps is not running in the background\n"
+        "tonewell is not running in the background\n"
     );
     assert!(!state.exists() && !plist.exists());
 }
@@ -3566,7 +3581,7 @@ fn a_stop_that_times_out_keeps_the_files_until_the_run_exits() {
 #[test]
 fn launchctl_failures_are_told_apart() {
     let dir = TempDir::new("bg-launchctl");
-    let idle = "dps is not running in the background; start at login is off\n";
+    let idle = "tonewell is not running in the background; start at login is off\n";
     // launchctl says there is no such job by its exit code, its message, or
     // both.
     for mode in ["code-only", "message-only"] {
@@ -3587,19 +3602,19 @@ fn launchctl_failures_are_told_apart() {
     let _ = Command::new("/bin/kill").arg(pid.to_string()).status();
     assert_eq!(
         stdout_line(&dir.run(&["stop"])),
-        "stopped dps in the background\n"
+        "stopped tonewell in the background\n"
     );
 
     // One that fails with the job still there is not.
     let pid = orphan_sleeper();
     dir.stub("launchctl.print", &running_print(pid));
     dir.stub("bootout.mode", "fail-stuck");
-    let plist = dir.support("dev.dps.live.plist");
+    let plist = dir.support("dev.tonewell.live.plist");
     fs::create_dir_all(plist.parent().unwrap()).unwrap();
     fs::write(&plist, "<plist/>").unwrap();
     assert_user_error(
         &dir.run(&["stop"]),
-        "launchctl could not stop dev.dps.live: Boot-out failed: 5: Input/output error",
+        "launchctl could not stop dev.tonewell.live: Boot-out failed: 5: Input/output error",
     );
     assert!(plist.exists());
     let _ = Command::new("/bin/kill").arg(pid.to_string()).status();

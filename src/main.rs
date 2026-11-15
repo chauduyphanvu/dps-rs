@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use dps::{Processor, Profile};
 use hound::WavSpec;
+use tonewell::{Processor, Profile};
 
 // live.rs reloads its watched file through `super::load_profile`.
 #[cfg(target_os = "macos")]
@@ -34,47 +34,47 @@ const BLOCK_FRAMES: usize = 4096;
 #[cfg(target_os = "macos")]
 const EXAMPLES: &str = "\
 Examples:
-  dps                       Process system audio live with your settings file
-  dps live --preset music   The same with the built-in music preset
-  dps start                 The same in the background (dps status, dps stop)
-  dps bypass                Toggle bypass in the running dps
-  dps use night             Play the night preset in the running dps from now on
-  dps set eq.gains_db[3] --by +2
-                            Raise the fourth EQ band 2 dB (dps get eq prints the EQ)
-  dps doctor                Check that live mode can work here
-  dps devices               List the outputs and the profile each plays with
-  dps devices assign        Give the default output a profile of its own
-  dps process song.flac     Write song.dps.flac (formats other than WAV use ffmpeg)
-  dps import hd650.txt      Import an AutoEQ headphone correction (ParametricEQ.txt)
-  dps calibrate             Measure your speakers with the microphone and correct them
-  dps presets               List the built-in presets
-  dps profile               Print the default profile as TOML
+  tonewell                       Process system audio live with your settings file
+  tonewell live --preset music   The same with the built-in music preset
+  tonewell start                 The same in the background (tonewell status, tonewell stop)
+  tonewell bypass                Toggle bypass in the running tonewell
+  tonewell use night             Play the night preset in the running tonewell from now on
+  tonewell set eq.gains_db[3] --by +2
+                                 Raise the fourth EQ band 2 dB (tonewell get eq prints the EQ)
+  tonewell doctor                Check that live mode can work here
+  tonewell devices               List the outputs and the profile each plays with
+  tonewell devices assign        Give the default output a profile of its own
+  tonewell process song.flac     Write song.tonewell.flac (formats other than WAV use ffmpeg)
+  tonewell import hd650.txt      Import an AutoEQ headphone correction (ParametricEQ.txt)
+  tonewell calibrate             Measure your speakers with the microphone and correct them
+  tonewell presets               List the built-in presets
+  tonewell profile               Print the default profile as TOML
 
-Settings file: $XDG_CONFIG_HOME/dps/profile.toml, else ~/.config/dps/profile.toml,
+Settings file: $XDG_CONFIG_HOME/tonewell/profile.toml, else ~/.config/tonewell/profile.toml,
 created with the default profile on first use; --profile or --preset overrides it.
-config.toml beside it gives output devices profiles of their own (dps devices).";
+config.toml beside it gives output devices profiles of their own (tonewell devices).";
 
 #[cfg(not(target_os = "macos"))]
 const EXAMPLES: &str = "\
 Examples:
-  dps process song.flac     Write song.dps.flac (formats other than WAV use ffmpeg)
-  dps process song.wav --preset music
-  dps set eq.gains_db[3] --by +2
-                            Raise the fourth EQ band 2 dB (dps get eq prints the EQ)
-  dps import hd650.txt      Import an AutoEQ headphone correction (ParametricEQ.txt)
-  dps presets               List the built-in presets
-  dps profile               Print the default profile as TOML
-  dps doctor                Check the settings and ffmpeg
+  tonewell process song.flac     Write song.tonewell.flac (formats other than WAV use ffmpeg)
+  tonewell process song.wav --preset music
+  tonewell set eq.gains_db[3] --by +2
+                                 Raise the fourth EQ band 2 dB (tonewell get eq prints the EQ)
+  tonewell import hd650.txt      Import an AutoEQ headphone correction (ParametricEQ.txt)
+  tonewell presets               List the built-in presets
+  tonewell profile               Print the default profile as TOML
+  tonewell doctor                Check the settings and ffmpeg
 
-Settings file: $XDG_CONFIG_HOME/dps/profile.toml, else ~/.config/dps/profile.toml,
+Settings file: $XDG_CONFIG_HOME/tonewell/profile.toml, else ~/.config/tonewell/profile.toml,
 created with the default profile on first use; --profile or --preset overrides it.";
 
-/// Digital Power Station processing for system audio and audio files.
+/// Levels, shapes and limits system audio and audio files.
 #[derive(Parser)]
 #[command(version, after_help = EXAMPLES)]
 #[cfg_attr(target_os = "macos", command(args_conflicts_with_subcommands = true))]
 struct Cli {
-    /// Bare `dps` runs live with these.
+    /// Bare `tonewell` runs live with these.
     #[cfg(target_os = "macos")]
     #[command(flatten)]
     source: SourceArgs,
@@ -95,7 +95,7 @@ struct SourceArgs {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Process system audio live until Ctrl-C (what bare `dps` does).
+    /// Process system audio live until Ctrl-C (what bare `tonewell` does).
     ///
     /// Processes all system audio in real time and plays it on the default
     /// output device. Needs macOS 14.2 or later.
@@ -103,16 +103,16 @@ enum Command {
     Live {
         #[command(flatten)]
         source: SourceArgs,
-        /// Run as the background service `dps start` sets up.
+        /// Run as the background service `tonewell start` sets up.
         #[arg(long, hide = true)]
         service: bool,
     },
     /// Process system audio live in the background.
     ///
     /// Keeps running after the terminal closes, reloading the settings file
-    /// or --profile file whenever it is saved, until `dps stop`. macOS asks
-    /// whether dps itself may record system audio, again after each rebuild
-    /// or reinstall. Messages go to ~/Library/Logs/dps.log.
+    /// or --profile file whenever it is saved, until `tonewell stop`. macOS asks
+    /// whether tonewell itself may record system audio, again after each rebuild
+    /// or reinstall. Messages go to ~/Library/Logs/tonewell.log.
     #[cfg(target_os = "macos")]
     Start {
         #[command(flatten)]
@@ -128,13 +128,13 @@ enum Command {
         #[arg(long)]
         login: bool,
     },
-    /// Say whether dps is processing in the background, and how.
+    /// Say whether tonewell is processing in the background, and how.
     #[cfg(target_os = "macos")]
     Status,
-    /// Turn bypass on or off in the running dps.
+    /// Turn bypass on or off in the running tonewell.
     ///
     /// The bypass the tuner's b key toggles: the unprocessed signal, matched
-    /// to the processed level. Works on `dps live` and on `dps start`; the
+    /// to the processed level. Works on `tonewell live` and on `tonewell start`; the
     /// tuner, if one is on screen, shows it. Refused while the tuner runs a
     /// blind test, which keeps bypass off.
     #[cfg(target_os = "macos")]
@@ -142,16 +142,16 @@ enum Command {
         #[arg(value_enum, default_value_t = control::Switch::Toggle)]
         state: control::Switch,
     },
-    /// Play a preset or a profile file in the running dps from now on.
+    /// Play a preset or a profile file in the running tonewell from now on.
     ///
-    /// The running dps (`dps live` or `dps start`) plays NAME_OR_FILE on
+    /// The running tonewell (`tonewell live` or `tonewell start`) plays NAME_OR_FILE on
     /// every output device, as if it had been started with --preset or
     /// --profile: a built-in preset if NAME_OR_FILE names one, else a
     /// profile file. --settings goes back to the settings file and each
-    /// output device's own profile, as a plain `dps` plays. Unsaved changes
+    /// output device's own profile, as a plain `tonewell` plays. Unsaved changes
     /// in the tuner are dropped, and a profile that does not fit the
-    /// output's sample rate is refused. It lasts until that run ends: `dps
-    /// start` and start at login keep starting dps as they were told to.
+    /// output's sample rate is refused. It lasts until that run ends: `tonewell
+    /// start` and start at login keep starting tonewell as they were told to.
     #[cfg(target_os = "macos")]
     Use {
         /// A built-in preset, or else a profile file.
@@ -166,7 +166,7 @@ enum Command {
         #[arg(long)]
         settings: bool,
     },
-    /// Check what dps needs here and say how to fix what is missing.
+    /// Check what tonewell needs here and say how to fix what is missing.
     Doctor {
         #[command(flatten)]
         source: SourceArgs,
@@ -174,7 +174,7 @@ enum Command {
     /// List the output devices and the profile live mode plays on each.
     ///
     /// Live mode with the settings file follows the output: a device given a
-    /// profile of its own (`dps devices assign`) plays with that profile,
+    /// profile of its own (`tonewell devices assign`) plays with that profile,
     /// every other device with the settings file. The assignments are kept
     /// in config.toml beside the settings file; --profile and --preset use
     /// one profile on every device.
@@ -197,7 +197,7 @@ enum Command {
     Process {
         /// The audio file to process.
         input: PathBuf,
-        /// [default: INPUT with .dps before its extension]
+        /// [default: INPUT with .tonewell before its extension]
         output: Option<PathBuf>,
         #[command(flatten)]
         source: SourceArgs,
@@ -209,9 +209,9 @@ enum Command {
     /// fills the [correction] table of the settings file (or of --profile)
     /// with that file's preamp and filters and turns it on, so the EQ and
     /// every other value stay as they are. On macOS, a default output device
-    /// with a profile of its own (`dps devices`) gets it in that profile
+    /// with a profile of its own (`tonewell devices`) gets it in that profile
     /// instead. Importing again replaces the earlier correction. The profile
-    /// file is rewritten, so comments in it are not kept; a running dps
+    /// file is rewritten, so comments in it are not kept; a running tonewell
     /// picks the change up on its own.
     Import {
         /// The ParametricEQ.txt file to import.
@@ -223,8 +223,8 @@ enum Command {
     /// Print one value of the profile, or all of it.
     ///
     /// Reads the settings file (or --profile); on macOS, a default output
-    /// device with a profile of its own (`dps devices`) has that profile
-    /// read instead. KEY is a path into the profile's TOML (`dps profile`
+    /// device with a profile of its own (`tonewell devices`) has that profile
+    /// read instead. KEY is a path into the profile's TOML (`tonewell profile`
     /// prints every key), with [N] for a position in a list, from 0:
     /// output_gain_db, leveler.enabled, eq.gains_db[3],
     /// correction.bands[0].gain_db. A single value prints as it is, a table
@@ -238,11 +238,11 @@ enum Command {
     },
     /// Change one value of the profile.
     ///
-    /// Sets KEY, a path as `dps get` takes it, in the profile `dps get`
+    /// Sets KEY, a path as `tonewell get` takes it, in the profile `tonewell get`
     /// reads, to VALUE or by --by. VALUE is a number, true or false (or on
     /// or off), or for correction.bands[N].kind peaking, low_shelf or
     /// high_shelf. A value out of its range is refused and changes nothing.
-    /// The file is rewritten, so comments in it are not kept; a running dps
+    /// The file is rewritten, so comments in it are not kept; a running tonewell
     /// picks the change up on its own.
     Set {
         /// The key, such as eq.gains_db[3].
@@ -273,11 +273,11 @@ enum Command {
     /// input device (the Mac's microphone), and fits up to 8 peaking filters
     /// that flatten what was heard, with at most 6 dB of boost and 10 dB of
     /// cut. They go into the [correction] table of the settings file (or of
-    /// --profile), turned on, as `dps import` does. It takes about 35 s: put
+    /// --profile), turned on, as `tonewell import` does. It takes about 35 s: put
     /// the microphone where you listen and keep the room quiet; Ctrl-C stops
-    /// it and writes nothing. --level is the only loudness control: dps
-    /// leaves the system volume alone. Quit dps live, or stop the background
-    /// run with `dps stop`, first. The result corrects the speakers as this
+    /// it and writes nothing. --level is the only loudness control: tonewell
+    /// leaves the system volume alone. Quit tonewell live, or stop the background
+    /// run with `tonewell stop`, first. The result corrects the speakers as this
     /// microphone hears them at this position.
     #[cfg(target_os = "macos")]
     Calibrate {
@@ -289,8 +289,8 @@ enum Command {
         #[arg(
             long,
             value_name = "DB",
-            default_value_t = dps::calibrate::DEFAULT_LEVEL_DB,
-            value_parser = dps::calibrate::parse_level,
+            default_value_t = tonewell::calibrate::DEFAULT_LEVEL_DB,
+            value_parser = tonewell::calibrate::parse_level,
             allow_negative_numbers = true
         )]
         level: f64,
@@ -386,7 +386,7 @@ impl SourceArgs {
     }
 }
 
-/// The profile `dps import`, `calibrate`, `get` and `set` work on: --profile,
+/// The profile `tonewell import`, `calibrate`, `get` and `set` work on: --profile,
 /// or on macOS the profile of the default output device if it has its own
 /// (else the settings file), with a sentence saying why.
 fn edit_target(
@@ -521,10 +521,10 @@ fn process(input: &Path, output: Option<PathBuf>, source: &Source) -> Result<(),
     Ok(())
 }
 
-/// `<stem>.dps.<extension>` beside the input, or `<name>.dps.wav` for an
-/// input without an extension. An input already named `<stem>.dps.<ext>`
-/// gets none, so that running dps over a folder twice does not process its
-/// own output again into `.dps.dps.` files.
+/// `<stem>.tonewell.<extension>` beside the input, or `<name>.tonewell.wav` for an
+/// input without an extension. An input already named `<stem>.tonewell.<ext>`
+/// gets none, so that running tonewell over a folder twice does not process its
+/// own output again into `.tonewell.tonewell.` files.
 fn default_output(input: &Path) -> Result<PathBuf, String> {
     let name = input
         .file_name()
@@ -533,11 +533,11 @@ fn default_output(input: &Path) -> Result<PathBuf, String> {
         .file_stem()
         .map(Path::new)
         .and_then(Path::extension)
-        .is_some_and(|e| e.eq_ignore_ascii_case("dps"))
+        .is_some_and(|e| e.eq_ignore_ascii_case("tonewell"))
         && input.extension().is_some()
     {
         return Err(format!(
-            "{} looks like dps output already; to process it again, name the output",
+            "{} looks like tonewell output already; to process it again, name the output",
             input.display()
         ));
     }
@@ -545,12 +545,12 @@ fn default_output(input: &Path) -> Result<PathBuf, String> {
     match (input.file_stem(), input.extension()) {
         (Some(stem), Some(extension)) => {
             out.push(stem);
-            out.push(".dps.");
+            out.push(".tonewell.");
             out.push(extension);
         }
         _ => {
             out.push(name);
-            out.push(".dps.wav");
+            out.push(".tonewell.wav");
         }
     }
     Ok(input.with_file_name(out))
@@ -694,7 +694,7 @@ fn run_live(args: SourceArgs, background: bool, dirs: &Dirs) -> Result<(), Strin
 /// A profile file, or else the settings file, is watched and saved to. A
 /// preset is not watched, and edits to it are saved to the settings file.
 /// Only the settings file gives way to an output device's own profile.
-/// `dps use` follows the same rules.
+/// `tonewell use` follows the same rules.
 #[cfg(target_os = "macos")]
 fn live_options(source: Source, dirs: &Dirs) -> Result<live::Options, String> {
     let profile = source.load()?;
@@ -746,7 +746,7 @@ fn print_presets() -> Result<(), String> {
         text += &format!("{:width$}  {}\n", preset.name, preset.description);
     }
     text += "\nStarting points reasoned from what each stage of the chain does, not \
-             Bongiovi's\ntunings (the patents publish none). `dps profile --preset NAME` \
+             Bongiovi's\ntunings (the patents publish none). `tonewell profile --preset NAME` \
              prints one.\nEach levels its input first: measured, once settled, a mix at \
              -20 to -4 LUFS\ncomes out within 1 LU of a -14 LUFS one, at -30 LUFS within 2 LU. \
              A limiter\nkeeps every peak at or below -1 dBFS (night: -2 dBFS), even at \
@@ -777,9 +777,9 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    /// What `dps set ARGS` asks for: the key, the value, the delta.
+    /// What `tonewell set ARGS` asks for: the key, the value, the delta.
     fn set_args(args: &[&str]) -> Result<(String, Option<String>, Option<f64>), clap::Error> {
-        let cli = Cli::try_parse_from(["dps", "set"].iter().chain(args))?;
+        let cli = Cli::try_parse_from(["tonewell", "set"].iter().chain(args))?;
         let Some(Command::Set { key, value, by, .. }) = cli.command else {
             panic!("not set");
         };
@@ -823,20 +823,20 @@ mod tests {
     }
 
     #[test]
-    fn default_output_puts_dps_before_the_extension() {
+    fn default_output_puts_tonewell_before_the_extension() {
         let out = |input: &str| default_output(Path::new(input)).unwrap();
-        assert_eq!(out("song.flac"), Path::new("song.dps.flac"));
-        assert_eq!(out("dir/take.2.WAV"), Path::new("dir/take.2.dps.WAV"));
-        assert_eq!(out("/a/b/noext"), Path::new("/a/b/noext.dps.wav"));
-        assert_eq!(out(".hidden"), Path::new(".hidden.dps.wav"));
+        assert_eq!(out("song.flac"), Path::new("song.tonewell.flac"));
+        assert_eq!(out("dir/take.2.WAV"), Path::new("dir/take.2.tonewell.WAV"));
+        assert_eq!(out("/a/b/noext"), Path::new("/a/b/noext.tonewell.wav"));
+        assert_eq!(out(".hidden"), Path::new(".hidden.tonewell.wav"));
         assert!(default_output(Path::new("dir/..")).is_err());
-        // Output of an earlier run is not processed into x.dps.dps.flac.
-        for again in ["x.dps.flac", "dir/x.DPS.wav"] {
+        // Output of an earlier run is not processed into x.tonewell.tonewell.flac.
+        for again in ["x.tonewell.flac", "dir/x.TONEWELL.wav"] {
             let e = default_output(Path::new(again)).unwrap_err();
-            assert!(e.contains("looks like dps output already"), "{e}");
+            assert!(e.contains("looks like tonewell output already"), "{e}");
         }
-        assert_eq!(out("x.dps"), Path::new("x.dps.dps"));
-        assert_eq!(out("dps.flac"), Path::new("dps.dps.flac"));
+        assert_eq!(out("x.tonewell"), Path::new("x.tonewell.tonewell"));
+        assert_eq!(out("tonewell.flac"), Path::new("tonewell.tonewell.flac"));
     }
 
     #[test]
@@ -922,7 +922,7 @@ mod tests {
         // is taken back out, at every length from under the latency to past
         // a block.
         let dir = config::tests::TestDir::new("chain-latency");
-        let unity = dps::profile::CompressorParams {
+        let unity = tonewell::profile::CompressorParams {
             ratio: 1.0,
             ..Default::default()
         };
@@ -990,11 +990,11 @@ mod live_tests {
     use config::tests::TestDir;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
-        Cli::try_parse_from(std::iter::once("dps").chain(args.iter().copied()))
+        Cli::try_parse_from(std::iter::once("tonewell").chain(args.iter().copied()))
     }
 
     #[test]
-    fn bare_dps_runs_live_and_takes_the_source_flags() {
+    fn bare_tonewell_runs_live_and_takes_the_source_flags() {
         let cli = parse(&[]).unwrap();
         assert!(cli.command.is_none());
         assert!(cli.source.profile.is_none() && cli.source.preset.is_none());
@@ -1017,7 +1017,7 @@ mod live_tests {
             &["--preset", "voice", "--profile", "a.toml"][..],
             &["live", "-p", "a.toml", "--preset", "voice"],
             &["--preset", "nope"],
-            // Flags before a subcommand belong to bare `dps` only.
+            // Flags before a subcommand belong to bare `tonewell` only.
             &["--preset", "voice", "process", "a.wav"],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
@@ -1072,13 +1072,13 @@ mod live_tests {
         assert_eq!(o.name, mine.display().to_string());
         assert_eq!(o.profile.output_gain_db, -2.0);
         assert!(!o.follow_devices && o.config.as_ref() == Some(&config));
-        // `dps use --settings` can go back to the settings file from any run.
+        // `tonewell use --settings` can go back to the settings file from any run.
         assert_eq!(o.settings_file.as_ref(), Some(&settings));
         assert_eq!(
             o.control,
             Some(
                 dir.0
-                    .join("home/Library/Application Support/dps/control.sock")
+                    .join("home/Library/Application Support/tonewell/control.sock")
             )
         );
         assert!(!settings.exists());

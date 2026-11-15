@@ -96,7 +96,7 @@ enabled = true
 cutoff_hz = 700.0
 level_db = -4.5
 
-# Off: `dps import` fills it for a measured headphone or speaker.
+# Off: `tonewell import` fills it for a measured headphone or speaker.
 [correction]
 enabled = false
 preamp_db = 0.0

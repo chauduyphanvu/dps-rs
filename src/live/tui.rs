@@ -22,7 +22,7 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 
-use dps::response::response_db;
+use tonewell::response::response_db;
 
 use super::mix::Readings;
 use super::tuner::{Field, Key, Row, SLOTS, Tuner};
@@ -191,7 +191,7 @@ pub fn layout(view: &View, width: u16, height: u16, top: &mut usize) -> Vec<Line
         Some(trial) => (
             vec![
                 line(
-                    format!("dps live  BLIND  playing {}", trial.playing),
+                    format!("tonewell live  BLIND  playing {}", trial.playing),
                     Style::Bold,
                 ),
                 line(format!("trial {}", trial.number), Style::Plain),
@@ -277,7 +277,7 @@ fn status(view: &View) -> String {
             }
         })
         .collect();
-    let mut status = format!("dps live  {}  ", slots.join(" "));
+    let mut status = format!("tonewell live  {}  ", slots.join(" "));
     if tuner.bypass() {
         status += &format!("BYPASS (dry {:+.1} dB)", 20.0 * view.dry_gain.log10());
     } else {
@@ -965,7 +965,7 @@ fn restore() {
     }
     let deferred = mem::take(&mut *DEFERRED.lock().unwrap_or_else(PoisonError::into_inner));
     for message in deferred {
-        let _ = writeln!(io::stderr(), "dps live: another thread {message}");
+        let _ = writeln!(io::stderr(), "tonewell live: another thread {message}");
     }
 }
 
@@ -1047,7 +1047,7 @@ fn install_panic_hook() {
 mod tests {
     use super::*;
     use crate::live::tuner::Action;
-    use dps::Profile;
+    use tonewell::Profile;
 
     fn view(tuner: &Tuner) -> View<'_> {
         View {
@@ -1083,7 +1083,7 @@ mod tests {
         let text = texts(&lines);
         assert_eq!(lines.len(), 24);
         assert!(text.iter().all(|t| t.chars().count() <= 79), "{text:#?}");
-        assert_eq!(text[0], "dps live  [A] B  PROCESSED");
+        assert_eq!(text[0], "tonewell live  [A] B  PROCESSED");
         assert_eq!(
             text[1],
             "MacBook Pro Speakers at 48000 Hz   presets/music.toml"
@@ -1106,7 +1106,7 @@ mod tests {
         Readings {
             input_lufs: -18.24,
             output_lufs: -14.06,
-            chain: dps::Meters {
+            chain: tonewell::Meters {
                 leveler_db: 3.52,
                 compressor1_db: 4.2,
                 compressor2_db: 1.0,
@@ -1382,7 +1382,7 @@ mod tests {
         );
         assert_eq!(
             lines[0].text,
-            "dps live  [A*] B  BYPASS (dry -6.0 dB)  trim 0.0 dB  clamped 1234"
+            "tonewell live  [A*] B  BYPASS (dry -6.0 dB)  trim 0.0 dB  clamped 1234"
         );
     }
 
@@ -1553,25 +1553,28 @@ mod tests {
         };
         assert_eq!(
             status(&tuner, [0.0, -1.34]),
-            "dps live  [A] B*  PROCESSED  trim B -1.3 dB"
+            "tonewell live  [A] B*  PROCESSED  trim B -1.3 dB"
         );
         assert_eq!(
             status(&tuner, [-0.02, 0.0]),
-            "dps live  [A] B*  PROCESSED  trim 0.0 dB"
+            "tonewell live  [A] B*  PROCESSED  trim 0.0 dB"
         );
         tuner.apply(Action::Switch, 48_000);
         assert_eq!(
             status(&tuner, [-2.0, 0.0]),
-            "dps live  A [B*]  PROCESSED  trim A -2.0 dB"
+            "tonewell live  A [B*]  PROCESSED  trim A -2.0 dB"
         );
         tuner.apply(Action::Matching, 48_000);
         assert_eq!(
             status(&tuner, [0.0; 2]),
-            "dps live  A [B*]  PROCESSED  match off"
+            "tonewell live  A [B*]  PROCESSED  match off"
         );
         // The same in both: no matching to speak of.
         tuner.apply(Action::Copy, 48_000);
-        assert_eq!(status(&tuner, [0.0; 2]), "dps live  A* [B*]  PROCESSED");
+        assert_eq!(
+            status(&tuner, [0.0; 2]),
+            "tonewell live  A* [B*]  PROCESSED"
+        );
     }
 
     #[test]
@@ -1593,7 +1596,7 @@ mod tests {
         let lines = layout(&view, 80, 24, &mut top);
         let text = texts(&lines);
         assert_eq!(lines.len(), 24);
-        assert_eq!(text[0], format!("dps live  BLIND  playing {playing}"));
+        assert_eq!(text[0], format!("tonewell live  BLIND  playing {playing}"));
         assert_eq!(lines[0].style, Style::Bold);
         assert_eq!(text[1], "trial 3");
         assert_eq!(&text[24 - BLIND_LEGEND.len()..], BLIND_LEGEND);
@@ -1757,9 +1760,12 @@ mod tests {
     fn the_status_line_counts_the_bands_the_chain_skips() {
         let tuner = Tuner::new(Profile::default(), String::new());
         for (rate, want) in [
-            (48_000, "dps live  [A] B  PROCESSED"),
-            (32_000, "dps live  [A] B  PROCESSED  1 EQ band skipped"),
-            (16_000, "dps live  [A] B  PROCESSED  2 EQ bands skipped"),
+            (48_000, "tonewell live  [A] B  PROCESSED"),
+            (32_000, "tonewell live  [A] B  PROCESSED  1 EQ band skipped"),
+            (
+                16_000,
+                "tonewell live  [A] B  PROCESSED  2 EQ bands skipped",
+            ),
         ] {
             let mut top = 0;
             let lines = layout(
@@ -1791,7 +1797,7 @@ mod tests {
         let lines = layout(&view, 80, 24, &mut top);
         assert_eq!(
             lines[0].text,
-            "dps live  [A*] B  PROCESSED  trim 0.0 dB  clamped 5  1 EQ band skipped"
+            "tonewell live  [A*] B  PROCESSED  trim 0.0 dB  clamped 5  1 EQ band skipped"
         );
         assert!(selected(&lines)[0].ends_with(" skipped"));
     }

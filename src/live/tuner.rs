@@ -11,8 +11,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use dps::Profile;
-use dps::profile::EQ_BANDS;
+use tonewell::Profile;
+use tonewell::profile::EQ_BANDS;
 
 use crate::presets::PRESETS;
 
@@ -1614,7 +1614,7 @@ mod tests {
         assert!(!t.profile().limiter.enabled);
         // Only the limiter's switch moved.
         let want = Profile {
-            limiter: dps::profile::LimiterParams {
+            limiter: tonewell::profile::LimiterParams {
                 enabled: false,
                 ..Profile::default().limiter
             },
@@ -3128,7 +3128,8 @@ mod tests {
     }
 
     fn scratch_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("dps-tuner-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("tonewell-tuner-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }
@@ -3240,7 +3241,7 @@ mod tests {
         let dir = scratch_dir("dangling");
         fs::create_dir_all(&dir).unwrap();
         let link = dir.join("settings.toml");
-        let real = dir.join("elsewhere").join("dps.toml");
+        let real = dir.join("elsewhere").join("tonewell.toml");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         save(&link, &Profile::default()).unwrap();
         assert!(fs::symlink_metadata(&link).unwrap().is_symlink());

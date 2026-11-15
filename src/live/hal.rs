@@ -1,4 +1,4 @@
-//! Thin wrappers over the Core Audio HAL calls `dps live` makes. Each object
+//! Thin wrappers over the Core Audio HAL calls `tonewell live` makes. Each object
 //! created here is destroyed by its guard's `Drop`.
 
 mod input;
@@ -258,7 +258,7 @@ fn get_string(
 const PROPERTY_RUN_LOOP: AudioObjectPropertySelector = u32::from_be_bytes(*b"rnlp");
 
 /// Has the HAL deliver property notifications on a thread of its own instead
-/// of the main run loop, which `dps live` never runs. macOS 10.6 and later
+/// of the main run loop, which `tonewell live` never runs. macOS 10.6 and later
 /// default to the main run loop; recent versions already use their own
 /// thread.
 pub fn notify_on_hal_thread() -> Result<(), Error> {
@@ -694,8 +694,8 @@ impl Aggregate {
     pub fn new(output_uid: &str, tap_uid: &str) -> Result<Self, Error> {
         let output_uid = CFString::from_str(output_uid);
         let tap_uid = CFString::from_str(tap_uid);
-        let uid = CFString::from_str(&format!("dps-live-{}-{tap_uid}", std::process::id()));
-        let name = CFString::from_str("dps live");
+        let uid = CFString::from_str(&format!("tonewell-live-{}-{tap_uid}", std::process::id()));
+        let name = CFString::from_str("tonewell live");
         let yes = CFBoolean::new(true);
         let no = CFBoolean::new(false);
         let sub_device = dictionary(&[(kAudioSubDeviceUIDKey, &output_uid)]);

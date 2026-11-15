@@ -12,7 +12,7 @@ use hound::{SampleFormat, WavSpec};
 
 use crate::interrupt;
 
-/// What ffprobe reports about a file: its first audio stream, which dps
+/// What ffprobe reports about a file: its first audio stream, which tonewell
 /// processes, and the streams it does not.
 #[derive(Debug, Default, PartialEq)]
 pub struct Probe {
@@ -489,7 +489,7 @@ impl Scratch {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
-        let dir = std::env::temp_dir().join(format!("dps-{}-{nanos}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tonewell-{}-{nanos}", std::process::id()));
         fs::create_dir(&dir)
             .map_err(|e| format!("cannot create temporary directory {}: {e}", dir.display()))?;
         Ok(Self(dir))
@@ -523,7 +523,7 @@ fn url(path: &Path) -> OsString {
 /// Runs ffmpeg or ffprobe and returns its stdout. `subject` is the file the
 /// run is for, `failure` begins the message if it fails, and each `(path,
 /// shown)` in `renames` names a path in that message as the user knows it.
-/// A signal to dps ends the run, and the program with it.
+/// A signal to tonewell ends the run, and the program with it.
 fn run(
     program: &str,
     args: &[OsString],
@@ -711,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_counts_the_streams_dps_does_not_process() {
+    fn probe_counts_the_streams_tonewell_does_not_process() {
         let opus = "index=1\ncodec_name=opus\ncodec_type=audio\nsample_fmt=fltp\n\
                     sample_rate=48000\nchannels=2\nbit_rate=N/A\n";
         let text = [
@@ -878,29 +878,41 @@ Encoders:
         assert_eq!(opts("a.wav", "b.caf", &wav, s24).unwrap(), "-c:a pcm_s24be");
         assert_eq!(opts("a.wav", "b.au", &wav, f32).unwrap(), "-c:a pcm_f32be");
         assert_eq!(opts("a.wav", "b.w64", &wav, f32).unwrap(), "-c:a pcm_f32le");
-        assert_eq!(opts("a.m4a", "a.dps.m4a", &alac, s16).unwrap(), "-c:a alac");
         assert_eq!(
-            opts("a.m4a", "a.dps.M4A", &aac, f32).unwrap(),
+            opts("a.m4a", "a.tonewell.m4a", &alac, s16).unwrap(),
+            "-c:a alac"
+        );
+        assert_eq!(
+            opts("a.m4a", "a.tonewell.M4A", &aac, f32).unwrap(),
             "-c:a aac -b:a 256000"
         );
         assert_eq!(
-            opts("a.mp3", "a.dps.mp3", &mp3, f32).unwrap(),
+            opts("a.mp3", "a.tonewell.mp3", &mp3, f32).unwrap(),
             "-c:a libmp3lame"
         );
         // Containers that hold several codecs keep the input's.
         assert_eq!(
-            opts("a.mka", "a.dps.mka", &opus, f32).unwrap(),
+            opts("a.mka", "a.tonewell.mka", &opus, f32).unwrap(),
             "-c:a libopus -b:a 140000"
         );
         assert_eq!(
-            opts("a.ogg", "a.dps.ogg", &vorbis, f32).unwrap(),
+            opts("a.ogg", "a.tonewell.ogg", &vorbis, f32).unwrap(),
             "-c:a vorbis -strict experimental -b:a 160000"
         );
-        assert_eq!(opts("a.mka", "a.dps.mka", &flac, s16).unwrap(), "-c:a flac");
-        let e = opts("a.wma", "a.dps.wma", &probe("wmapro", "fltp", 0, None), f32).unwrap_err();
+        assert_eq!(
+            opts("a.mka", "a.tonewell.mka", &flac, s16).unwrap(),
+            "-c:a flac"
+        );
+        let e = opts(
+            "a.wma",
+            "a.tonewell.wma",
+            &probe("wmapro", "fltp", 0, None),
+            f32,
+        )
+        .unwrap_err();
         assert_eq!(
             e,
-            "cannot write a.dps.wma: this ffmpeg has no encoder for wmapro, the codec of \
+            "cannot write a.tonewell.wma: this ffmpeg has no encoder for wmapro, the codec of \
              a.wma; name an output with another extension"
         );
         // A new format gets ffmpeg's defaults for it.

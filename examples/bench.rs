@@ -3,18 +3,18 @@
 //!
 //! cargo run --release --example bench [-- --rate HZ] [--seconds N] [--block FRAMES]
 
-use dps::profile::{BandKind, CorrectionBand, EQ_BANDS};
-use dps::{Processor, Profile};
 use std::f64::consts::TAU;
 use std::hint::black_box;
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
+use tonewell::profile::{BandKind, CorrectionBand, EQ_BANDS};
+use tonewell::{Processor, Profile};
 
 const USAGE: &str = "\
 Usage: cargo run --release --example bench [-- OPTIONS]
 
-Times the dps chain over a synthetic stereo programme, once per configuration.
+Times the tonewell chain over a synthetic stereo programme, once per configuration.
 Numbers from a debug build are meaningless: always use --release.
 
 Options:

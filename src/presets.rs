@@ -2,7 +2,7 @@
 //! points reasoned from what each stage of the chain does, not Bongiovi's.
 
 use clap::builder::{PossibleValuesParser, TypedValueParser};
-use dps::Profile;
+use tonewell::Profile;
 
 pub struct Preset {
     pub name: &'static str,
@@ -63,8 +63,8 @@ pub fn parser() -> impl TypedValueParser<Value = &'static Preset> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dps::Processor;
-    use dps::profile::EQ_BANDS;
+    use tonewell::Processor;
+    use tonewell::profile::EQ_BANDS;
 
     /// Deterministic noise in [-0.5, 0.5).
     fn noise(n: usize, seed: u64) -> Vec<f32> {

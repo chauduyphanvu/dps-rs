@@ -1,6 +1,6 @@
-//! `dps devices`, and the commands that follow the default output device,
+//! `tonewell devices`, and the commands that follow the default output device,
 //! driven through the built binary with the output devices given in
-//! `DPS_TEST_DEVICES`, so no test reads the real audio system.
+//! `TONEWELL_TEST_DEVICES`, so no test reads the real audio system.
 
 #![cfg(target_os = "macos")]
 
@@ -18,7 +18,8 @@ struct TempDir {
 
 impl TempDir {
     fn new(test: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("dps-devices-{}-{test}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("tonewell-devices-{}-{test}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for sub in ["work", "config", "home"] {
             fs::create_dir_all(root.join(sub)).unwrap();
@@ -27,7 +28,7 @@ impl TempDir {
         let stub = root.join("launchctl");
         fs::write(
             &stub,
-            "#!/bin/sh\necho 'Could not find service \"dev.dps.live\"' >&2\nexit 113\n",
+            "#!/bin/sh\necho 'Could not find service \"dev.tonewell.live\"' >&2\nexit 113\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -35,27 +36,27 @@ impl TempDir {
         Self { root }
     }
 
-    fn dps(&self, args: &[&str]) -> Output {
-        self.dps_with_apps(args, "")
+    fn tonewell(&self, args: &[&str]) -> Output {
+        self.tonewell_with_apps(args, "")
     }
 
-    /// `dps` with the audio apps `DPS_TEST_APPS` lists.
-    fn dps_with_apps(&self, args: &[&str], apps: &str) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_dps"))
+    /// `tonewell` with the audio apps `TONEWELL_TEST_APPS` lists.
+    fn tonewell_with_apps(&self, args: &[&str], apps: &str) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_tonewell"))
             .args(args)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("HOME", self.root.join("home"))
-            .env("DPS_LAUNCHCTL", self.root.join("launchctl"))
-            .env("DPS_TEST_DEVICES", DEVICES)
-            .env("DPS_TEST_OUTPUT", "MacBook Pro Speakers@48000")
-            .env("DPS_TEST_OTHERS_PLAYING", "0")
-            .env("DPS_TEST_APPS", apps)
+            .env("TONEWELL_LAUNCHCTL", self.root.join("launchctl"))
+            .env("TONEWELL_TEST_DEVICES", DEVICES)
+            .env("TONEWELL_TEST_OUTPUT", "MacBook Pro Speakers@48000")
+            .env("TONEWELL_TEST_OTHERS_PLAYING", "0")
+            .env("TONEWELL_TEST_APPS", apps)
             .output()
             .unwrap()
     }
 
     fn dir(&self) -> PathBuf {
-        self.root.join("config/dps")
+        self.root.join("config/tonewell")
     }
 
     fn settings(&self) -> PathBuf {
@@ -88,7 +89,7 @@ fn stderr(out: &Output) -> String {
 }
 
 fn ok(out: Output) -> String {
-    assert!(out.status.success(), "dps failed: {}", stderr(&out));
+    assert!(out.status.success(), "tonewell failed: {}", stderr(&out));
     stdout(&out)
 }
 
@@ -111,7 +112,7 @@ fn read(path: &Path) -> String {
 #[test]
 fn devices_lists_each_output_with_the_profile_it_plays_with() {
     let dir = TempDir::new("list");
-    let text = ok(dir.dps(&["devices"]));
+    let text = ok(dir.tonewell(&["devices"]));
     assert_eq!(
         text,
         format!(
@@ -120,7 +121,7 @@ fn devices_lists_each_output_with_the_profile_it_plays_with() {
   AirPods Pro           AA:output             settings file
   AirPods Max           BB:output             settings file
 
-* default output. Profile paths are relative to {}; `dps devices assign` gives a device a profile of its own.
+* default output. Profile paths are relative to {}; `tonewell devices assign` gives a device a profile of its own.
 ",
             dir.dir().display()
         )
@@ -131,14 +132,14 @@ fn devices_lists_each_output_with_the_profile_it_plays_with() {
 #[test]
 fn assign_copies_the_profile_the_device_plays_with_and_maps_it() {
     let dir = TempDir::new("assign");
-    let out = dir.dps(&["devices", "assign"]);
+    let out = dir.tonewell(&["devices", "assign"]);
     let said = ok(out);
     let own = dir.dir().join("devices/macbook-pro-speakers.toml");
     assert_eq!(
         said,
         format!(
             "wrote {} from {}\nMacBook Pro Speakers (BuiltInSpeakerDevice) now uses it in live \
-             mode; rewrote {} (comments in it are not kept); a running dps switches on its own\n",
+             mode; rewrote {} (comments in it are not kept); a running tonewell switches on its own\n",
             own.display(),
             dir.settings().display(),
             dir.config().display()
@@ -151,7 +152,7 @@ fn assign_copies_the_profile_the_device_plays_with_and_maps_it() {
         "exclude = []\n\n[devices.BuiltInSpeakerDevice]\nname = \"MacBook Pro Speakers\"\nprofile \
          = \"devices/macbook-pro-speakers.toml\"\n"
     );
-    let list = ok(dir.dps(&["devices"]));
+    let list = ok(dir.tonewell(&["devices"]));
     assert!(
         list.contains(
             "* MacBook Pro Speakers  BuiltInSpeakerDevice  devices/macbook-pro-speakers.toml\n"
@@ -161,14 +162,14 @@ fn assign_copies_the_profile_the_device_plays_with_and_maps_it() {
 
     // A hand-edited settings file is copied as it is, comments and all.
     fs::write(dir.settings(), "# mine\noutput_gain_db = -4.0\n").unwrap();
-    ok(dir.dps(&["devices", "assign", "--device", "AA:output"]));
+    ok(dir.tonewell(&["devices", "assign", "--device", "AA:output"]));
     assert_eq!(
         read(&dir.dir().join("devices/airpods-pro.toml")),
         "# mine\noutput_gain_db = -4.0\n"
     );
     // Assigning again keeps the file there, edits and all.
     fs::write(&own, "output_gain_db = -1.0\n").unwrap();
-    let said = ok(dir.dps(&["devices", "assign", "--device", "macbook"]));
+    let said = ok(dir.tonewell(&["devices", "assign", "--device", "macbook"]));
     assert!(
         said.starts_with(&format!(
             "kept {}, which was already there\n",
@@ -188,7 +189,7 @@ fn assign_copies_the_profile_the_device_plays_with_and_maps_it() {
 fn assign_starts_from_a_preset_or_a_file_and_replaces_only_with_force() {
     let dir = TempDir::new("assign-from");
     let own = dir.dir().join("devices/airpods-pro.toml");
-    let said = ok(dir.dps(&[
+    let said = ok(dir.tonewell(&[
         "devices",
         "assign",
         "--device",
@@ -201,7 +202,7 @@ fn assign_starts_from_a_preset_or_a_file_and_replaces_only_with_force() {
     assert!(music.contains("[eq]"), "{music}");
 
     let err = fails(
-        dir.dps(&[
+        dir.tonewell(&[
             "devices",
             "assign",
             "--device",
@@ -213,7 +214,7 @@ fn assign_starts_from_a_preset_or_a_file_and_replaces_only_with_force() {
     );
     assert!(err.contains(&own.display().to_string()), "{err}");
     assert_eq!(read(&own), music);
-    ok(dir.dps(&[
+    ok(dir.tonewell(&[
         "devices",
         "assign",
         "--device",
@@ -226,7 +227,7 @@ fn assign_starts_from_a_preset_or_a_file_and_replaces_only_with_force() {
 
     let mine = dir.work("mine.toml", "# for the AirPods\noutput_gain_db = -5.0\n");
     let mine_arg = mine.to_str().unwrap();
-    ok(dir.dps(&[
+    ok(dir.tonewell(&[
         "devices",
         "assign",
         "--device",
@@ -242,7 +243,7 @@ fn assign_starts_from_a_preset_or_a_file_and_replaces_only_with_force() {
     let bad_arg = bad.to_str().unwrap();
     let config = read(&dir.config());
     fails(
-        dir.dps(&[
+        dir.tonewell(&[
             "devices",
             "assign",
             "--device",
@@ -256,16 +257,16 @@ fn assign_starts_from_a_preset_or_a_file_and_replaces_only_with_force() {
     assert_eq!(read(&dir.config()), config);
 
     // --force means nothing without --preset or --from.
-    let out = dir.dps(&["devices", "assign", "--force"]);
+    let out = dir.tonewell(&["devices", "assign", "--force"]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
-    let out = dir.dps(&["devices", "assign", "--preset", "music", "--from", mine_arg]);
+    let out = dir.tonewell(&["devices", "assign", "--preset", "music", "--from", mine_arg]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
 }
 
 #[test]
 fn unassign_removes_the_mapping_and_keeps_the_file() {
     let dir = TempDir::new("unassign");
-    ok(dir.dps(&[
+    ok(dir.tonewell(&[
         "devices",
         "assign",
         "--device",
@@ -274,12 +275,12 @@ fn unassign_removes_the_mapping_and_keeps_the_file() {
         "headphones",
     ]));
     let own = dir.dir().join("devices/airpods-max.toml");
-    let said = ok(dir.dps(&["devices", "unassign", "--device", "max"]));
+    let said = ok(dir.tonewell(&["devices", "unassign", "--device", "max"]));
     assert_eq!(
         said,
         format!(
             "AirPods Max (BB:output) uses the settings file again; kept {}; rewrote {} (comments \
-             in it are not kept); a running dps switches on its own\n",
+             in it are not kept); a running tonewell switches on its own\n",
             own.display(),
             dir.config().display()
         )
@@ -287,7 +288,7 @@ fn unassign_removes_the_mapping_and_keeps_the_file() {
     assert!(own.exists());
     assert_eq!(read(&dir.config()), "exclude = []\n\n[devices]\n");
     assert_eq!(
-        ok(dir.dps(&["devices", "unassign", "--device", "BB:output"])),
+        ok(dir.tonewell(&["devices", "unassign", "--device", "BB:output"])),
         "AirPods Max has no profile of its own; it uses the settings file\n"
     );
 }
@@ -301,7 +302,7 @@ fn a_device_that_is_not_connected_can_still_be_unassigned() {
         "[devices.GONE]\nname = \"Old DAC\"\nprofile = \"devices/old-dac.toml\"\n",
     )
     .unwrap();
-    let list = ok(dir.dps(&["devices"]));
+    let list = ok(dir.tonewell(&["devices"]));
     assert!(
         list.contains(
             "  Old DAC (not connected)  GONE                  devices/old-dac.toml (missing, so \
@@ -309,7 +310,7 @@ fn a_device_that_is_not_connected_can_still_be_unassigned() {
         ),
         "{list}"
     );
-    let said = ok(dir.dps(&["devices", "unassign", "--device", "old dac"]));
+    let said = ok(dir.tonewell(&["devices", "unassign", "--device", "old dac"]));
     assert!(
         said.starts_with("Old DAC (GONE) uses the settings file again;"),
         "{said}"
@@ -320,13 +321,13 @@ fn a_device_that_is_not_connected_can_still_be_unassigned() {
 fn a_device_name_that_matches_none_or_several_is_refused() {
     let dir = TempDir::new("match");
     fails(
-        dir.dps(&["devices", "assign", "--device", "airpods"]),
+        dir.tonewell(&["devices", "assign", "--device", "airpods"]),
         "--device \"airpods\" matches 2 devices: AirPods Pro (AA:output), AirPods Max (BB:output); \
          give its UID or more of its name",
     );
     fails(
-        dir.dps(&["devices", "unassign", "--device", "HDMI"]),
-        "no output device matches --device \"HDMI\"; `dps devices` lists them",
+        dir.tonewell(&["devices", "unassign", "--device", "HDMI"]),
+        "no output device matches --device \"HDMI\"; `tonewell devices` lists them",
     );
     assert!(!dir.dir().exists());
 }
@@ -336,18 +337,18 @@ fn a_broken_config_toml_is_named_and_left_alone() {
     let dir = TempDir::new("broken");
     fs::create_dir_all(dir.dir()).unwrap();
     fs::write(dir.config(), "exclude = [\"a\"]\ndevicez = 1\n").unwrap();
-    let err = fails(dir.dps(&["devices"]), "devicez");
+    let err = fails(dir.tonewell(&["devices"]), "devicez");
     assert!(
         err.contains(&format!("{}:2:", dir.config().display())),
         "{err}"
     );
-    fails(dir.dps(&["devices", "assign"]), "devicez");
+    fails(dir.tonewell(&["devices", "assign"]), "devicez");
     let hd = dir.work(
         "hd.txt",
         "Preamp: -1 dB\nFilter 1: ON PK Fc 1000 Hz Gain 2 dB Q 1\n",
     );
     fails(
-        dir.dps(&["import", hd.to_str().unwrap()]),
+        dir.tonewell(&["import", hd.to_str().unwrap()]),
         "; correct it, or name the profile with --profile",
     );
     assert_eq!(read(&dir.config()), "exclude = [\"a\"]\ndevicez = 1\n");
@@ -363,7 +364,7 @@ fn import_writes_into_the_profile_the_default_output_plays_with() {
     );
     let hd = hd.to_str().unwrap();
 
-    let said = ok(dir.dps(&["import", hd]));
+    let said = ok(dir.tonewell(&["import", hd]));
     let lines: Vec<&str> = said.lines().collect();
     assert_eq!(
         lines[..2],
@@ -378,7 +379,7 @@ fn import_writes_into_the_profile_the_default_output_plays_with() {
     );
 
     // Another device's profile leaves the default output on the settings file.
-    ok(dir.dps(&[
+    ok(dir.tonewell(&[
         "devices",
         "assign",
         "--device",
@@ -386,16 +387,16 @@ fn import_writes_into_the_profile_the_default_output_plays_with() {
         "--preset",
         "music",
     ]));
-    let said = ok(dir.dps(&["import", hd]));
+    let said = ok(dir.tonewell(&["import", hd]));
     assert_eq!(
         said.lines().nth(1).unwrap(),
         "the default output device, MacBook Pro Speakers, has no profile of its own, so it uses \
          the settings file"
     );
 
-    ok(dir.dps(&["devices", "assign", "--preset", "voice"]));
+    ok(dir.tonewell(&["devices", "assign", "--preset", "voice"]));
     let own = dir.dir().join("devices/macbook-pro-speakers.toml");
-    let said = ok(dir.dps(&["import", hd]));
+    let said = ok(dir.tonewell(&["import", hd]));
     let lines: Vec<&str> = said.lines().collect();
     assert_eq!(
         lines[..2],
@@ -412,17 +413,17 @@ fn import_writes_into_the_profile_the_default_output_plays_with() {
 
     // --profile still wins and says nothing more.
     let mine = dir.work("mine.toml", "");
-    let said = ok(dir.dps(&["import", hd, "--profile", mine.to_str().unwrap()]));
+    let said = ok(dir.tonewell(&["import", hd, "--profile", mine.to_str().unwrap()]));
     assert!(!said.contains("default output"), "{said}");
 }
 
 #[test]
 fn doctor_names_the_profile_the_default_output_plays_with() {
     let dir = TempDir::new("doctor");
-    // A held lock stands in for a running dps, so the doctor makes no tap.
+    // A held lock stands in for a running tonewell, so the doctor makes no tap.
     let lock = dir
         .root
-        .join("home/Library/Application Support/dps/live.lock");
+        .join("home/Library/Application Support/tonewell/live.lock");
     fs::create_dir_all(lock.parent().unwrap()).unwrap();
     let file = fs::File::create(&lock).unwrap();
     file.lock().unwrap();
@@ -440,16 +441,16 @@ fn doctor_names_the_profile_the_default_output_plays_with() {
             .to_owned()
     };
     assert_eq!(
-        config_line(dir.dps(&["doctor", "--preset", "music"])),
+        config_line(dir.tonewell(&["doctor", "--preset", "music"])),
         format!(
             "ok       config: {} does not exist, so every output device plays with the settings \
              file",
             dir.config().display()
         )
     );
-    ok(dir.dps(&["devices", "assign", "--preset", "music"]));
+    ok(dir.tonewell(&["devices", "assign", "--preset", "music"]));
     assert_eq!(
-        config_line(dir.dps(&["doctor", "--preset", "music"])),
+        config_line(dir.tonewell(&["doctor", "--preset", "music"])),
         format!(
             "ok       config: {} gives 1 output device a profile of its own; the default output, \
              MacBook Pro Speakers, plays with {}",
@@ -461,7 +462,7 @@ fn doctor_names_the_profile_the_default_output_plays_with() {
     );
     // A broken config is a problem, but not one live mode stops for.
     fs::write(dir.config(), "nonsense = 1\n").unwrap();
-    let out = dir.dps(&["doctor", "--preset", "music"]);
+    let out = dir.tonewell(&["doctor", "--preset", "music"]);
     let line = config_line(out);
     assert!(line.starts_with("problem  config: "), "{line}");
     assert!(line.contains("nonsense"), "{line}");
@@ -474,13 +475,13 @@ fn doctor_names_the_profile_the_default_output_plays_with() {
     let running = "com.spotify.client+,us.zoom.xos,com.apple.Music";
     fs::write(dir.config(), "exclude = [\"us.zoom.xos\"]\n").unwrap();
     assert_eq!(
-        apps_line(dir.dps_with_apps(&["doctor", "--preset", "music"], running)),
+        apps_line(dir.tonewell_with_apps(&["doctor", "--preset", "music"], running)),
         "ok       apps: playing audio now: com.spotify.client; config.toml leaves alone: \
          us.zoom.xos"
     );
     fs::remove_file(dir.config()).unwrap();
     assert_eq!(
-        apps_line(dir.dps_with_apps(&["doctor", "--preset", "music"], "")),
+        apps_line(dir.tonewell_with_apps(&["doctor", "--preset", "music"], "")),
         "ok       apps: playing audio now: none; to leave one alone, add its bundle ID to \
          exclude in config.toml"
     );

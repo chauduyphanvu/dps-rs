@@ -1,4 +1,4 @@
-//! Drives `dps calibrate` through the built binary as far as it goes
+//! Drives `tonewell calibrate` through the built binary as far as it goes
 //! without audio: its arguments and help. Nothing here plays or records.
 
 #![cfg(target_os = "macos")]
@@ -14,7 +14,7 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new(test: &str) -> Self {
         let root =
-            std::env::temp_dir().join(format!("dps-calibrate-{}-{test}", std::process::id()));
+            std::env::temp_dir().join(format!("tonewell-calibrate-{}-{test}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for sub in ["config", "home"] {
             fs::create_dir_all(root.join(sub)).unwrap();
@@ -22,8 +22,8 @@ impl TempDir {
         Self(root)
     }
 
-    fn dps(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_dps"))
+    fn tonewell(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_tonewell"))
             .args(args)
             .env("XDG_CONFIG_HOME", self.0.join("config"))
             .env("HOME", self.0.join("home"))
@@ -57,7 +57,7 @@ fn stderr(out: &Output) -> String {
 fn a_level_outside_the_range_is_refused_with_the_range() {
     let dir = TempDir::new("level");
     for level in ["-5", "-61", "0", "-12.5e3", "loud", "nan"] {
-        let out = dir.dps(&["calibrate", "--level", level, "--dry-run"]);
+        let out = dir.tonewell(&["calibrate", "--level", level, "--dry-run"]);
         let err = stderr(&out);
         assert_eq!(out.status.code(), Some(2), "{level}: {err}");
         assert!(
@@ -71,7 +71,7 @@ fn a_level_outside_the_range_is_refused_with_the_range() {
         assert!(out.stdout.is_empty());
     }
     // `=` works too, and so does a value with no flag after it.
-    let out = dir.dps(&["calibrate", "--level=-70"]);
+    let out = dir.tonewell(&["calibrate", "--level=-70"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr(&out).contains("from -60 to -12"));
     assert!(dir.untouched());
@@ -80,7 +80,7 @@ fn a_level_outside_the_range_is_refused_with_the_range() {
 #[test]
 fn the_help_explains_the_measurement() {
     let dir = TempDir::new("help");
-    let out = dir.dps(&["calibrate", "--help"]);
+    let out = dir.tonewell(&["calibrate", "--help"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let help = stdout(&out);
     for needle in [
@@ -90,7 +90,7 @@ fn the_help_explains_the_measurement() {
         "[correction]",
         "Ctrl-C",
         "system volume",
-        "dps stop",
+        "tonewell stop",
         "--profile <FILE.toml>",
         "--level <DB>",
         "[default: -30]",
@@ -98,9 +98,9 @@ fn the_help_explains_the_measurement() {
     ] {
         assert!(help.contains(needle), "{needle:?} not in {help}");
     }
-    let out = dir.dps(&["--help"]);
+    let out = dir.tonewell(&["--help"]);
     let help = stdout(&out);
     assert!(help.contains("calibrate"), "{help}");
-    assert!(help.contains("dps calibrate "), "{help}");
+    assert!(help.contains("tonewell calibrate "), "{help}");
     assert!(dir.untouched());
 }

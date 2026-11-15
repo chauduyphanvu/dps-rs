@@ -1,4 +1,4 @@
-//! `dps import`: reads an Equalizer APO / AutoEQ "ParametricEQ.txt" and writes
+//! `tonewell import`: reads an Equalizer APO / AutoEQ "ParametricEQ.txt" and writes
 //! it into the `[correction]` table of a profile file, leaving the rest of the
 //! profile alone.
 
@@ -6,8 +6,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use dps::Profile;
-use dps::profile::{BandKind, CorrectionBand, CorrectionParams, MAX_CORRECTION_BANDS};
+use tonewell::Profile;
+use tonewell::profile::{BandKind, CorrectionBand, CorrectionParams, MAX_CORRECTION_BANDS};
 
 use crate::PendingFile;
 use crate::config::{Dirs, Source};
@@ -53,7 +53,7 @@ pub fn run(
     let bands = target.correction.bands.len();
     crate::write_stdout(&format!(
         "imported {bands} band{} and a preamp of {} dB into {}\n{}\
-         rewrote the file, so comments in it are not kept; a running dps picks the change up \
+         rewrote the file, so comments in it are not kept; a running tonewell picks the change up \
          on its own\n",
         if bands == 1 { "" } else { "s" },
         target.correction.preamp_db,
@@ -95,7 +95,7 @@ fn skipped_warnings(profile: &Profile) -> Vec<String> {
 }
 
 /// Replaces the file `path` names with `profile` as TOML, through a temporary
-/// file beside it, so a `dps` watching the file never reads it half written.
+/// file beside it, so a `tonewell` watching the file never reads it half written.
 /// A symlink stays and the file it points to is replaced; that file keeps its
 /// permissions. The file must exist.
 pub(crate) fn rewrite(path: &Path, profile: &Profile) -> Result<(), String> {
