@@ -14,6 +14,11 @@ fn db_to_gain(db: f32) -> f32 {
     10f64.powf(f64::from(db) / 20.0) as f32
 }
 
+/// Frames the per-channel stages take at a time, each channel in turn.
+const CHUNK_FRAMES: usize = 256;
+/// EQ bands run together in one pass over a chunk.
+const BELLS_PER_PASS: usize = 4;
+
 /// The nine stages for one channel, each with its own state.
 struct Channel {
     input_gain: f32,
@@ -65,16 +70,50 @@ impl Channel {
         }
     }
 
-    fn tick(&mut self, x: f32) -> f32 {
-        let x = self.high1.tick(self.low1.tick(x * self.input_gain));
-        // `Compressor::tick` split open, to see the gain; the same products.
-        let gain1 = self.comp1.gain(x);
-        self.comp1_min = self.comp1_min.min(gain1);
-        let x = self.high2.tick(self.low2.tick(x * gain1));
-        let x = self.bells.iter_mut().fold(x, |x, bell| bell.tick(x));
-        let gain2 = self.comp2.gain(x);
-        self.comp2_min = self.comp2_min.min(gain2);
-        x * gain2 * self.output_gain
+    /// Runs a block of this channel's samples through its stages, a few
+    /// stages at a time over the whole block rather than one sample at a
+    /// time through all of them. A sample's path through all 17 filters is
+    /// too long for the CPU to start on the next sample before it ends; over
+    /// a few stages it can, and each filter's state stays in registers.
+    /// Every sample meets the same arithmetic in the same order.
+    fn run(&mut self, block: &mut [f32]) {
+        for x in block.iter_mut() {
+            let y = self.high1.tick(self.low1.tick(*x * self.input_gain));
+            // `Compressor::tick` split open, to see the gain; the same products.
+            let gain1 = self.comp1.gain(y);
+            self.comp1_min = self.comp1_min.min(gain1);
+            *x = self.high2.tick(self.low2.tick(y * gain1));
+        }
+        for bells in self.bells.chunks_mut(BELLS_PER_PASS) {
+            match bells {
+                [a, b, c, d] => {
+                    for x in block.iter_mut() {
+                        *x = d.tick(c.tick(b.tick(a.tick(*x))));
+                    }
+                }
+                [a, b, c] => {
+                    for x in block.iter_mut() {
+                        *x = c.tick(b.tick(a.tick(*x)));
+                    }
+                }
+                [a, b] => {
+                    for x in block.iter_mut() {
+                        *x = b.tick(a.tick(*x));
+                    }
+                }
+                [a] => {
+                    for x in block.iter_mut() {
+                        *x = a.tick(*x);
+                    }
+                }
+                _ => unreachable!("chunks of 1 to {BELLS_PER_PASS} bells"),
+            }
+        }
+        for x in block.iter_mut() {
+            let gain2 = self.comp2.gain(*x);
+            self.comp2_min = self.comp2_min.min(gain2);
+            *x = *x * gain2 * self.output_gain;
+        }
     }
 }
 
@@ -115,6 +154,9 @@ pub struct Processor {
     limiter: Option<Limiter>,
     /// The limiter's smallest gain since the last `meters`.
     limiter_min: f32,
+    /// One channel of a chunk, `CHUNK_FRAMES` long so that `process` does
+    /// not allocate.
+    scratch: Vec<f32>,
 }
 
 impl Processor {
@@ -152,20 +194,42 @@ impl Processor {
                 .enabled
                 .then(|| Limiter::new(&profile.limiter, fs)),
             limiter_min: 1.0,
+            scratch: vec![0.0; CHUNK_FRAMES],
         }
     }
 
     /// Processes interleaved frames in place. `samples.len()` must be a
     /// multiple of the channel count.
     pub fn process(&mut self, samples: &mut [f32]) {
-        assert_eq!(samples.len() % self.channels.len(), 0);
-        for frame in samples.chunks_exact_mut(self.channels.len()) {
-            if let Some(leveler) = &mut self.leveler {
+        let channels = self.channels.len();
+        assert_eq!(samples.len() % channels, 0);
+        for chunk in samples.chunks_mut(CHUNK_FRAMES * channels) {
+            self.process_chunk(chunk);
+        }
+    }
+
+    /// Each stage sees the same samples in the same order whichever way the
+    /// stages take turns, since none reads another's state; so the leveler
+    /// takes the whole chunk, then each channel's stages, then the rest
+    /// frame by frame.
+    fn process_chunk(&mut self, chunk: &mut [f32]) {
+        let channels = self.channels.len();
+        if let Some(leveler) = &mut self.leveler {
+            for frame in chunk.chunks_exact_mut(channels) {
                 leveler.frame(frame);
             }
-            for (x, channel) in frame.iter_mut().zip(&mut self.channels) {
-                *x = channel.tick(*x);
+        }
+        let scratch = &mut self.scratch[..chunk.len() / channels];
+        for (c, channel) in self.channels.iter_mut().enumerate() {
+            for (x, frame) in scratch.iter_mut().zip(chunk.chunks_exact(channels)) {
+                *x = frame[c];
             }
+            channel.run(scratch);
+            for (x, frame) in scratch.iter().zip(chunk.chunks_exact_mut(channels)) {
+                frame[c] = *x;
+            }
+        }
+        for frame in chunk.chunks_exact_mut(channels) {
             if let Some(bass) = &mut self.bass {
                 bass.frame(frame);
             }
