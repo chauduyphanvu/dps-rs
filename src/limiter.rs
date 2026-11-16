@@ -232,11 +232,18 @@ fn required(peak: f32, ceiling: f32) -> f32 {
     gain
 }
 
+/// The most points estimated between samples (3), rounded up to a vector's
+/// width so that their sums run side by side.
+const LANES: usize = 4;
+
 /// Estimates each frame's peak including what the signal reaches between
 /// samples, `TAPS / 2` frames after the frame arrives.
 struct TruePeak {
-    /// The interpolator's taps for each point estimated between samples.
-    phases: Vec<[f32; TAPS]>,
+    /// How many points between samples are estimated.
+    points: usize,
+    /// For each of the `TAPS` samples the interpolator sees, its tap for
+    /// each point; the lanes past `points` are 0.
+    taps: [[f32; LANES]; TAPS],
     /// For each channel the last `TAPS` samples, twice over so that they
     /// read as one slice; a sample that is not finite is held as 0.
     history: Vec<f32>,
@@ -253,20 +260,19 @@ impl TruePeak {
             &[0.25, 0.5, 0.75]
         };
         let half = (TAPS / 2) as f64;
-        let phases = points
-            .iter()
-            .map(|offset| {
-                std::array::from_fn(|i| {
-                    // From the point to tap i's sample, which is never 0.
-                    let t = half - 1.0 - i as f64 + offset;
-                    let window = bessel_i0(KAISER_BETA * (1.0 - (t / half).powi(2)).sqrt())
-                        / bessel_i0(KAISER_BETA);
-                    ((PI * t).sin() / (PI * t) * window) as f32
-                })
-            })
-            .collect();
+        let mut taps = [[0.0; LANES]; TAPS];
+        for (lane, offset) in points.iter().enumerate() {
+            for (i, tap) in taps.iter_mut().enumerate() {
+                // From the point to tap i's sample, which is never 0.
+                let t = half - 1.0 - i as f64 + offset;
+                let window = bessel_i0(KAISER_BETA * (1.0 - (t / half).powi(2)).sqrt())
+                    / bessel_i0(KAISER_BETA);
+                tap[lane] = ((PI * t).sin() / (PI * t) * window) as f32;
+            }
+        }
         Self {
-            phases,
+            points: points.len(),
+            taps,
             history: vec![0.0; 2 * TAPS * PREALLOCATED_CHANNELS],
             at: 0,
             after_last: 0.0,
@@ -283,10 +289,19 @@ impl TruePeak {
             let x = if x.is_finite() { *x } else { 0.0 };
             history[at] = x;
             history[at + TAPS] = x;
-            let recent = &history[at + 1..=at + TAPS];
+            // An array rather than a slice, so the sums below compile to
+            // vector arithmetic across the points.
+            let recent: &[f32; TAPS] = history[at + 1..=at + TAPS]
+                .try_into()
+                .expect("TAPS samples");
             sample = sample.max(recent[TAPS / 2 - 1].abs());
-            for taps in &self.phases {
-                let y: f32 = recent.iter().zip(taps).map(|(x, c)| x * c).sum();
+            // Each point's sum adds its products in tap order, from -0.0 as
+            // `Iterator::sum` does.
+            let mut y = [-0.0f32; LANES];
+            for (x, taps) in recent.iter().zip(&self.taps) {
+                y = std::array::from_fn(|lane| y[lane] + x * taps[lane]);
+            }
+            for y in &y[..self.points] {
                 between = between.max(y.abs());
             }
         }
@@ -304,7 +319,9 @@ impl TruePeak {
     }
 
     fn can_adopt(&self, from: &Self) -> bool {
-        self.phases == from.phases && self.history.capacity() >= from.history.len()
+        self.points == from.points
+            && self.taps == from.taps
+            && self.history.capacity() >= from.history.len()
     }
 
     fn adopt(&mut self, from: &Self) {
@@ -917,12 +934,10 @@ mod tests {
         // each phase's taps add up to less than 2.2 in magnitude.
         for rate in [44_100.0, 48_000.0, 96_000.0, 192_000.0] {
             let detector = TruePeak::new(rate);
-            assert!(
-                detector
-                    .phases
-                    .iter()
-                    .all(|taps| taps.iter().map(|c| c.abs()).sum::<f32>() < 2.2)
-            );
+            assert!((0..detector.points).all(|point| {
+                let taps = detector.taps.iter().map(|taps| taps[point]);
+                taps.map(|c| c.abs()).sum::<f32>() < 2.2
+            }));
             for (lookahead_ms, true_peak) in [(0.0, true), (0.1, false), (1.5, true), (10.0, true)]
             {
                 for channels in [1, 2, 6] {
