@@ -84,36 +84,53 @@ impl Channel {
             self.comp1_min = self.comp1_min.min(gain1);
             *x = self.high2.tick(self.low2.tick(y * gain1));
         }
-        for bells in self.bells.chunks_mut(BELLS_PER_PASS) {
-            match bells {
-                [a, b, c, d] => {
-                    for x in block.iter_mut() {
-                        *x = d.tick(c.tick(b.tick(a.tick(*x))));
-                    }
-                }
-                [a, b, c] => {
-                    for x in block.iter_mut() {
-                        *x = c.tick(b.tick(a.tick(*x)));
-                    }
-                }
-                [a, b] => {
-                    for x in block.iter_mut() {
-                        *x = b.tick(a.tick(*x));
-                    }
-                }
-                [a] => {
-                    for x in block.iter_mut() {
-                        *x = a.tick(*x);
-                    }
-                }
-                _ => unreachable!("chunks of 1 to {BELLS_PER_PASS} bells"),
+        let mut passes = self.bells.chunks_mut(BELLS_PER_PASS);
+        let last = passes.next_back().unwrap_or_default();
+        for bells in passes {
+            bells_pass(bells, block, |x| x);
+        }
+        // Compressor 2 rides along with the last bands, whose arithmetic the
+        // CPU can get on with while it waits on powf in the gain.
+        let (comp2, comp2_min, output_gain) =
+            (&mut self.comp2, &mut self.comp2_min, self.output_gain);
+        bells_pass(last, block, |x| {
+            let gain2 = comp2.gain(x);
+            *comp2_min = comp2_min.min(gain2);
+            x * gain2 * output_gain
+        });
+    }
+}
+
+/// Runs `block` through up to `BELLS_PER_PASS` bells and then `then`, in
+/// one pass.
+fn bells_pass(bells: &mut [Bell], block: &mut [f32], mut then: impl FnMut(f32) -> f32) {
+    match bells {
+        [a, b, c, d] => {
+            for x in block.iter_mut() {
+                *x = then(d.tick(c.tick(b.tick(a.tick(*x)))));
             }
         }
-        for x in block.iter_mut() {
-            let gain2 = self.comp2.gain(*x);
-            self.comp2_min = self.comp2_min.min(gain2);
-            *x = *x * gain2 * self.output_gain;
+        [a, b, c] => {
+            for x in block.iter_mut() {
+                *x = then(c.tick(b.tick(a.tick(*x))));
+            }
         }
+        [a, b] => {
+            for x in block.iter_mut() {
+                *x = then(b.tick(a.tick(*x)));
+            }
+        }
+        [a] => {
+            for x in block.iter_mut() {
+                *x = then(a.tick(*x));
+            }
+        }
+        [] => {
+            for x in block.iter_mut() {
+                *x = then(*x);
+            }
+        }
+        _ => unreachable!("passes of at most {BELLS_PER_PASS} bells"),
     }
 }
 
