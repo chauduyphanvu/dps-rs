@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use hound::{Sample, SampleFormat, WavReader, WavSpec, WavWriter};
+use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 
 /// Reads the samples a block at a time; hound only reads the header, since
 /// its reader takes one sample per call.
@@ -16,16 +16,16 @@ pub struct Reader {
     left: u64,
     /// How the stored samples decode, or why they cannot be, in which case
     /// the first read fails as hound's would.
-    decode: Result<Decode, Undecodable>,
+    layout: Result<Layout, Unsupported>,
     width: usize,
     raw: Vec<u8>,
     path: PathBuf,
 }
 
-/// The sample layouts hound decodes: integers stored in 1 to 4 bytes (8-bit
-/// unsigned, 24-bit also in 4 bytes) and 32-bit floats.
+/// The sample layouts hound reads and writes: integers stored in 1 to 4
+/// bytes (8-bit unsigned, 24-bit also in 4 bytes) and 32-bit floats.
 #[derive(Clone, Copy)]
-enum Decode {
+enum Layout {
     U8,
     I16,
     I24,
@@ -34,15 +34,25 @@ enum Decode {
     F32,
 }
 
+/// Why hound cannot read or write samples of a given width.
 #[derive(Clone, Copy)]
-enum Undecodable {
+enum Unsupported {
     TooWide,
-    Unsupported,
+    Other,
 }
 
-impl Decode {
+impl Unsupported {
+    fn error(self) -> hound::Error {
+        match self {
+            Self::TooWide => hound::Error::TooWide,
+            Self::Other => hound::Error::Unsupported,
+        }
+    }
+}
+
+impl Layout {
     /// What hound's `Sample::read` makes of samples `width` bytes wide.
-    fn new(spec: WavSpec, width: usize) -> Result<Self, Undecodable> {
+    fn new(spec: WavSpec, width: usize) -> Result<Self, Unsupported> {
         match (spec.sample_format, width, spec.bits_per_sample) {
             (SampleFormat::Int, 1, 8) => Ok(Self::U8),
             (SampleFormat::Int, 2, 16) => Ok(Self::I16),
@@ -50,14 +60,30 @@ impl Decode {
             (SampleFormat::Int, 4, 24) => Ok(Self::I24In4),
             (SampleFormat::Int, 4, 32) => Ok(Self::I32),
             (SampleFormat::Float, 4, 32) => Ok(Self::F32),
-            (_, width, _) if width > 4 => Err(Undecodable::TooWide),
-            _ => Err(Undecodable::Unsupported),
+            (_, width, _) if width > 4 => Err(Unsupported::TooWide),
+            _ => Err(Unsupported::Other),
+        }
+    }
+
+    /// Appends `ints`, already in range for the layout, to `raw` as hound's
+    /// `Sample::write_padded` writes them.
+    fn encode_ints(self, ints: impl Iterator<Item = i32>, raw: &mut Vec<u8>) {
+        match self {
+            // Stored unsigned.
+            Self::U8 => raw.extend(ints.map(|x| (x + 128) as u8)),
+            Self::I16 => ints.for_each(|x| raw.extend_from_slice(&x.to_le_bytes()[..2])),
+            Self::I24 => ints.for_each(|x| raw.extend_from_slice(&x.to_le_bytes()[..3])),
+            Self::I24In4 => ints.for_each(|x| {
+                let b = x.to_le_bytes();
+                raw.extend_from_slice(&[b[0], b[1], b[2], 0]);
+            }),
+            Self::I32 | Self::F32 => ints.for_each(|x| raw.extend_from_slice(&x.to_le_bytes())),
         }
     }
 
     /// Converts `raw`, `out.len()` samples, as hound and then `full_scale`
     /// would, one by one.
-    fn convert(self, raw: &[u8], out: &mut [f32], bits: u16) {
+    fn decode(self, raw: &[u8], out: &mut [f32], bits: u16) {
         let scale = full_scale(bits) as f32;
         let int = |s: i32| s as f32 / scale;
         match self {
@@ -143,7 +169,7 @@ impl Reader {
             spec,
             frames,
             left,
-            decode: Decode::new(spec, width),
+            layout: Layout::new(spec, width),
             width,
             raw: Vec::new(),
             path: path.to_owned(),
@@ -167,15 +193,10 @@ impl Reader {
             return Ok(0);
         }
         let cannot_read = |e: hound::Error| format!("cannot read {}: {e}", self.path.display());
-        let decode = self.decode.map_err(|why| {
-            cannot_read(match why {
-                Undecodable::TooWide => hound::Error::TooWide,
-                Undecodable::Unsupported => hound::Error::Unsupported,
-            })
-        })?;
+        let layout = self.layout.map_err(|why| cannot_read(why.error()))?;
         self.raw.resize(n * self.width, 0);
         read_all(&mut self.file, &mut self.raw).map_err(|e| cannot_read(e.into()))?;
-        decode.convert(&self.raw, &mut out[..n], self.spec.bits_per_sample);
+        layout.decode(&self.raw, &mut out[..n], self.spec.bits_per_sample);
         self.left -= n as u64;
         Ok(n)
     }
@@ -282,6 +303,10 @@ pub struct Writer {
     path: PathBuf,
     spec: WavSpec,
     sample_bytes: u16,
+    /// How samples are stored, or that hound would fail at the first one.
+    layout: Result<Layout, Unsupported>,
+    /// A block's samples encoded, so they go to `out` in one write.
+    raw: Vec<u8>,
     /// Where the data chunk's size field is.
     data_size_at: u64,
     data_bytes: u64,
@@ -327,6 +352,10 @@ impl Writer {
             path: path.to_owned(),
             spec,
             sample_bytes: chunks.sample_bytes,
+            // hound's writer has no TooWide.
+            layout: Layout::new(spec, usize::from(chunks.sample_bytes))
+                .map_err(|_| Unsupported::Other),
+            raw: Vec::new(),
             data_size_at: chunks.before.len() as u64 + 4,
             data_bytes: 0,
             after: chunks.after,
@@ -344,36 +373,41 @@ impl Writer {
     }
 
     pub fn write(&mut self, samples: &[f32]) -> Result<(), String> {
-        let spec = self.spec;
-        let (out, bytes) = (&mut self.out, self.sample_bytes);
-        let result = match spec.sample_format {
-            SampleFormat::Float => {
-                if self.count_float_overs {
-                    self.clipped += samples.iter().filter(|s| s.abs() > 1.0).count() as u64;
-                }
-                samples
-                    .iter()
-                    .try_for_each(|&s| s.write_padded(out, 32, bytes))
-            }
-            SampleFormat::Int => {
-                let scale = full_scale(spec.bits_per_sample);
-                let clipped = &mut self.clipped;
-                samples.iter().try_for_each(|&s| {
-                    let x = (f64::from(s) * scale).round();
-                    // Two's complement has no +1.0, and f32 cannot hold every
-                    // 32-bit integer (i32::MAX reads back as exactly 1.0), so a
-                    // value at +full scale is clamped one step without counting
-                    // as clipping.
-                    if x > scale || x < -scale {
-                        *clipped += 1;
+        let cannot_write = |e: hound::Error| format!("cannot write {}: {e}", self.path.display());
+        if !samples.is_empty() {
+            let layout = self.layout.map_err(|why| cannot_write(why.error()))?;
+            self.raw.clear();
+            match layout {
+                Layout::F32 => {
+                    if self.count_float_overs {
+                        self.clipped += samples.iter().filter(|s| s.abs() > 1.0).count() as u64;
                     }
-                    let x = x.clamp(-scale, scale - 1.0) as i32;
-                    x.write_padded(out, spec.bits_per_sample, bytes)
-                })
+                    for s in samples {
+                        self.raw.extend_from_slice(&s.to_le_bytes());
+                    }
+                }
+                _ => {
+                    let scale = full_scale(self.spec.bits_per_sample);
+                    let clipped = &mut self.clipped;
+                    let ints = samples.iter().map(|&s| {
+                        let x = (f64::from(s) * scale).round();
+                        // Two's complement has no +1.0, and f32 cannot hold
+                        // every 32-bit integer (i32::MAX reads back as exactly
+                        // 1.0), so a value at +full scale is clamped one step
+                        // without counting as clipping.
+                        if x > scale || x < -scale {
+                            *clipped += 1;
+                        }
+                        x.clamp(-scale, scale - 1.0) as i32
+                    });
+                    layout.encode_ints(ints, &mut self.raw);
+                }
             }
-        };
-        result.map_err(|e| format!("cannot write {}: {e}", self.path.display()))?;
-        self.data_bytes += samples.len() as u64 * u64::from(bytes);
+            self.out
+                .write_all(&self.raw)
+                .map_err(|e| cannot_write(e.into()))?;
+        }
+        self.data_bytes += samples.len() as u64 * u64::from(self.sample_bytes);
         let riff_bytes = self.data_size_at + self.data_bytes + 1 + self.after.len() as u64;
         if riff_bytes > u64::from(u32::MAX) {
             return Err(format!(
