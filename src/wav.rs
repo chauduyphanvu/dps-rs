@@ -6,9 +6,96 @@ use std::path::{Path, PathBuf};
 
 use hound::{Sample, SampleFormat, WavReader, WavSpec, WavWriter};
 
+/// Reads the samples a block at a time; hound only reads the header, since
+/// its reader takes one sample per call.
 pub struct Reader {
-    inner: WavReader<BufReader<File>>,
+    file: BufReader<File>,
+    spec: WavSpec,
+    frames: u64,
+    /// Samples not yet read, over all channels.
+    left: u64,
+    /// How the stored samples decode, or why they cannot be, in which case
+    /// the first read fails as hound's would.
+    decode: Result<Decode, Undecodable>,
+    width: usize,
+    raw: Vec<u8>,
     path: PathBuf,
+}
+
+/// The sample layouts hound decodes: integers stored in 1 to 4 bytes (8-bit
+/// unsigned, 24-bit also in 4 bytes) and 32-bit floats.
+#[derive(Clone, Copy)]
+enum Decode {
+    U8,
+    I16,
+    I24,
+    I24In4,
+    I32,
+    F32,
+}
+
+#[derive(Clone, Copy)]
+enum Undecodable {
+    TooWide,
+    Unsupported,
+}
+
+impl Decode {
+    /// What hound's `Sample::read` makes of samples `width` bytes wide.
+    fn new(spec: WavSpec, width: usize) -> Result<Self, Undecodable> {
+        match (spec.sample_format, width, spec.bits_per_sample) {
+            (SampleFormat::Int, 1, 8) => Ok(Self::U8),
+            (SampleFormat::Int, 2, 16) => Ok(Self::I16),
+            (SampleFormat::Int, 3, 24) => Ok(Self::I24),
+            (SampleFormat::Int, 4, 24) => Ok(Self::I24In4),
+            (SampleFormat::Int, 4, 32) => Ok(Self::I32),
+            (SampleFormat::Float, 4, 32) => Ok(Self::F32),
+            (_, width, _) if width > 4 => Err(Undecodable::TooWide),
+            _ => Err(Undecodable::Unsupported),
+        }
+    }
+
+    /// Converts `raw`, `out.len()` samples, as hound and then `full_scale`
+    /// would, one by one.
+    fn convert(self, raw: &[u8], out: &mut [f32], bits: u16) {
+        let scale = full_scale(bits) as f32;
+        let int = |s: i32| s as f32 / scale;
+        match self {
+            Self::U8 => {
+                for (x, b) in out.iter_mut().zip(raw) {
+                    *x = int(i32::from(*b) - 128);
+                }
+            }
+            Self::I16 => {
+                for (x, b) in out.iter_mut().zip(raw.chunks_exact(2)) {
+                    *x = int(i32::from(i16::from_le_bytes([b[0], b[1]])));
+                }
+            }
+            Self::I24 => {
+                for (x, b) in out.iter_mut().zip(raw.chunks_exact(3)) {
+                    // Into the top three bytes, then shifted back down to
+                    // extend the sign.
+                    *x = int(i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8);
+                }
+            }
+            Self::I24In4 => {
+                for (x, b) in out.iter_mut().zip(raw.chunks_exact(4)) {
+                    // The fourth byte is padding, whatever it holds.
+                    *x = int(i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8);
+                }
+            }
+            Self::I32 => {
+                for (x, b) in out.iter_mut().zip(raw.chunks_exact(4)) {
+                    *x = int(i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                }
+            }
+            Self::F32 => {
+                for (x, b) in out.iter_mut().zip(raw.chunks_exact(4)) {
+                    *x = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                }
+            }
+        }
+    }
 }
 
 impl Reader {
@@ -39,47 +126,71 @@ impl Reader {
                 ));
             }
         }
+        let (frames, left) = (u64::from(inner.duration()), u64::from(inner.len()));
+        let mut file = inner.into_inner();
+        let cannot_read = |e: io::Error| format!("cannot read {}: {e}", path.display());
+        // hound stops just past the data chunk's header, which ends with the
+        // length it found to be `left` whole samples.
+        let mut data_bytes = [0; 4];
+        file.seek_relative(-4)
+            .and_then(|()| file.read_exact(&mut data_bytes))
+            .map_err(cannot_read)?;
+        let width = u64::from(u32::from_le_bytes(data_bytes))
+            .checked_div(left)
+            .unwrap_or(0) as usize;
         Ok(Self {
-            inner,
+            file,
+            spec,
+            frames,
+            left,
+            decode: Decode::new(spec, width),
+            width,
+            raw: Vec::new(),
             path: path.to_owned(),
         })
     }
 
     pub fn spec(&self) -> WavSpec {
-        self.inner.spec()
+        self.spec
     }
 
     /// The length in frames that the header states.
     pub fn frames(&self) -> u64 {
-        u64::from(self.inner.duration())
+        self.frames
     }
 
     /// Fills `out` from the start with the next interleaved samples and
     /// returns how many it read; 0 means the end of the file.
     pub fn read(&mut self, out: &mut [f32]) -> Result<usize, String> {
-        let spec = self.inner.spec();
-        let result = match spec.sample_format {
-            SampleFormat::Float => fill(&mut self.inner, out, |s: f32| s),
-            SampleFormat::Int => {
-                let scale = full_scale(spec.bits_per_sample) as f32;
-                fill(&mut self.inner, out, |s: i32| s as f32 / scale)
-            }
-        };
-        result.map_err(|e| format!("cannot read {}: {e}", self.path.display()))
+        let n = (out.len() as u64).min(self.left) as usize;
+        if n == 0 {
+            return Ok(0);
+        }
+        let cannot_read = |e: hound::Error| format!("cannot read {}: {e}", self.path.display());
+        let decode = self.decode.map_err(|why| {
+            cannot_read(match why {
+                Undecodable::TooWide => hound::Error::TooWide,
+                Undecodable::Unsupported => hound::Error::Unsupported,
+            })
+        })?;
+        self.raw.resize(n * self.width, 0);
+        read_all(&mut self.file, &mut self.raw).map_err(|e| cannot_read(e.into()))?;
+        decode.convert(&self.raw, &mut out[..n], self.spec.bits_per_sample);
+        self.left -= n as u64;
+        Ok(n)
     }
 }
 
-fn fill<S: Sample>(
-    reader: &mut WavReader<BufReader<File>>,
-    out: &mut [f32],
-    convert: impl Fn(S) -> f32,
-) -> hound::Result<usize> {
+/// Fills `buf` as hound does, with its error for a file that ends first.
+fn read_all(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<()> {
     let mut n = 0;
-    for sample in reader.samples::<S>().take(out.len()) {
-        out[n] = convert(sample?);
-        n += 1;
+    while n < buf.len() {
+        match reader.read(&mut buf[n..])? {
+            0 => return Err(io::Error::other("Failed to read enough bytes.")),
+            read => n += read,
+        }
     }
-    Ok(n)
+    Ok(())
 }
 
 /// A WAV file's chunks other than its samples: the fmt chunk with its
