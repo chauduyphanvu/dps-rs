@@ -209,9 +209,9 @@ impl Processor {
     }
 
     /// Each stage sees the same samples in the same order whichever way the
-    /// stages take turns, since none reads another's state; so the leveler
-    /// takes the whole chunk, then each channel's stages, then the rest
-    /// frame by frame.
+    /// stages take turns, since none reads another's state; so each takes
+    /// the whole chunk before the next starts, which lets the CPU overlap
+    /// one frame's work in a stage with the next frame's.
     fn process_chunk(&mut self, chunk: &mut [f32]) {
         let channels = self.channels.len();
         if let Some(leveler) = &mut self.leveler {
@@ -229,23 +229,33 @@ impl Processor {
                 frame[c] = *x;
             }
         }
-        for frame in chunk.chunks_exact_mut(channels) {
-            if let Some(bass) = &mut self.bass {
+        if let Some(bass) = &mut self.bass {
+            for frame in chunk.chunks_exact_mut(channels) {
                 bass.frame(frame);
             }
-            if let Some(contour) = &mut self.contour {
+        }
+        if let Some(contour) = &mut self.contour {
+            for frame in chunk.chunks_exact_mut(channels) {
                 contour.frame(frame);
             }
-            if let Some(stereo) = &mut self.stereo {
+        }
+        if let Some(stereo) = &mut self.stereo {
+            for frame in chunk.chunks_exact_mut(channels) {
                 (frame[0], frame[1]) = stereo.tick(frame[0], frame[1]);
             }
-            if let Some(crossfeed) = &mut self.crossfeed {
+        }
+        if let Some(crossfeed) = &mut self.crossfeed {
+            for frame in chunk.chunks_exact_mut(channels) {
                 (frame[0], frame[1]) = crossfeed.tick(frame[0], frame[1]);
             }
-            if let Some(correction) = &mut self.correction {
+        }
+        if let Some(correction) = &mut self.correction {
+            for frame in chunk.chunks_exact_mut(channels) {
                 correction.frame(frame);
             }
-            if let Some(limiter) = &mut self.limiter {
+        }
+        if let Some(limiter) = &mut self.limiter {
+            for frame in chunk.chunks_exact_mut(channels) {
                 limiter.frame(frame);
                 self.limiter_min = self.limiter_min.min(limiter.gain());
             }
