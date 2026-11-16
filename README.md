@@ -275,14 +275,15 @@ or below −1 dBFS (−2 for `night`).
 ```sh
 cargo fmt --check && cargo test && cargo clippy --all-targets -- -D warnings
 cargo run --release --example bench    # what the chain costs, stage by stage
+scripts/bench-process.sh               # tonewell process end to end, on generated WAVs
 ```
 
 The tests never touch the real settings file, launchd or audio devices.
 `docs/` holds the specs extracted from the patents, including the errors in
 the printed equations and the corrected forms the code uses.
 
-With every stage on, the chain takes about 1.5 % of one core at 48 kHz on an
-Apple silicon Mac; the default profile about 0.5 %.
+With every stage on, the chain takes about 0.7 % of one core at 48 kHz on an
+Apple silicon Mac; the default profile about 0.25 %.
 
 ### Releasing
 
