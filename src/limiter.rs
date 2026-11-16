@@ -326,23 +326,29 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
-/// The lookahead's target gain over the last `len` frames' peaks. Each is
-/// kept in a ring of `len` slots, the next to be replaced at `at`.
+/// The lookahead's target gain over the last `len` frames' peaks.
+///
+/// The loudest peak of the window comes from the van Herk/Gil-Werman
+/// method, which has no branch that depends on the audio: the frames are cut
+/// into blocks of `len`, so the window ending at slot `at` of the current
+/// block is the previous block from slot `at + 1` on plus the current block
+/// up to `at`, whose loudest are `suffix[at + 1]` and `running`.
 struct Lookahead {
     len: usize,
+    /// The current frame's slot in its block.
     at: usize,
+    /// The current block's peaks, up to `at`.
     peaks: Vec<f32>,
+    /// The loudest of the previous block's peaks from each slot on, and 0
+    /// past its end.
+    suffix: Vec<f32>,
+    /// The loudest of the current block's peaks so far.
+    running: f32,
     /// The loudest peak of the `len` frames up to each frame.
     maxima: Vec<f32>,
     /// In fixed point, rounded down, the gain each of `maxima` needs.
     shares: Vec<u64>,
     sum: u64,
-    /// A ring of the slots of the frames that are louder than every frame
-    /// after them, oldest first, so the first is the loudest of the window:
-    /// `count` of them from `head`.
-    order: Vec<usize>,
-    head: usize,
-    count: usize,
 }
 
 impl Lookahead {
@@ -352,12 +358,11 @@ impl Lookahead {
             len,
             at: 0,
             peaks: vec![0.0; len],
+            suffix: vec![0.0; len + 1],
+            running: 0.0,
             maxima: vec![0.0; len],
             shares: vec![UNITY; len],
             sum: UNITY * len as u64,
-            order: vec![0; len],
-            head: 0,
-            count: 0,
         }
     }
 
@@ -365,44 +370,32 @@ impl Lookahead {
     /// `len - 1` before it.
     fn push(&mut self, peak: f32, ceiling: f32) -> f32 {
         let at = self.at;
-        // The frame in slot `at` leaves the window.
-        if self.count > 0 && self.order[self.head] == at {
-            self.head = self.wrap(self.head + 1);
-            self.count -= 1;
-        }
-        while self.count > 0
-            && self.peaks[self.order[self.wrap(self.head + self.count - 1)]] <= peak
-        {
-            self.count -= 1;
-        }
-        let back = self.wrap(self.head + self.count);
-        self.order[back] = at;
-        self.count += 1;
         self.peaks[at] = peak;
-        let loudest = self.peaks[self.order[self.head]];
+        self.running = self.running.max(peak);
+        let loudest = self.suffix[at + 1].max(self.running);
         let share = share(required(loudest, ceiling));
         self.sum = self.sum - self.shares[at] + share;
         self.shares[at] = share;
         self.maxima[at] = loudest;
-        self.at = self.wrap(at + 1);
-        (((self.sum / self.len as u64) as f64) / UNITY as f64) as f32
-    }
-
-    fn wrap(&self, slot: usize) -> usize {
-        if slot >= self.len {
-            slot - self.len
+        if at + 1 == self.len {
+            for i in (0..self.len).rev() {
+                self.suffix[i] = self.peaks[i].max(self.suffix[i + 1]);
+            }
+            self.running = 0.0;
+            self.at = 0;
         } else {
-            slot
+            self.at = at + 1;
         }
+        (((self.sum / self.len as u64) as f64) / UNITY as f64) as f32
     }
 
     /// Takes over `from`'s window, of the same length, with the gains worked
     /// out again for `ceiling`.
     fn adopt(&mut self, from: &Self, ceiling: f32) {
         self.peaks.copy_from_slice(&from.peaks);
+        self.suffix.copy_from_slice(&from.suffix);
         self.maxima.copy_from_slice(&from.maxima);
-        self.order.copy_from_slice(&from.order);
-        (self.at, self.head, self.count) = (from.at, from.head, from.count);
+        (self.at, self.running) = (from.at, from.running);
         self.sum = 0;
         for (share_slot, loudest) in self.shares.iter_mut().zip(&self.maxima) {
             *share_slot = share(required(*loudest, ceiling));
